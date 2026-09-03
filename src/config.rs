@@ -29,7 +29,7 @@ pub enum CliAction {
 }
 
 /// `~/.config/dshtui/config.toml` 的完整结构（Notes/02 §7 草案）。
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub server: ServerConfig,
@@ -84,17 +84,6 @@ const DEFAULT_TICK_MS: u64 = 33;
 const DEFAULT_SIDEBAR_WIDTH: u16 = 32;
 const DEFAULT_CACHE_BYTES: u64 = 32 * 1024 * 1024;
 const DEFAULT_RSS_TARGET_MB: u64 = 80;
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            server: ServerConfig::default(),
-            ui: UiConfig::default(),
-            perf: PerfConfig::default(),
-            keymap: KeymapConfig::default(),
-        }
-    }
-}
 
 impl Default for ServerConfig {
     fn default() -> Self {
@@ -231,7 +220,10 @@ pub fn default_config_path() -> PathBuf {
         }
     }
     if let Some(home) = env::var_os("HOME") {
-        return PathBuf::from(home).join(".config").join("dshtui").join("config.toml");
+        return PathBuf::from(home)
+            .join(".config")
+            .join("dshtui")
+            .join("config.toml");
     }
     PathBuf::from(".config").join("dshtui").join("config.toml")
 }
@@ -282,12 +274,18 @@ pub fn parse_cli<I: IntoIterator<Item = String>>(args: I) -> Result<Cli, String>
 
 /// 启发式：疑似 secret 的环境变量名（长、含特殊字符）拒绝通过 `--token` 传入。
 fn looks_like_secret(v: &str) -> bool {
-    v.len() > 64 || !v.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+    v.len() > 64
+        || !v
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
 }
 
 /// 判定 URL 是否 loopback（默认仅连 loopback；非 loopback 需显式警告，REQ §7）。
 pub fn is_loopback(url: &str) -> bool {
-    matches!(host_of(url).to_ascii_lowercase().as_str(), "127.0.0.1" | "localhost" | "::1")
+    matches!(
+        host_of(url).to_ascii_lowercase().as_str(),
+        "127.0.0.1" | "localhost" | "::1"
+    )
 }
 
 /// 提取 URL 的 host（支持 `[::1]:3080` IPv6 形式与 user@host）。
@@ -359,11 +357,8 @@ mod tests {
         impl TempDir {
             pub fn new() -> Result<Self, std::io::Error> {
                 let n = SEQ.fetch_add(1, Ordering::Relaxed);
-                let p = std::env::temp_dir().join(format!(
-                    "dshtui-test-{}-{}",
-                    std::process::id(),
-                    n
-                ));
+                let p =
+                    std::env::temp_dir().join(format!("dshtui-test-{}-{}", std::process::id(), n));
                 std::fs::create_dir_all(&p)?;
                 Ok(Self(p))
             }
@@ -470,7 +465,10 @@ window_messages = 100
     #[test]
     fn load_rejects_invalid_toml() {
         let (_dir, path) = tmp_config("not [ valid toml");
-        assert!(matches!(Config::load(Some(&path)), Err(ConfigError::Toml { .. })));
+        assert!(matches!(
+            Config::load(Some(&path)),
+            Err(ConfigError::Toml { .. })
+        ));
     }
 
     #[test]

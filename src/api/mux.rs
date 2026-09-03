@@ -16,6 +16,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::{mpsc, Mutex};
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::MaybeTlsStream;
 
@@ -25,6 +26,12 @@ type Sink = futures_util::stream::SplitSink<
     tokio_tungstenite::WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
     Message,
 >;
+
+/// Fully-negotiated WebSocket socket type (factored out for readability).
+type WsStream = tokio_tungstenite::WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// Per-stream response channel registry.
+type StreamMap = HashMap<u64, mpsc::Sender<Result<Value, ClientError>>>;
 
 /// 一条 mux stream 的接收端。
 pub struct StreamHandle {
@@ -43,7 +50,7 @@ impl StreamHandle {
 /// 已连接的 mux：打开/取消 stream。
 pub struct Mux {
     sink: Arc<Mutex<Sink>>,
-    streams: Arc<Mutex<HashMap<u64, mpsc::Sender<Result<Value, ClientError>>>>>,
+    streams: Arc<Mutex<StreamMap>>,
     next_id: AtomicU64,
 }
 
@@ -63,11 +70,15 @@ struct ServerFrame {
 impl Mux {
     /// 连接 `ws://{host}/api/remote.mux`，携带认证 cookie 完成握手。
     pub async fn connect(ws_url: &str, cookie_header: &str) -> Result<Self, ClientError> {
-        let req = http::Request::builder()
-            .uri(ws_url)
-            .header("Cookie", cookie_header)
-            .body(())
+        let mut req = ws_url
+            .into_client_request()
             .map_err(|e| ClientError::Protocol(format!("WS 请求构造失败: {e}")))?;
+        req.headers_mut().insert(
+            http::header::COOKIE,
+            cookie_header
+                .parse()
+                .map_err(|e| ClientError::Protocol(format!("Cookie header 无效: {e}")))?,
+        );
         let (ws, _resp) = tokio_tungstenite::connect_async(req)
             .await
             .map_err(|e| ClientError::Transport(format!("WS 连接失败（{ws_url}）: {e}")))?;
@@ -76,10 +87,9 @@ impl Mux {
     }
 
     /// 从已建立连接的 socket 构造（测试/复用路径）。
-    pub fn from_socket(ws: tokio_tungstenite::WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>) -> Self {
+    pub fn from_socket(ws: WsStream) -> Self {
         let (sink, mut stream) = ws.split();
-        let streams: Arc<Mutex<HashMap<u64, mpsc::Sender<Result<Value, ClientError>>>>> =
-            Arc::new(Mutex::new(HashMap::new()));
+        let streams: Arc<Mutex<StreamMap>> = Arc::new(Mutex::new(HashMap::new()));
         let sink = Arc::new(Mutex::new(sink));
         let mux = Self {
             sink,
@@ -124,10 +134,7 @@ impl Mux {
                                 });
                                 let e = ClientError::Stream {
                                     code: err.code.clone(),
-                                    message: err
-                                        .message
-                                        .clone()
-                                        .unwrap_or_else(|| "流错误".into()),
+                                    message: err.message.clone().unwrap_or_else(|| "流错误".into()),
                                     class: ErrorClass::from_code(&err.code),
                                 };
                                 if let Some(tx) = guard.remove(&frame.stream_id) {
@@ -211,10 +218,8 @@ mod tests {
 
     #[test]
     fn server_frame_parses_item_end_error() {
-        let f: ServerFrame = serde_json::from_str(
-            r#"{"type":"item","streamId":3,"value":{"hello":1}}"#,
-        )
-        .unwrap();
+        let f: ServerFrame =
+            serde_json::from_str(r#"{"type":"item","streamId":3,"value":{"hello":1}}"#).unwrap();
         assert_eq!(f.kind, "item");
         assert_eq!(f.stream_id, 3);
         assert_eq!(f.value.unwrap()["hello"], 1);

@@ -2,7 +2,10 @@
 
 use std::collections::HashMap;
 
-use crate::api::types::{SessionMeta, SessionId, WorkspaceId};
+use nucleo::pattern::{CaseMatching, Normalization, Pattern};
+use nucleo::{Matcher, Utf32String};
+
+use crate::api::types::{SessionId, SessionMeta, WorkspaceId};
 
 /// 项目（workspace）行：id/title/成员会话 id。
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -69,8 +72,48 @@ impl WorkspaceStore {
     /// 供 picker 的会话迭代（按 updated_at_ms 降序）。
     pub fn sessions_sorted(&self) -> Vec<&SessionMeta> {
         let mut v: Vec<&SessionMeta> = self.sessions.values().collect();
-        v.sort_by(|a, b| b.updated_at_ms.cmp(&a.updated_at_ms));
+        v.sort_by_key(|m| std::cmp::Reverse(m.updated_at_ms));
         v
+    }
+
+    /// Fuzzy-match sessions for the picker (ADR-003: nucleo, no external fzf).
+    /// Fields: id / title / cwd / workspace id / last turn preview. The result
+    /// keeps the updated-descending order as tie-break; an empty query returns
+    /// the full sorted list. Per-keystroke cost stays bounded (V0.1 list size).
+    pub fn match_sessions(&self, query: &str) -> Vec<&SessionMeta> {
+        let sorted = self.sessions_sorted();
+        let query = query.trim();
+        if query.is_empty() {
+            return sorted;
+        }
+        let pattern = Pattern::parse(query, CaseMatching::Smart, Normalization::Smart);
+        let mut matcher = Matcher::default();
+        let mut scored: Vec<(u32, &SessionMeta)> = sorted
+            .into_iter()
+            .filter_map(|meta| {
+                let fields = [
+                    meta.id.0.as_str(),
+                    meta.title.as_deref().unwrap_or(""),
+                    meta.cwd.as_deref().unwrap_or(""),
+                    meta.workspace.as_ref().map(|w| w.0.as_str()).unwrap_or(""),
+                    meta.last_turn_preview.as_deref().unwrap_or(""),
+                ];
+                let best = fields
+                    .iter()
+                    .filter_map(|field| {
+                        if field.is_empty() {
+                            return None;
+                        }
+                        let haystack = Utf32String::from(*field);
+                        pattern.score(haystack.slice(..), &mut matcher)
+                    })
+                    .max()?;
+                Some((best, meta))
+            })
+            .collect();
+        // `sort_by_key` is stable: equal scores keep updated-descending order.
+        scored.sort_by_key(|s| std::cmp::Reverse(s.0));
+        scored.into_iter().map(|(_, meta)| meta).collect()
     }
 }
 
@@ -132,5 +175,64 @@ mod tests {
         store.clear_workspaces();
         assert!(store.workspaces.is_empty());
         assert_eq!(store.session_count(), 1, "清空 workspace 不影响会话");
+    }
+
+    #[test]
+    fn match_sessions_empty_query_returns_updated_desc_order() {
+        let mut store = WorkspaceStore::new();
+        store.upsert_session(meta("old", 1, None));
+        store.upsert_session(meta("new", 100, None));
+        store.upsert_session(meta("mid", 50, None));
+        let matched = store.match_sessions("  ");
+        let ids: Vec<&str> = matched.iter().map(|m| m.id.0.as_str()).collect();
+        assert_eq!(ids, vec!["new", "mid", "old"]);
+    }
+
+    #[test]
+    fn match_sessions_fuzzy_ranks_across_fields_and_keeps_order_ties() {
+        let mut store = WorkspaceStore::new();
+        store.upsert_session(meta("s-1", 100, None));
+        store.upsert_session(meta("s-2", 90, None));
+        let mut cwd_match = meta("s-3", 80, None);
+        cwd_match.cwd = Some("/home/nd/src/deploy-target".into());
+        store.upsert_session(cwd_match);
+        // A partial preview hit exists on s-2 for the broad query.
+        let mut preview_match = meta("s-2", 90, None);
+        preview_match.last_turn_preview = Some("deploy 到生产".into());
+        store.upsert_session(preview_match);
+
+        // Broad query hits several fields; every hit must stay, non-hits go.
+        let matched = store.match_sessions("deploy");
+        assert!(!matched.is_empty());
+        assert!(!matched.iter().any(|m| m.id == SessionId("s-1".into())));
+        assert!(matched.len() >= 2, "s-2 preview and s-3 cwd both match");
+
+        // Specific query only matches the s-3 cwd token (deterministic single hit).
+        let specific = store.match_sessions("deploy-target");
+        assert_eq!(specific.len(), 1);
+        assert_eq!(specific[0].id, SessionId("s-3".into()));
+    }
+
+    #[test]
+    fn picker_match_1042_sessions_is_bounded() {
+        // AC-001-03: picker search < 30ms on 1042 local sessions.
+        let mut store = WorkspaceStore::new();
+        for i in 0..1042 {
+            let mut m = meta(&format!("sess-{i:04}"), i as i64, None);
+            m.title = Some(format!("Session {i} deploy build"));
+            m.cwd = Some(format!("/home/nd/projects/p{}", i % 40));
+            m.last_turn_preview = Some(format!("turn preview {i}"));
+            store.upsert_session(m);
+        }
+        let start = std::time::Instant::now();
+        let matched = store.match_sessions("depl");
+        let elapsed = start.elapsed();
+        assert!(!matched.is_empty());
+        assert!(
+            elapsed.as_millis() < 30,
+            "picker match too slow: {} ms",
+            elapsed.as_millis()
+        );
+        eprintln!("picker_match_1042: {} ms", elapsed.as_millis());
     }
 }

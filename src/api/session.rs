@@ -31,12 +31,7 @@ pub async fn list(
         .get("items")
         .and_then(|v| v.as_array())
         .cloned()
-        .unwrap_or_else(|| {
-            value
-                .as_array()
-                .cloned()
-                .unwrap_or_default()
-        });
+        .unwrap_or_else(|| value.as_array().cloned().unwrap_or_default());
     let next_cursor = value
         .get("nextCursor")
         .or_else(|| value.get("cursor"))
@@ -84,12 +79,17 @@ pub async fn page(
         args["beforeSeq"] = serde_json::json!(b);
     }
     let value = unary(http, base, "session/page", args).await?;
-    serde_json::from_value(value).map_err(|e| ClientError::Protocol(format!("session/page 响应形状异常: {e}")))
+    serde_json::from_value(value)
+        .map_err(|e| ClientError::Protocol(format!("session/page 响应形状异常: {e}")))
 }
 
 /// `session/cancel`：停止运行中会话（退出语义 AC-001-08 的最小 wrapper）。
 /// 形状未在 Notes/03 字段级记录，按官方注册表 `{sessionId}` 约定，失败不影响退出流程。
-pub async fn cancel(http: &reqwest::Client, base: &str, session_id: &str) -> Result<Value, ClientError> {
+pub async fn cancel(
+    http: &reqwest::Client,
+    base: &str,
+    session_id: &str,
+) -> Result<Value, ClientError> {
     let args = serde_json::json!({ "sessionId": session_id });
     unary(http, base, "session/cancel", args).await
 }

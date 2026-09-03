@@ -52,16 +52,15 @@ pub async fn authenticate(
             }
         }
     }
-    if !session
-        .cookies
-        .iter()
-        .any(|c| c.starts_with("dsh-auth-"))
-    {
+    if !session.cookies.iter().any(|c| c.starts_with("dsh-auth-")) {
         return Err(ClientError::Auth(
             "认证响应缺少 dsh-auth-<n> cookie（官方认证形态可能已变化）".to_string(),
         ));
     }
-    tracing::debug!(cookie_count = session.cookies.len(), "认证成功（cookie 仅内存）");
+    tracing::debug!(
+        cookie_count = session.cookies.len(),
+        "认证成功（cookie 仅内存）"
+    );
     Ok(session)
 }
 

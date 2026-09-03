@@ -10,7 +10,8 @@ use super::envelope::ClientError;
 use super::mux::{Mux, StreamHandle};
 
 pub async fn open_follow(mux: &Mux) -> Result<StreamHandle, ClientError> {
-    mux.open_stream("workspace/follow", serde_json::json!({})).await
+    mux.open_stream("workspace/follow", serde_json::json!({}))
+        .await
 }
 
 /// 从 follow 帧提取 workspace 原始列表（容忍多形态；识别不了返回 None 并记日志）。

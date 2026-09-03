@@ -178,7 +178,10 @@ mod tests {
         let stats = p.session_stats();
         assert_eq!(stats.turns, Some(27));
         assert_eq!(stats.steps, Some(1144));
-        assert_eq!(p.model_selection().last_used.as_deref(), Some("deepseek-chat"));
+        assert_eq!(
+            p.model_selection().last_used.as_deref(),
+            Some("deepseek-chat")
+        );
     }
 
     #[test]

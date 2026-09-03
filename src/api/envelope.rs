@@ -124,9 +124,7 @@ impl ClientError {
             ClientError::Auth(_) | ClientError::Http(_) | ClientError::Envelope(_) => {
                 ErrorClass::UserFacing
             }
-            ClientError::RpcIdMismatch { .. } | ClientError::Protocol(_) => {
-                ErrorClass::UserFacing
-            }
+            ClientError::RpcIdMismatch { .. } | ClientError::Protocol(_) => ErrorClass::UserFacing,
         }
     }
 }
@@ -135,10 +133,7 @@ impl ClientError {
 pub fn remote_error(e: &RpcError) -> ClientError {
     ClientError::Remote {
         code: e.code.clone(),
-        message: e
-            .message
-            .clone()
-            .unwrap_or_else(|| "无消息".to_string()),
+        message: e.message.clone().unwrap_or_else(|| "无消息".to_string()),
         class: ClientError::classify(&e.code),
     }
 }
@@ -170,10 +165,7 @@ impl Backoff {
     /// 下一次退避延迟（2^n * base，封顶 cap），返回后 attempt+1。
     pub fn next_delay_ms(&mut self) -> u64 {
         let exp = self.attempt.min(16);
-        let ms = self
-            .base_ms
-            .saturating_mul(1u64 << exp)
-            .min(self.cap_ms);
+        let ms = self.base_ms.saturating_mul(1u64 << exp).min(self.cap_ms);
         self.attempt += 1;
         ms
     }

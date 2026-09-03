@@ -10,7 +10,9 @@ use serde::{Deserialize, Serialize};
 macro_rules! newtype {
     ($name:ident, $inner:ty, $doc:expr) => {
         #[doc = $doc]
-        #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+        #[derive(
+            Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, Default,
+        )]
         #[serde(transparent)]
         pub struct $name(pub $inner);
 
@@ -32,23 +34,15 @@ newtype!(SessionId, String, "会话标识（官方 session id，字符串）");
 newtype!(WorkspaceId, String, "工作区/项目标识");
 newtype!(SessionSeq, u64, "事件序列号（单调）");
 newtype!(SessionLogOffset, u64, "日志 offset（page/follow 游标语义）");
-newtype!(RequestId, String, "请求幂等键（D-4：重复送达按 requestId 幂等 apply）");
+newtype!(
+    RequestId,
+    String,
+    "请求幂等键（D-4：重复送达按 requestId 幂等 apply）"
+);
 
 // 数值 newtype 允许 Copy（窗口 reducer 高频拷贝，避免 move 噪声）。
 impl Copy for SessionSeq {}
 impl Copy for SessionLogOffset {}
-
-// 字符串 newtype 提供 Default（容器/derive 需要；空值仅在反序列化占位使用）。
-impl Default for SessionId {
-    fn default() -> Self {
-        Self(String::new())
-    }
-}
-impl Default for WorkspaceId {
-    fn default() -> Self {
-        Self(String::new())
-    }
-}
 
 // ---------- session/page / session/follow 地址 ----------
 
@@ -114,18 +108,46 @@ pub struct SessionWireEvent {
 }
 
 /// packed chunk row（原样存储，不展开为逐 delta——官方低内存优化的关键）。
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(tag = "type", rename_all = "camelCase")]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ChunkRow {
-    #[serde(rename = "chunkrow/text-chunks")]
     TextChunks(ChunkData),
-    #[serde(rename = "chunkrow/reasoning-chunks")]
     ReasoningChunks(ChunkData),
-    #[serde(rename = "chunkrow/tool-call-chunks")]
     ToolCallChunks(ToolCallChunkData),
-    /// 未知 chunkrow 类型：原样保留 event type + payload（D-4 下游契约）。
-    #[serde(other)]
-    Unknown,
+    /// Unknown chunkrow type: preserve both its type and complete raw payload.
+    Unknown {
+        event_type: String,
+        raw: serde_json::Value,
+    },
+}
+
+impl<'de> Deserialize<'de> for ChunkRow {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = serde_json::Value::deserialize(deserializer)?;
+        let Some(event_type) = raw.get("type").and_then(|v| v.as_str()) else {
+            return Ok(Self::Unknown {
+                event_type: "<missing>".into(),
+                raw,
+            });
+        };
+        match event_type {
+            "chunkrow/text-chunks" => serde_json::from_value::<ChunkData>(raw)
+                .map(Self::TextChunks)
+                .map_err(serde::de::Error::custom),
+            "chunkrow/reasoning-chunks" => serde_json::from_value::<ChunkData>(raw)
+                .map(Self::ReasoningChunks)
+                .map_err(serde::de::Error::custom),
+            "chunkrow/tool-call-chunks" => serde_json::from_value::<ToolCallChunkData>(raw)
+                .map(Self::ToolCallChunks)
+                .map_err(serde::de::Error::custom),
+            _ => Ok(Self::Unknown {
+                event_type: event_type.to_string(),
+                raw,
+            }),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Default)]
@@ -262,7 +284,8 @@ pub fn meta_from_raw(raw: ListItemRaw) -> Option<SessionMeta> {
         })
     };
     let get_bool = |keys: &[&str]| -> Option<bool> {
-        keys.iter().find_map(|k| vals.and_then(|v| v.get(k)).and_then(|x| x.as_bool()))
+        keys.iter()
+            .find_map(|k| vals.and_then(|v| v.get(k)).and_then(|x| x.as_bool()))
     };
     let metadata = vals.and_then(|v| v.get("sessionListMetadata"));
     let updated_at_ms = metadata
@@ -289,7 +312,11 @@ pub fn meta_from_raw(raw: ListItemRaw) -> Option<SessionMeta> {
         updated_at_ms,
         running: get_bool(&["running"]).or(raw.running).unwrap_or(false),
         blank: get_bool(&["blank"])
-            .or_else(|| metadata.and_then(|m| m.get("blank")).and_then(|x| x.as_bool()))
+            .or_else(|| {
+                metadata
+                    .and_then(|m| m.get("blank"))
+                    .and_then(|x| x.as_bool())
+            })
             .or(raw.blank)
             .unwrap_or(false),
         origin: raw.origin.clone(),
@@ -365,12 +392,15 @@ mod tests {
             r#"{"type":"chunks","event":{"type":"chunkrow/future-thing","texts":["x"]}}"#,
         )
         .unwrap();
-        assert!(matches!(
-            r,
+        match r {
             SessionHistoryRecord::Chunks {
-                event: ChunkRow::Unknown
+                event: ChunkRow::Unknown { event_type, raw },
+            } => {
+                assert_eq!(event_type, "chunkrow/future-thing");
+                assert_eq!(raw["texts"][0], "x");
             }
-        ));
+            other => panic!("unexpected chunk row: {other:?}"),
+        }
     }
 
     #[test]

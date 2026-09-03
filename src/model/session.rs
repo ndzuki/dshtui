@@ -288,7 +288,7 @@ impl TranscriptWindow {
             .blocks
             .back()
             .map(|b| b.seq())
-            .is_none_or(|tail| seq > tail)
+            .map_or(true, |tail| seq > tail)
         {
             self.blocks.push_back(block);
         } else {
@@ -305,14 +305,12 @@ impl TranscriptWindow {
 
     fn apply_chunks(&mut self, row: ChunkRow) -> ApplyEffect {
         // chunks 无独立 seq：归入最近一个 AssistantMessage（官方顺序保证紧跟）。
-        if let Some(last) = self.blocks.back_mut() {
-            if let Block::AssistantMessage { chunks, .. } = last {
-                chunks.rows.push(row);
-                return ApplyEffect::TailAppended {
-                    appended: 0, // 块数不变（行并入既有块），仅内容变化
-                    anchor_stable: true,
-                };
-            }
+        if let Some(Block::AssistantMessage { chunks, .. }) = self.blocks.back_mut() {
+            chunks.rows.push(row);
+            return ApplyEffect::TailAppended {
+                appended: 0, // 块数不变（行并入既有块），仅内容变化
+                anchor_stable: true,
+            };
         }
         tracing::warn!("chunkrow 到达但窗口尾非 assistant message，丢弃并计入日志");
         ApplyEffect::Noop
@@ -326,9 +324,10 @@ impl TranscriptWindow {
         if let Some(hm) = has_more {
             self.head_has_more = hm;
         }
+        let head_before = self.head_seq();
         let mut inserted = 0usize;
         for rec in records {
-            // page 记录与窗口/已逐出 seq 重叠 → 去重（AC-001-11 并发交错合并）。
+            // Page overlap is deduplicated before insertion.
             if let Some(seq) = record_seq(&rec) {
                 if self.seen_seq.contains(&seq.0) {
                     continue;
@@ -339,51 +338,55 @@ impl TranscriptWindow {
                     }
                 }
             }
-            self.ingest_record(rec);
-            inserted += 1;
+            if self.ingest_record(rec) {
+                inserted += 1;
+            }
         }
         if inserted == 0 {
             return ApplyEffect::Noop;
         }
+        // Count only records that actually moved the old head; an out-of-order
+        // record inserted in the middle must not shift the viewport anchor.
+        let anchor_shift = head_before
+            .map(|head| self.blocks.iter().take_while(|b| b.seq() < head).count())
+            .unwrap_or(0);
         self.evict();
         ApplyEffect::HeadPrepend {
             inserted,
-            anchor_shift: inserted,
+            anchor_shift,
         }
     }
 
-    /// 单条记录落窗（保持升序：二分插入）。
-    fn ingest_record(&mut self, rec: SessionHistoryRecord) {
+    /// Insert one record in sequence order. Returns whether a visible block was inserted.
+    fn ingest_record(&mut self, rec: SessionHistoryRecord) -> bool {
         match &rec {
             SessionHistoryRecord::Event { event } => {
                 let Some(seq) = event.seq else {
-                    tracing::warn!(event_type = %event.event_type, "快照事件缺少 seq，跳过");
-                    return;
+                    tracing::warn!(event_type = %event.event_type, "event missing seq; skipped");
+                    return false;
                 };
                 if self.seen_seq.contains(&seq.0) {
-                    return;
+                    return false;
                 }
                 if let Some(rid) = event.request_id.as_deref() {
                     if self.seen_request.contains(rid) {
-                        return;
+                        return false;
                     }
                     self.seen_request.insert(rid.to_string());
                 }
                 self.seen_seq.insert(seq.0);
                 let block = block_from_event(event, seq);
-                let idx = self
-                    .blocks
-                    .partition_point(|b| b.seq() < seq);
+                let idx = self.blocks.partition_point(|b| b.seq() < seq);
                 self.blocks.insert(idx, block);
+                true
             }
             SessionHistoryRecord::Chunks { event: row } => {
-                if let Some(last) = self.blocks.back_mut() {
-                    if let Block::AssistantMessage { chunks, .. } = last {
-                        chunks.rows.push(row.clone());
-                        return;
-                    }
+                if let Some(Block::AssistantMessage { chunks, .. }) = self.blocks.back_mut() {
+                    chunks.rows.push(row.clone());
+                    return true;
                 }
-                tracing::warn!("chunkrow 无归属 assistant，丢弃并计入日志");
+                tracing::warn!("chunkrow has no assistant owner; skipped");
+                false
             }
         }
     }
@@ -406,16 +409,17 @@ impl TranscriptWindow {
         };
         self.turn_outline = arr
             .iter()
-            .filter_map(|item| {
-                Some(TurnOutlineItem {
-                    turn: item.get("turn").and_then(|v| v.as_u64()),
-                    seq: item.get("seq").and_then(|v| v.as_u64()).map(SessionSeq),
-                    prompt: item.get("prompt").and_then(|v| v.as_str()).map(String::from),
-                    response: item
-                        .get("response")
-                        .and_then(|v| v.as_str())
-                        .map(String::from),
-                })
+            .map(|item| TurnOutlineItem {
+                turn: item.get("turn").and_then(|v| v.as_u64()),
+                seq: item.get("seq").and_then(|v| v.as_u64()).map(SessionSeq),
+                prompt: item
+                    .get("prompt")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
+                response: item
+                    .get("response")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
             })
             .collect();
     }
@@ -461,7 +465,10 @@ fn block_from_event(ev: &SessionWireEvent, seq: SessionSeq) -> Block {
             content: str_of("content")
                 .or_else(|| data.get("content").map(|v| v.to_string()))
                 .unwrap_or_default(),
-            is_error: data.get("isError").and_then(|v| v.as_bool()).unwrap_or(false),
+            is_error: data
+                .get("isError")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
             time,
         }
     } else if t.contains("request") && t.contains("header") {
@@ -479,16 +486,13 @@ fn block_from_event(ev: &SessionWireEvent, seq: SessionSeq) -> Block {
             seq,
             attachment_id: str_of("attachmentId").or_else(|| str_of("attachment_id")),
             name: str_of("name"),
-            dims: data
-                .get("dims")
-                .map(|v| v.to_string())
-                .or_else(|| {
-                    Some(format!(
-                        "{}x{}",
-                        data.get("width").and_then(|v| v.as_u64()).unwrap_or(0),
-                        data.get("height").and_then(|v| v.as_u64()).unwrap_or(0)
-                    ))
-                }),
+            dims: data.get("dims").map(|v| v.to_string()).or_else(|| {
+                Some(format!(
+                    "{}x{}",
+                    data.get("width").and_then(|v| v.as_u64()).unwrap_or(0),
+                    data.get("height").and_then(|v| v.as_u64()).unwrap_or(0)
+                ))
+            }),
         }
     } else {
         Block::Unknown {
@@ -546,7 +550,8 @@ impl SessionStore {
                     self.windows.remove(&old);
                 }
             }
-            self.windows.insert(id.to_string(), TranscriptWindow::new(cap));
+            self.windows
+                .insert(id.to_string(), TranscriptWindow::new(cap));
         } else if let Some(pos) = self.order.iter().position(|x| x == id) {
             self.order.remove(pos);
         }
@@ -574,7 +579,9 @@ mod tests {
     }
 
     fn event_rec(seq: u64, r#type: &str, rid: Option<&str>) -> SessionHistoryRecord {
-        SessionHistoryRecord::Event { event: ev(seq, r#type, rid, None) }
+        SessionHistoryRecord::Event {
+            event: ev(seq, r#type, rid, None),
+        }
     }
 
     #[test]
@@ -610,12 +617,25 @@ mod tests {
             projections: None,
         });
         assert_eq!(
-            w.apply(Incoming::FollowEvent(ev(2, "assistant/message", None, None))),
-            ApplyEffect::TailAppended { appended: 1, anchor_stable: true }
+            w.apply(Incoming::FollowEvent(ev(
+                2,
+                "assistant/message",
+                None,
+                None
+            ))),
+            ApplyEffect::TailAppended {
+                appended: 1,
+                anchor_stable: true
+            }
         );
         // 重复 seq → Noop（AC-001-11）。
         assert_eq!(
-            w.apply(Incoming::FollowEvent(ev(2, "assistant/message", None, None))),
+            w.apply(Incoming::FollowEvent(ev(
+                2,
+                "assistant/message",
+                None,
+                None
+            ))),
             ApplyEffect::Noop
         );
         assert_eq!(w.len(), 2);
@@ -631,21 +651,44 @@ mod tests {
             projections: None,
         });
         // 同 requestId 已 apply：不同 seq 重放也必须跳过（AC-001-10）。
-        w.apply(Incoming::FollowEvent(ev(2, "assistant/message", Some("r1"), None)));
+        w.apply(Incoming::FollowEvent(ev(
+            2,
+            "assistant/message",
+            Some("r1"),
+            None,
+        )));
         assert_eq!(
-            w.apply(Incoming::FollowEvent(ev(3, "assistant/message", Some("r1"), None))),
+            w.apply(Incoming::FollowEvent(ev(
+                3,
+                "assistant/message",
+                Some("r1"),
+                None
+            ))),
             ApplyEffect::Noop
         );
         // 同 seq 同 rid 再次重复。
         assert_eq!(
-            w.apply(Incoming::FollowEvent(ev(2, "assistant/message", Some("r1"), None))),
+            w.apply(Incoming::FollowEvent(ev(
+                2,
+                "assistant/message",
+                Some("r1"),
+                None
+            ))),
             ApplyEffect::Noop
         );
         assert_eq!(w.len(), 2);
         // 恢复路径：重放被拒后，新 requestId 正常追加（状态不被污染）。
         assert_eq!(
-            w.apply(Incoming::FollowEvent(ev(4, "assistant/message", Some("r2"), None))),
-            ApplyEffect::TailAppended { appended: 1, anchor_stable: true }
+            w.apply(Incoming::FollowEvent(ev(
+                4,
+                "assistant/message",
+                Some("r2"),
+                None
+            ))),
+            ApplyEffect::TailAppended {
+                appended: 1,
+                anchor_stable: true
+            }
         );
         assert_eq!(w.tail_seq(), Some(SessionSeq(4)));
     }
@@ -655,7 +698,10 @@ mod tests {
         let mut w = TranscriptWindow::new(200);
         w.apply(Incoming::Snapshot {
             cursor: Some(SessionLogOffset(6)),
-            records: vec![event_rec(6, "user/message", None), event_rec(7, "user/message", None)],
+            records: vec![
+                event_rec(6, "user/message", None),
+                event_rec(7, "user/message", None),
+            ],
             has_more: true,
             projections: None,
         });
@@ -668,7 +714,13 @@ mod tests {
             ],
             has_more: Some(false),
         });
-        assert_eq!(eff, ApplyEffect::HeadPrepend { inserted: 2, anchor_shift: 2 });
+        assert_eq!(
+            eff,
+            ApplyEffect::HeadPrepend {
+                inserted: 2,
+                anchor_shift: 2
+            }
+        );
         assert!(!w.head_has_more(), "hasMore=false → 到顶");
         let seqs: Vec<u64> = w.blocks().map(|b| b.seq().0).collect();
         assert_eq!(seqs, vec![4, 5, 6, 7]);
@@ -688,15 +740,26 @@ mod tests {
         let mut w = TranscriptWindow::new(200);
         w.apply(Incoming::Snapshot {
             cursor: None,
-            records: vec![event_rec(10, "user/message", None), event_rec(20, "user/message", None)],
+            records: vec![
+                event_rec(10, "user/message", None),
+                event_rec(20, "user/message", None),
+            ],
             has_more: true,
             projections: None,
         });
-        w.apply(Incoming::FollowEvent(ev(30, "assistant/message", None, None)));
+        w.apply(Incoming::FollowEvent(ev(
+            30,
+            "assistant/message",
+            None,
+            None,
+        )));
         // 修复到达 seq 15（介于 10/20 之间）。
         assert_eq!(
             w.apply(Incoming::FollowEvent(ev(15, "user/message", None, None))),
-            ApplyEffect::TailAppended { appended: 1, anchor_stable: true }
+            ApplyEffect::TailAppended {
+                appended: 1,
+                anchor_stable: true
+            }
         );
         let seqs: Vec<u64> = w.blocks().map(|b| b.seq().0).collect();
         assert_eq!(seqs, vec![10, 15, 20, 30]);
@@ -706,21 +769,43 @@ mod tests {
     fn capacity_eviction_keeps_latest_and_anchor() {
         let mut w = TranscriptWindow::new(10);
         // 先放 5 条（未满）：追加不逐出 → anchor_stable。
-        let records: Vec<SessionHistoryRecord> =
-            (1..=5).map(|s| event_rec(s, "user/message", None)).collect();
-        w.apply(Incoming::Snapshot { cursor: None, records, has_more: true, projections: None });
+        let records: Vec<SessionHistoryRecord> = (1..=5)
+            .map(|s| event_rec(s, "user/message", None))
+            .collect();
+        w.apply(Incoming::Snapshot {
+            cursor: None,
+            records,
+            has_more: true,
+            projections: None,
+        });
         for s in 6..=10 {
             assert_eq!(
-                w.apply(Incoming::FollowEvent(ev(s, "assistant/message", None, None))),
-                ApplyEffect::TailAppended { appended: 1, anchor_stable: true },
+                w.apply(Incoming::FollowEvent(ev(
+                    s,
+                    "assistant/message",
+                    None,
+                    None
+                ))),
+                ApplyEffect::TailAppended {
+                    appended: 1,
+                    anchor_stable: true
+                },
                 "未满时追加 seq {s}：anchor 不动"
             );
         }
         // 窗口满（10 条）后每次追加逐出最旧 → anchor 前进（unstable）。
         for s in 11..=20 {
             assert_eq!(
-                w.apply(Incoming::FollowEvent(ev(s, "assistant/message", None, None))),
-                ApplyEffect::TailAppended { appended: 1, anchor_stable: false },
+                w.apply(Incoming::FollowEvent(ev(
+                    s,
+                    "assistant/message",
+                    None,
+                    None
+                ))),
+                ApplyEffect::TailAppended {
+                    appended: 1,
+                    anchor_stable: false
+                },
                 "满窗追加 seq {s}：逐出最旧，anchor 前进"
             );
         }
@@ -730,7 +815,10 @@ mod tests {
         assert_eq!(w.head_seq(), Some(SessionSeq(11)));
         // 已逐出 seq 的 page 重放 → Noop（seq 锚点语义，不重复加载）。
         assert_eq!(
-            w.apply(Incoming::Page { records: vec![event_rec(5, "user/message", None)], has_more: None }),
+            w.apply(Incoming::Page {
+                records: vec![event_rec(5, "user/message", None)],
+                has_more: None
+            }),
             ApplyEffect::Noop
         );
     }
@@ -753,9 +841,12 @@ mod tests {
         });
         assert_eq!(
             w.apply(Incoming::Chunks(row.clone())),
-            ApplyEffect::TailAppended { appended: 0, anchor_stable: true }
+            ApplyEffect::TailAppended {
+                appended: 0,
+                anchor_stable: true
+            }
         );
-        let last = w.blocks().last().map(|b| b.clone()).unwrap();
+        let last = w.blocks().last().cloned().unwrap();
         match last {
             Block::AssistantMessage { chunks, .. } => assert_eq!(chunks.rows, vec![row]),
             _ => panic!("尾部必须是 assistant"),
@@ -768,14 +859,23 @@ mod tests {
         w.apply(Incoming::Snapshot {
             cursor: None,
             records: vec![SessionHistoryRecord::Event {
-                event: ev(9, "future/mystery", None, Some(serde_json::json!({"k": "v"}))),
+                event: ev(
+                    9,
+                    "future/mystery",
+                    None,
+                    Some(serde_json::json!({"k": "v"})),
+                ),
             }],
             has_more: true,
             projections: None,
         });
-        let first = w.blocks().next().map(|b| b.clone()).unwrap();
+        let first = w.blocks().next().cloned().unwrap();
         match first {
-            Block::Unknown { seq, event_type, raw } => {
+            Block::Unknown {
+                seq,
+                event_type,
+                raw,
+            } => {
                 assert_eq!(seq, SessionSeq(9));
                 assert_eq!(event_type, "future/mystery");
                 assert_eq!(raw["k"], "v");
@@ -789,11 +889,19 @@ mod tests {
         let mut w = TranscriptWindow::new(200);
         w.apply(Incoming::Snapshot {
             cursor: None,
-            records: vec![event_rec(1, "user/message", None), event_rec(2, "user/message", None)],
+            records: vec![
+                event_rec(1, "user/message", None),
+                event_rec(2, "user/message", None),
+            ],
             has_more: true,
             projections: None,
         });
-        w.apply(Incoming::FollowEvent(ev(3, "assistant/message", None, None)));
+        w.apply(Incoming::FollowEvent(ev(
+            3,
+            "assistant/message",
+            None,
+            None,
+        )));
         // 重连 rebuild（不可修复缺口 → 整窗重建）。
         w.apply(Incoming::Snapshot {
             cursor: None,
@@ -806,8 +914,16 @@ mod tests {
         // 旧 requestId/seq 索引已被清空：旧 seq 可以重新进入。
         // 乱序事件插入窗口头之前 → anchor 位移（unstable 语义正确）。
         assert_eq!(
-            w.apply(Incoming::FollowEvent(ev(2, "assistant/message", None, None))),
-            ApplyEffect::TailAppended { appended: 1, anchor_stable: false }
+            w.apply(Incoming::FollowEvent(ev(
+                2,
+                "assistant/message",
+                None,
+                None
+            ))),
+            ApplyEffect::TailAppended {
+                appended: 1,
+                anchor_stable: false
+            }
         );
         assert_eq!(w.head_seq(), Some(SessionSeq(2)));
     }
@@ -834,7 +950,12 @@ mod tests {
     #[test]
     fn event_without_seq_logged_and_skipped() {
         let mut w = TranscriptWindow::new(200);
-        w.apply(Incoming::Snapshot { cursor: None, records: vec![], has_more: true, projections: None });
+        w.apply(Incoming::Snapshot {
+            cursor: None,
+            records: vec![],
+            has_more: true,
+            projections: None,
+        });
         let mut e = ev(0, "user/message", None, None);
         e.seq = None;
         assert_eq!(w.apply(Incoming::FollowEvent(e)), ApplyEffect::Noop);

@@ -108,10 +108,7 @@ pub async fn unary(
         });
     }
     if resp_body.result.ok {
-        Ok(resp_body
-            .result
-            .value
-            .unwrap_or(Value::Null))
+        Ok(resp_body.result.value.unwrap_or(Value::Null))
     } else {
         match resp_body.result.error {
             Some(e) => Err(envelope::remote_error(&e)),
