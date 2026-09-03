@@ -1,0 +1,20 @@
+# dshtui 配置示例（复制到 ~/.config/dshtui/config.toml 后修改）
+# 与 Notes/02-architecture.md §7 草案一致；CLI --url/--token 覆盖本文件。
+
+[server]
+url = "http://127.0.0.1:3080"   # dsh web 地址（默认仅连 loopback）
+token = ""                       # 可选；更推荐环境变量 DSH_TOKEN 或首次启动交互粘贴
+
+[ui]
+theme = "dark"                   # dark / light（V0.1 仅 dark 生效）
+sidebar_width_cells = 32         # 左栏列数（终端窄时自动收窄/隐藏）
+show_turn_rail = false           # 右侧 turn 导航（V0.2）
+tick_ms = 33                     # 帧循环节拍
+
+[perf]
+window_messages = 200            # 转录本窗口条数
+page_size = 50                   # session/page 每页条数
+cache_bytes = 33554432           # 图片/历史缓存上限 32MB
+rss_target_mb = 80               # 超限触发 LRU 释放
+
+[keymap]                         # 默认内置，允许覆盖（后期）

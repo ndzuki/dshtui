@@ -1,0 +1,40 @@
+[package]
+name = "dshtui"
+version = "0.1.0"
+edition = "2021"
+description = "dshtui — 官方 dsh web Remote API 的 Rust TUI 客户端（V0.1 核心底座）"
+license = "MIT"
+repository = ""
+rust-version = "1.80"
+
+# 依赖清单对齐 Notes/02-architecture.md §5（ratatui/crossterm/tokio/reqwest/
+# tokio-tungstenite/nucleo/toml/tracing/thiserror），不引入计划外框架。
+[lib]
+name = "dshtui"
+path = "src/lib.rs"
+
+[[bin]]
+name = "dshtui"
+path = "src/main.rs"
+
+[dependencies]
+ratatui = "0.29"
+crossterm = "0.28"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "fs", "signal"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "cookies"] }
+tokio-tungstenite = "0.24"
+http = "1"
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+nucleo = "0.5"
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+thiserror = "1"
+
+[dev-dependencies]
+
+[profile.release]
+opt-level = 2
