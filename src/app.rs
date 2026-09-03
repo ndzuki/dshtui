@@ -1,14 +1,20 @@
-//! AppState、事件编排与帧循环骨架（Notes/02 §3/§4；Step 4 是唯一维护
-//! mpsc 顺序的地方）。
+//! AppState, event orchestration and the frame-loop skeleton (Notes/02 §3/§4;
+//! Step 4 is the single place that maintains mpsc ordering).
 //!
-//! 设计要点（Step 4 Prototype 验证结论，`examples/proto_step4.rs`）：
-//! - 单一 reducer：`handle(event) -> Vec<Cmd>`，UI/transport 绝不直接持有模型可变引用；
-//! - page 请求**单飞**（`in_flight`）+ **generation** 防 stale response（乱序到达直接丢弃）；
-//! - **断线/reconnecting 期间禁止发 HTTP page**——只记 `want_backfill`，
-//!   refollow snapshot 完成后补发（AC-001-12 重连-分页对账）；
-//! - 任何成功的服务器响应都置 `Ready`；断线置 `Reconnecting`（状态条可见，不静默吞事件）；
-//! - running 会话退出命令顺序：cancel → terminal restore → exit（AC-001-08）；
-//! - 权限错误（PERMISSION_DENIED）不自动重试（Notes/03 §8）。
+//! Design notes (Step 4 Prototype validation, `examples/proto_step4.rs`):
+//! - single reducer: `handle(event) -> Vec<Cmd>`; UI/transport never hold a
+//!   mutable model reference directly;
+//! - page requests are **single-flight** (`in_flight`) + **generation** to
+//!   guard against stale responses (out-of-order arrivals are dropped);
+//! - **no HTTP page requests while disconnected/reconnecting** — only record
+//!   `want_backfill`, and send it after the refollow snapshot completes
+//!   (AC-001-12 reconnect-pagination reconciliation);
+//! - any successful server response sets `Ready`; a disconnect sets
+//!   `Reconnecting` (visible in the status bar, events are never swallowed
+//!   silently);
+//! - quit command order for a running session: cancel → terminal restore →
+//!   exit (AC-001-08);
+//! - permission errors (PERMISSION_DENIED) are not auto-retried (Notes/03 §8).
 
 use std::collections::HashSet;
 
@@ -24,7 +30,7 @@ pub enum Mode {
     #[default]
     Normal,
     Picker,
-    /// 预留（REQ-002 composer 扩展点）。
+    /// Reserved (REQ-002 composer extension point).
     Insert,
 }
 
@@ -41,17 +47,19 @@ pub enum ConnState {
     Connecting,
     Ready,
     Reconnecting,
-    /// 启动探测/认证失败：展示「请启动 dsh web / 检查 127.0.0.1:3080」指引（AC-001-02）。
+    /// Startup probe/auth failure: show the "please start dsh web / check
+    /// 127.0.0.1:3080" guidance (AC-001-02).
     StartupFailed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Viewport {
-    /// 视口顶部在窗口块列表中的偏移（块索引）。
+    /// Offset of the viewport top in the window block list (block index).
     pub offset: usize,
-    /// 是否贴住 live tail（流式跟随；用户向上滚动时冻结）。
+    /// Whether to stick to the live tail (streaming follow; frozen when the
+    /// user scrolls up).
     pub follow_tail: bool,
-    /// 可视高度（行）。
+    /// Visible height (lines).
     pub height: usize,
 }
 
@@ -78,17 +86,19 @@ pub struct PageGuard {
     pub in_flight: bool,
 }
 
-/// 进入 AppState 的事件（来自 api 任务 / 输入层 / 帧循环）。
+/// Events entering AppState (from api tasks / the input layer / the frame
+/// loop).
 #[derive(Debug)]
 pub enum AppEvent {
-    /// 启动：认证成功后先拉会话列表。
+    /// Startup: after auth succeeds, load the session list first.
     Startup,
     SessionListPage {
         items: Vec<ListItemRaw>,
         next_cursor: Option<String>,
     },
     SessionListError(ClientError),
-    /// workspace/follow 原始帧（api 层已容忍未知形态）。
+    /// workspace/follow raw frame (the api layer has already tolerated unknown
+    /// shapes).
     WorkspaceFrame(serde_json::Value),
     FollowSnapshot {
         session_id: SessionId,
@@ -122,7 +132,7 @@ pub enum AppEvent {
     },
     Disconnected(String),
     Reconnected,
-    /// 启动探测失败（AC-001-02 指引）。
+    /// Startup probe failed (AC-001-02 guidance).
     StartupProbeFailed(String),
     Resize {
         width: u16,
@@ -130,7 +140,7 @@ pub enum AppEvent {
     },
 }
 
-/// reducer 输出的编排命令（由 run 循环执行）。
+/// Orchestration commands emitted by the reducer (executed by the run loop).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Cmd {
     LoadSessionList {
@@ -169,18 +179,21 @@ pub struct AppState {
     pub help_open: bool,
     pub quit_requested: bool,
     pub exited: bool,
-    /// 面向用户的最近错误（状态条/指引区展示，不刷屏）。
+    /// Most recent user-facing error (shown in the status bar/guidance area,
+    /// no spam).
     pub last_error: Option<String>,
-    /// 启动指引（AC-001-02）。
+    /// Startup guidance (AC-001-02).
     pub startup_guidance: Option<String>,
-    /// 终端尺寸（渲染断点输入）。
+    /// Terminal size (render breakpoint input).
     pub width: u16,
     pub height: u16,
-    /// 窗口消息上限（配置）。
+    /// Window message cap (config).
     pub window_cap: usize,
     page_guard: PageGuard,
     want_backfill: bool,
     running_sessions: HashSet<SessionId>,
+    /// Workspaces collapsed via `h` (FR-001-03); `l` expands all.
+    pub collapsed_workspaces: HashSet<crate::api::types::WorkspaceId>,
     list_cursor: Option<String>,
     list_loaded: bool,
 }
@@ -207,6 +220,7 @@ impl Default for AppState {
             page_guard: PageGuard::default(),
             want_backfill: false,
             running_sessions: HashSet::new(),
+            collapsed_workspaces: HashSet::new(),
             list_cursor: None,
             list_loaded: false,
         }
@@ -221,7 +235,7 @@ impl AppState {
         }
     }
 
-    // ---------- 查询（UI 只读） ----------
+    // ---------- queries (UI read-only) ----------
 
     pub fn is_reconnecting(&self) -> bool {
         self.conn == ConnState::Reconnecting
@@ -240,7 +254,23 @@ impl AppState {
             .unwrap_or(false)
     }
 
-    /// AC-001-02 指引文本（探针失败时展示；含重试/退出提示）。
+    /// `loadThrough(seq)` downstream contract (REQ-003): jump the viewport to a
+    /// turn seq that is inside the loaded window. Returns false when the seq
+    /// is not loaded (caller decides whether to page through to it).
+    pub fn scroll_to_seq(&mut self, seq: SessionSeq) -> bool {
+        let Some(window) = self.active_window() else {
+            return false;
+        };
+        let Some(index) = window.offset_of(seq) else {
+            return false;
+        };
+        self.viewport.follow_tail = false;
+        self.viewport.offset = index;
+        true
+    }
+
+    /// AC-001-02 guidance text (shown when the probe fails; includes
+    /// retry/quit hints).
     pub fn guidance_text(&self) -> String {
         match &self.startup_guidance {
             Some(g) => format!(
@@ -269,7 +299,8 @@ impl AppState {
                     }
                 }
                 if next_cursor.is_some() && !self.list_loaded {
-                    // 继续分页直到列表加载完成（本地增量合并，Notes/06 §1）。
+                    // Keep paging until the list is fully loaded (local
+                    // incremental merge, Notes/06 §1).
                     self.list_cursor = next_cursor;
                     vec![Cmd::LoadSessionList {
                         cursor: self.list_cursor.clone(),
@@ -286,32 +317,15 @@ impl AppState {
                 vec![]
             }
             AppEvent::WorkspaceFrame(frame) => {
+                // Field-level frame parsing lives in api/workspace (protocol
+                // knowledge centralized in the api layer).
                 if let Some(items) = crate::api::workspace::extract_workspaces(&frame) {
                     for item in items {
-                        let id = item
-                            .get("id")
-                            .or_else(|| item.get("workspaceId"))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or_default()
-                            .to_string();
-                        if id.is_empty() {
-                            continue;
-                        }
-                        let title = item.get("title").and_then(|v| v.as_str()).map(String::from);
-                        let wid = crate::api::types::WorkspaceId(id);
-                        self.workspaces.upsert_workspace(wid.clone(), title);
-                        // Session membership: attach to the workspace this frame
-                        // item describes (never "last upserted" — frame item
-                        // order is server-owned).
-                        if let Some(sids) = item
-                            .get("sessionIds")
-                            .or_else(|| item.get("sessions"))
-                            .and_then(|v| v.as_array())
-                        {
-                            for s in sids.iter().filter_map(|s| s.as_str()) {
-                                self.workspaces
-                                    .attach_session_to_workspace(&wid, &SessionId(s.to_string()));
-                            }
+                        let wid = crate::api::types::WorkspaceId(item.id);
+                        self.workspaces.upsert_workspace(wid.clone(), item.title);
+                        for session in item.session_ids {
+                            self.workspaces
+                                .attach_session_to_workspace(&wid, &SessionId(session));
                         }
                     }
                 }
@@ -324,10 +338,16 @@ impl AppState {
                 has_more,
                 projections,
             } => {
-                // 任何成功的服务器响应都证明连接就绪。
+                // Any successful server response proves the connection is
+                // ready.
                 self.conn = ConnState::Ready;
-                self.active_session = Some(session_id.clone());
-                // running 来自官方 projections（不自算）。
+                // NOTE: active_session is only ever set by open_session. A
+                // stale snapshot from a previously opened session must not
+                // steal the selection after the user switched away
+                // (per-session windows are keyed by session id, so the data
+                // still lands correctly).
+                // `running` comes from the official projections (never
+                // self-computed).
                 let running = projections
                     .as_ref()
                     .and_then(|p| p.get("running"))
@@ -348,7 +368,8 @@ impl AppState {
                     })
                 };
                 self.adjust_viewport(&eff);
-                // 重连对账：refollow 完成后补发浏览缺口（AC-001-12）。
+                // Reconnect reconciliation: send the browsed gap after the
+                // refollow completes (AC-001-12).
                 if self.want_backfill {
                     self.want_backfill = false;
                     vec![self.page_cmd()]
@@ -375,11 +396,13 @@ impl AppState {
             }
             AppEvent::FollowError { session_id, error } => {
                 if error.class() == ErrorClass::PermissionDenied {
-                    // 权限错误不自动重试（Notes/03 §8），也不断连。
+                    // Permission errors are not auto-retried (Notes/03 §8)
+                    // and do not disconnect.
                     self.last_error = Some(format!("权限不足（{}）：{}", session_id, error));
                     vec![]
                 } else {
-                    // 其它流错误按断开处理 → 统一重连编排。
+                    // Other stream errors are treated as a disconnect →
+                    // uniform reconnect orchestration.
                     self.handle_disconnected(format!("follow 流错误: {error}"))
                 }
             }
@@ -389,7 +412,8 @@ impl AppState {
                 records,
                 has_more,
             } => {
-                // generation 校验：stale response 直接丢弃（单飞 + 防乱序）。
+                // generation check: a stale response is dropped directly
+                // (single-flight + out-of-order guard).
                 if !self.page_guard.in_flight || generation != self.page_guard.generation {
                     tracing::debug!(generation, "stale page 响应丢弃");
                     return vec![];
@@ -420,7 +444,8 @@ impl AppState {
             AppEvent::Disconnected(reason) => self.handle_disconnected(reason),
             AppEvent::Reconnected => {
                 self.conn = ConnState::Ready;
-                // 恢复后只触发一次 refollow（不重复 repair）。
+                // After recovery trigger refollow only once (no repeated
+                // repair).
                 match self.active_session.clone() {
                     Some(sid) => vec![Cmd::OpenFollow {
                         session_id: sid,
@@ -446,7 +471,8 @@ impl AppState {
 
     fn handle_disconnected(&mut self, reason: String) -> Vec<Cmd> {
         self.conn = ConnState::Reconnecting;
-        // 在途 page 作废（generation 保留，防 stale 复燃）。
+        // Void the in-flight page (generation is kept, guarding against stale
+        // resurrection).
         self.page_guard.in_flight = false;
         tracing::warn!(%reason, "连接断开 → reconnecting");
         vec![Cmd::Reconnect { delay_ms: 500 }]
@@ -456,7 +482,8 @@ impl AppState {
         self.page_guard.generation += 1;
         self.page_guard.in_flight = true;
         let session_id = self.active_session.clone().expect("page_cmd 需要活动会话");
-        // throughSeq = follow 快照 cursor；beforeSeq = 窗口最旧 seq。
+        // throughSeq = follow snapshot cursor; beforeSeq = oldest seq in the
+        // window.
         let through_seq = self
             .sessions
             .get(&session_id.0)
@@ -473,11 +500,11 @@ impl AppState {
         }
     }
 
-    /// ApplyEffect → 视口平移（滚动不抖的关键）。
+    /// ApplyEffect → viewport shift (the key to jitter-free scrolling).
     fn adjust_viewport(&mut self, eff: &ApplyEffect) {
         match eff {
             ApplyEffect::Rebuilt => {
-                // 整窗重建：贴尾。
+                // Full-window rebuild: stick to the tail.
                 self.viewport.follow_tail = true;
                 self.scroll_to_bottom();
             }
@@ -485,13 +512,15 @@ impl AppState {
                 if self.viewport.follow_tail {
                     self.scroll_to_bottom();
                 } else if !*anchor_stable {
-                    // 头部被逐出：视口同步前移，保持浏览相对位置。
+                    // Head was evicted: shift the viewport forward in sync,
+                    // keeping the relative browsing position.
                     self.viewport.offset = self.viewport.offset.saturating_sub(1);
                 }
-                // anchor_stable 且浏览中：不动（不抖）。
+                // anchor_stable while browsing: do not move (no jitter).
             }
             ApplyEffect::HeadPrepend { anchor_shift, .. } => {
-                // 前插：视口平移 anchor_shift，浏览位置不跳。
+                // Prepend: shift the viewport by anchor_shift, the browsing
+                // position does not jump.
                 self.viewport.offset += anchor_shift;
             }
             ApplyEffect::Noop => {}
@@ -505,7 +534,8 @@ impl AppState {
     }
 
     fn record_error(&mut self, e: ClientError, prefix: &str) {
-        // 权限/业务错误提示用户；网络错误只进日志 + 状态条（不刷屏）。
+        // Permission/business errors surface to the user; network errors only
+        // go to the log + status bar (no spam).
         let msg = format!("{prefix}: {e}");
         match e.class() {
             ErrorClass::Retryable => tracing::warn!(error = %msg, "可重试错误"),
@@ -516,10 +546,14 @@ impl AppState {
         }
     }
 
-    // ---------- 输入命令（Step 5 keymap 映射到此处） ----------
+    // ---------- input commands (Step 5 keymap maps here) ----------
 
     pub fn handle_command(&mut self, cmd: crate::input::Command) -> Vec<Cmd> {
         use crate::input::Command as C;
+        // Any key other than Quit cancels a pending quit confirmation.
+        if !matches!(&cmd, C::Quit) {
+            self.quit_requested = false;
+        }
         match cmd {
             C::MoveDown
             | C::MoveUp
@@ -571,7 +605,16 @@ impl AppState {
                 .filter(|sid| self.running_sessions.contains(sid))
                 .map(|sid| vec![Cmd::CancelSession(sid)])
                 .unwrap_or_default(),
-            C::CollapseProject | C::ExpandProject => vec![],
+            C::CollapseProject => {
+                for workspace in &self.workspaces.workspaces {
+                    self.collapsed_workspaces.insert(workspace.id.clone());
+                }
+                vec![]
+            }
+            C::ExpandProject => {
+                self.collapsed_workspaces.clear();
+                vec![]
+            }
             C::PickerConfirm => {
                 let chosen = self.picker_selected_session();
                 self.mode = Mode::Normal;
@@ -648,7 +691,8 @@ impl AppState {
         cmds
     }
 
-    /// 顶部且还有更早历史 → 发 page（单飞 + 仅 Ready + 断线只记 want_backfill）。
+    /// At the top with earlier history available → send a page request
+    /// (single-flight + Ready only + disconnect just records want_backfill).
     fn maybe_request_page(&mut self) -> Vec<Cmd> {
         let at_top = self.viewport.offset == 0;
         let has_more = self
@@ -692,8 +736,17 @@ impl AppState {
             .map(|meta| meta.id.clone())
     }
 
-    /// AC-001-08：运行中先 stop（cancel），再恢复终端，最后退出。
+    /// AC-001-08 / FR-001-07: `q` exits directly; a running session requests
+    /// stop first. The first Quit while running only shows a confirmation
+    /// hint (stop first, then confirm exit); the second performs cancel →
+    /// terminal restore → exit.
     pub fn quit(&mut self) -> Vec<Cmd> {
+        if self.active_running() && !self.quit_requested {
+            self.quit_requested = true;
+            self.last_error =
+                Some("运行中会话：再按一次 q 或 Ctrl+c 确认退出（将先请求 stop）".to_string());
+            return vec![];
+        }
         self.quit_requested = true;
         let mut cmds = Vec::new();
         if let Some(sid) = self.active_session.clone() {
@@ -756,7 +809,8 @@ mod tests {
         assert!(g.contains("请启动 dsh web"), "guidance={g}");
         assert!(g.contains("127.0.0.1:3080"), "guidance={g}");
         assert!(g.contains("[r] 重试"), "guidance={g}");
-        // 重试路径：RetryProbe 回到 Connecting 且清空指引（恢复不被旧状态污染）。
+        // Retry path: RetryProbe returns to Connecting and clears the guidance
+        // (recovery not polluted by old state).
         s.handle_command(C::RetryProbe);
         assert_eq!(s.conn, ConnState::Connecting);
         assert!(s.startup_guidance.is_none());
@@ -783,9 +837,9 @@ mod tests {
             Cmd::RequestPage { generation, .. } => *generation,
             _ => panic!("预期 page 命令"),
         };
-        // 在途期间再次到顶 → 不发新请求。
+        // Hit the top again while in flight → no new request.
         assert!(s.handle_command(C::GotoTop).is_empty());
-        // stale 响应丢弃。
+        // A stale response is dropped.
         let cmds = s.handle(AppEvent::PageResult {
             session_id: SessionId("s1".into()),
             generation: gen + 99,
@@ -793,7 +847,7 @@ mod tests {
             has_more: None,
         });
         assert!(cmds.is_empty());
-        // 正常完成释放单飞。
+        // Normal completion releases the single-flight slot.
         s.handle(AppEvent::PageResult {
             session_id: SessionId("s1".into()),
             generation: gen,
@@ -819,10 +873,10 @@ mod tests {
         let cmds = s.handle(AppEvent::Disconnected("eof".into()));
         assert!(s.is_reconnecting());
         assert!(cmds.iter().any(|c| matches!(c, Cmd::Reconnect { .. })));
-        // 断线期间滚动不发 HTTP page。
+        // While disconnected, scrolling never sends an HTTP page request.
         let cmds = s.handle_command(C::GotoTop);
         assert!(!cmds.iter().any(|c| matches!(c, Cmd::RequestPage { .. })));
-        // 恢复 → 只触发一次 refollow。
+        // Recovery → triggers exactly one refollow.
         let cmds = s.handle(AppEvent::Reconnected);
         assert_eq!(
             cmds.iter()
@@ -831,7 +885,8 @@ mod tests {
             1
         );
         assert_eq!(s.conn, ConnState::Ready);
-        // refollow snapshot 到达 → 补发 backfill（AC-001-12 对账）。
+        // refollow snapshot arrives → send the backfill (AC-001-12
+        // reconciliation).
         let cmds = s.handle(snapshot("s1", false));
         assert_eq!(
             cmds.iter()
@@ -866,6 +921,15 @@ mod tests {
         s.handle(AppEvent::Startup);
         s.handle_command(C::OpenSession(SessionId("s1".into())));
         s.handle(snapshot("s1", true));
+        // Running: the first quit asks for confirmation (FR-001-07) ...
+        let cmds = s.handle_command(C::Quit);
+        assert!(cmds.is_empty(), "first quit only confirms: {cmds:?}");
+        assert!(s
+            .last_error
+            .as_deref()
+            .is_some_and(|m| m.contains("确认退出")));
+        assert!(!s.exited);
+        // ... the second quit stops first, then restores, then exits.
         let cmds = s.handle_command(C::Quit);
         assert_eq!(
             cmds,
@@ -875,7 +939,7 @@ mod tests {
                 Cmd::Exit,
             ]
         );
-        // 非 running：无 cancel。
+        // Not running: no cancel, no confirmation.
         let mut s = AppState::default();
         s.handle_command(C::OpenSession(SessionId("s2".into())));
         s.handle(snapshot("s2", false));
@@ -889,7 +953,7 @@ mod tests {
         s.handle_command(C::OpenSession(SessionId("s1".into())));
         s.handle(snapshot("s1", false));
         s.viewport.height = 2;
-        // follow_tail：追加事件保持贴尾。
+        // follow_tail: appended events stay stuck to the tail.
         for i in 4..=6 {
             s.handle(AppEvent::FollowEvent {
                 session_id: SessionId("s1".into()),
@@ -906,11 +970,11 @@ mod tests {
             });
         }
         assert!(s.viewport.follow_tail);
-        // 向上滚冻结 tail。
+        // Scrolling up freezes the tail.
         s.handle_command(C::GotoTop);
         assert!(!s.viewport.follow_tail);
         assert_eq!(s.viewport.offset, 0);
-        // 追加事件不动浏览位置（anchor stable）。
+        // Appended events do not move the browsing position (anchor stable).
         s.handle(AppEvent::FollowEvent {
             session_id: SessionId("s1".into()),
             event: SessionWireEvent {
@@ -938,7 +1002,8 @@ mod tests {
             Cmd::RequestPage { generation, .. } => *generation,
             _ => 0,
         };
-        // 旧 generation 的错误不影响当前单飞。
+        // An error from an old generation must not affect the current
+        // single-flight request.
         let cmds = s.handle(AppEvent::PageError {
             session_id: SessionId("s1".into()),
             generation: gen - 1,

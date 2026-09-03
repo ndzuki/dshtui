@@ -1,18 +1,21 @@
-//! 认证：token → 内存 cookie（Notes/03 §1）。
+//! Auth: token → in-memory cookie (Notes/03 §1).
 //!
-//! - `GET {base}/?token=<token>` → `303 See Other` + `Set-Cookie: dsh-auth-<n>`；
-//! - cookie 只存 reqwest 内存 jar（cookie_store），不落盘；
-//! - 捕获 Set-Cookie 原文供 WS handshake 使用（WS 握手不走 reqwest jar）；
-//! - token 绝不进入日志（脱敏）。
+//! - `GET {base}/?token=<token>` → `303 See Other` + `Set-Cookie: dsh-auth-<n>`;
+//! - the cookie lives only in the reqwest in-memory jar (cookie_store), never
+//!   on disk;
+//! - the raw Set-Cookie value is captured for the WS handshake (the WS
+//!   handshake does not go through the reqwest jar);
+//! - the token never enters logs (redaction).
 
 use reqwest::header::SET_COOKIE;
 
 use super::envelope::ClientError;
 
-/// 认证会话：cookie 存于 reqwest jar（内存），此处只保留 WS 握手所需的原始值。
+/// Auth session: the cookie lives in the reqwest jar (in memory); only the raw
+/// value needed for the WS handshake is kept here.
 #[derive(Debug, Clone, Default)]
 pub struct AuthSession {
-    /// 原始 Set-Cookie 的 `name=value` 部分（不含属性）。
+    /// The `name=value` part of the raw Set-Cookie (attributes excluded).
     pub cookies: Vec<String>,
 }
 
@@ -33,7 +36,12 @@ pub async fn authenticate(
         .query(&[("token", token)])
         .send()
         .await
-        .map_err(|e| ClientError::Transport(format!("认证请求失败（{url}）: {e}")))?;
+        .map_err(|e| {
+            // without_url(): reqwest error Display embeds the full request URL
+            // including the `?token=` query — strip it so the secret can never
+            // reach the guidance screen or tracing logs (redaction invariant).
+            ClientError::Transport(format!("认证请求失败（{url}）: {}", e.without_url()))
+        })?;
 
     let status = resp.status();
     if !status.is_redirection() {
@@ -45,7 +53,8 @@ pub async fn authenticate(
     let mut session = AuthSession::default();
     for v in resp.headers().get_all(SET_COOKIE) {
         if let Ok(raw) = v.to_str() {
-            // 只保留 name=value 段；属性（HttpOnly/Path/…）不进入 Cookie 头。
+            // Keep only the name=value segment; attributes (HttpOnly/Path/…)
+            // never enter the Cookie header.
             let pair = raw.split(';').next().unwrap_or(raw).trim();
             if !pair.is_empty() {
                 session.cookies.push(pair.to_string());

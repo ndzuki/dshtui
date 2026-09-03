@@ -1,16 +1,24 @@
-//! 窗口化转录本与一致性合并（Notes/06 §2 / REQ-001 §5；D-3/D-4=A）。
+//! Windowed transcript and consistency merge (Notes/06 §2 / REQ-001 §5;
+//! D-3/D-4=A).
 //!
-//! 设计要点（Step 3 Prototype 验证结论，`examples/proto_step3.rs`）：
-//! - 单一 `apply(Incoming) -> ApplyEffect` 漏斗：snapshot 重建、follow 尾追、
-//!   page 前插、repair 整窗重建全部经此 seam（AppState 只消费 Effect）；
-//! - **乱序事件不能盲尾插**：快路径 seq>尾部 O(1) 尾插；慢路径二分定位插入
-//!   保持全局升序（AC-001-11「合并后顺序一致」）；
-//! - requestId 幂等先于 seq 去重判断（D-4）：同 requestId 重放不产生重复块；
-//! - 逐出最旧仅留 seq 锚点：`seen_seq` 保留逐出块的 seq，page 重叠直接丢弃；
-//! - 视口稳定由 Effect 表达：`TailAppended.anchor_stable`（尾部追加未动窗口头）
-//!   与 `HeadPrepend.anchor_shift`（前插条数），UI 据此平移滚动位置不抖动；
-//! - 模型不臆断缺口：seq 稀疏是合法形态（chunks 无独立 seq）；缺口修复由
-//!   follow/page 边界事实（hasMore、snapshot 重建）驱动，见 AppState。
+//! Design notes (Step 3 Prototype validation, `examples/proto_step3.rs`):
+//! - a single `apply(Incoming) -> ApplyEffect` funnel: snapshot rebuild, follow
+//!   tail append, page prepend and repair full-window rebuild all go through
+//!   this seam (AppState only consumes the Effect);
+//! - **out-of-order events must not be blindly tail-appended**: fast path
+//!   seq>tail is an O(1) tail append; the slow path binary-search-inserts to
+//!   keep the global ascending order (AC-001-11 "merged order consistent");
+//! - requestId idempotency comes before seq dedup (D-4): replaying the same
+//!   requestId never produces duplicate blocks;
+//! - eviction of the oldest only keeps the seq anchor: `seen_seq` retains the
+//!   seqs of evicted blocks, page overlap is discarded directly;
+//! - viewport stability is expressed via Effect:
+//!   `TailAppended.anchor_stable` (tail append did not move the window head)
+//!   and `HeadPrepend.anchor_shift` (number of prepended entries); the UI
+//!   shifts its scroll position accordingly without jitter;
+//! - the model never invents gaps: sparse seq is a legal shape (chunks carry no
+//!   independent seq); gap repair is driven by follow/page boundary facts
+//!   (hasMore, snapshot rebuild), see AppState.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -20,7 +28,8 @@ use crate::api::types::{
     ChunkRow, SessionHistoryRecord, SessionLogOffset, SessionSeq, SessionWireEvent,
 };
 
-/// 窗口元素（packed chunk rows 原样存储，不展开为逐 delta）。
+/// Window element (packed chunk rows stored as-is, never expanded into
+/// per-delta items).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Block {
     UserMessage {
@@ -55,14 +64,16 @@ pub enum Block {
         seq: SessionSeq,
         summary: String,
     },
-    /// V0.1 仅占位（REQ-004 FR-004-01 依赖 identity 保留）。
+    /// V0.1 placeholder only (REQ-004 FR-004-01 depends on identity
+    /// preservation).
     Image {
         seq: SessionSeq,
         attachment_id: Option<String>,
         name: Option<String>,
         dims: Option<String>,
     },
-    /// 未知事件：event type + 原始 payload 原样保留（D-4 下游契约），不渲染不丢弃。
+    /// Unknown event: event type + raw payload preserved as-is (D-4 downstream
+    /// contract), never rendered, never dropped.
     Unknown {
         seq: SessionSeq,
         event_type: String,
@@ -89,13 +100,15 @@ impl Block {
     }
 }
 
-/// packed chunk rows 原样存储（官方低内存优化的关键，Notes/03 §4.3）。
+/// packed chunk rows stored as-is (key to the official low-memory
+/// optimization, Notes/03 §4.3).
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct PackedChunks {
     pub rows: Vec<ChunkRow>,
 }
 
-/// 轮次元数据（turnOutline 解析结果；下游 REQ-003 FR-003-02/04 契约）。
+/// Turn metadata (turnOutline parse result; downstream REQ-003 FR-003-02/04
+/// contract).
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct TurnOutlineItem {
     pub turn: Option<u64>,
@@ -104,7 +117,7 @@ pub struct TurnOutlineItem {
     pub response: Option<String>,
 }
 
-/// 进入窗口的输入（由 AppState 把 api 事件映射为此类型）。
+/// Input entering the window (AppState maps api events to this type).
 #[derive(Debug, Clone)]
 pub enum Incoming {
     Snapshot {
@@ -114,7 +127,7 @@ pub enum Incoming {
         projections: Option<Value>,
     },
     FollowEvent(SessionWireEvent),
-    /// 独立 chunk row：归入最近一个 AssistantMessage。
+    /// Independent chunk row: attached to the most recent AssistantMessage.
     Chunks(ChunkRow),
     Page {
         records: Vec<SessionHistoryRecord>,
@@ -122,37 +135,42 @@ pub enum Incoming {
     },
 }
 
-/// apply 的效果（AppState 据此发起 backfill/refollow、平移视口）。
+/// Effect of apply (AppState uses it to trigger backfill/refollow and shift
+/// the viewport).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApplyEffect {
-    /// 整窗重建（snapshot）。
+    /// Full-window rebuild (snapshot).
     Rebuilt,
-    /// 尾部追加：anchor_stable=true 表示窗口头（滚动锚点）未被逐出。
+    /// Tail append: anchor_stable=true means the window head (scroll anchor)
+    /// was not evicted.
     TailAppended {
         appended: usize,
         anchor_stable: bool,
     },
-    /// 头部前插：anchor_shift=实际新插入条数（UI 平移滚动位置）。
+    /// Head prepend: anchor_shift=number of entries actually inserted (the UI
+    /// shifts the scroll position by it).
     HeadPrepend {
         inserted: usize,
         anchor_shift: usize,
     },
-    /// 全部去重/幂等跳过，无可见变化。
+    /// Everything deduplicated / idempotently skipped; no visible change.
     Noop,
 }
 
-/// 窗口化转录本（上限 window_messages，默认 200）。
+/// Windowed transcript (bounded by window_messages, default 200).
 #[derive(Debug, Clone)]
 pub struct TranscriptWindow {
     blocks: VecDeque<Block>,
     cap: usize,
-    /// 是否到顶（page hasMore=false）。
+    /// Whether the top has been reached (page hasMore=false).
     head_has_more: bool,
-    /// follow 快照 cursor（session/page 的 throughSeq；-1 表示空日志）。
+    /// follow snapshot cursor (throughSeq for session/page; -1 means an empty
+    /// log).
     cursor: Option<SessionLogOffset>,
-    /// 投影快照（官方口径，全部从 raw 读取，不自算）。
+    /// Projection snapshot (official convention; all reads go through raw,
+    /// never self-computed).
     projections: Value,
-    /// 轮次元数据（下游契约）。
+    /// Turn metadata (downstream contract).
     turn_outline: Vec<TurnOutlineItem>,
     seen_seq: HashSet<u64>,
     seen_request: HashSet<String>,
@@ -178,7 +196,7 @@ impl TranscriptWindow {
         }
     }
 
-    // ---------- 查询（UI 只读） ----------
+    // ---------- queries (UI read-only) ----------
 
     pub fn blocks(&self) -> impl Iterator<Item = &Block> {
         self.blocks.iter()
@@ -192,18 +210,25 @@ impl TranscriptWindow {
         self.blocks.is_empty()
     }
 
-    /// 窗口最旧已加载 seq（滚动锚点）。
+    /// Oldest loaded seq in the window (scroll anchor).
     pub fn head_seq(&self) -> Option<SessionSeq> {
         self.blocks.front().map(|b| b.seq())
     }
 
-    /// 窗口最新 seq（live tail）。
+    /// Newest seq in the window (live tail).
     pub fn tail_seq(&self) -> Option<SessionSeq> {
         self.blocks.back().map(|b| b.seq())
     }
 
     pub fn head_has_more(&self) -> bool {
         self.head_has_more
+    }
+
+    /// Block index of a seq within the loaded window, if present.
+    /// Downstream contract: `loadThrough(seq)` scroll support (REQ-003) uses
+    /// this to jump to a turn without loading through intermediate pages.
+    pub fn offset_of(&self, seq: SessionSeq) -> Option<usize> {
+        self.blocks.iter().position(|b| b.seq() == seq)
     }
 
     pub fn cursor(&self) -> Option<SessionLogOffset> {
@@ -218,12 +243,12 @@ impl TranscriptWindow {
         &self.turn_outline
     }
 
-    /// 某 seq 是否已在窗口内。
+    /// Whether a seq is already inside the window.
     pub fn contains_seq(&self, seq: SessionSeq) -> bool {
         self.seen_seq.contains(&seq.0)
     }
 
-    // ---------- 写入口（单一漏斗） ----------
+    // ---------- write entry (single funnel) ----------
 
     pub fn apply(&mut self, incoming: Incoming) -> ApplyEffect {
         match incoming {
@@ -246,7 +271,8 @@ impl TranscriptWindow {
         has_more: bool,
         projections: Option<Value>,
     ) -> ApplyEffect {
-        // 整窗重建：清空全部索引（不可修复缺口 → rebuild 的语义，Notes/06 §2）。
+        // Full-window rebuild: clear all indexes (an unfixable gap → rebuild
+        // semantics, Notes/06 §2).
         self.blocks.clear();
         self.seen_seq.clear();
         self.seen_request.clear();
@@ -264,11 +290,13 @@ impl TranscriptWindow {
 
     fn apply_event(&mut self, ev: &SessionWireEvent) -> ApplyEffect {
         let Some(seq) = ev.seq else {
-            // 无 seq 事件：不可参与去重/排序，原样计入日志不落窗口。
+            // Event without seq: cannot take part in dedup/sorting; log it
+            // as-is and never put it in the window.
             tracing::warn!(event_type = %ev.event_type, "事件缺少 seq，跳过（计入日志）");
             return ApplyEffect::Noop;
         };
-        // requestId 幂等（D-4）先于 seq 去重：同 requestId 已 apply → 跳过（不论 seq）。
+        // requestId idempotency (D-4) comes before seq dedup: if the same
+        // requestId was already applied → skip (regardless of seq).
         if let Some(rid) = ev.request_id.as_deref() {
             if self.seen_request.contains(rid) {
                 return ApplyEffect::Noop;
@@ -283,7 +311,8 @@ impl TranscriptWindow {
         }
         let head_before = self.head_seq();
         let block = block_from_event(ev, seq);
-        // 快路径尾插 / 慢路径二分定位（乱序修复事件保持升序）。
+        // Fast-path tail append / slow-path binary-search insert (repair
+        // events arriving out of order stay ascending).
         if self
             .blocks
             .back()
@@ -298,17 +327,26 @@ impl TranscriptWindow {
         self.evict();
         ApplyEffect::TailAppended {
             appended: 1,
-            // anchor_stable：尾部追加未移动窗口头（滚动锚点稳定，UI 不抖）。
+            // anchor_stable: the tail append did not move the window head
+            // (scroll anchor stable, no UI jitter).
             anchor_stable: head_before.is_none() || self.head_seq() == head_before,
         }
     }
 
     fn apply_chunks(&mut self, row: ChunkRow) -> ApplyEffect {
-        // chunks 无独立 seq：归入最近一个 AssistantMessage（官方顺序保证紧跟）。
-        if let Some(Block::AssistantMessage { chunks, .. }) = self.blocks.back_mut() {
+        // chunks carry no independent seq: attach to the most recent
+        // AssistantMessage (the official ordering guarantees it follows
+        // immediately).
+        // Find the LAST assistant block (not just the window tail): an
+        // out-of-order event inserted at the tail must not steal the chunks.
+        if let Some(chunks) = self.blocks.iter_mut().rev().find_map(|b| match b {
+            Block::AssistantMessage { chunks, .. } => Some(chunks),
+            _ => None,
+        }) {
             chunks.rows.push(row);
             return ApplyEffect::TailAppended {
-                appended: 0, // 块数不变（行并入既有块），仅内容变化
+                appended: 0, // block count unchanged (row merged into the
+                // existing block), content only
                 anchor_stable: true,
             };
         }
@@ -381,7 +419,13 @@ impl TranscriptWindow {
                 true
             }
             SessionHistoryRecord::Chunks { event: row } => {
-                if let Some(Block::AssistantMessage { chunks, .. }) = self.blocks.back_mut() {
+                // Attach to the LAST assistant block in the window, not the
+                // window tail: a repair event inserted at the tail after the
+                // snapshot must not capture chunks that follow the assistant.
+                if let Some(chunks) = self.blocks.iter_mut().rev().find_map(|b| match b {
+                    Block::AssistantMessage { chunks, .. } => Some(chunks),
+                    _ => None,
+                }) {
                     chunks.rows.push(row.clone());
                     return true;
                 }
@@ -393,12 +437,14 @@ impl TranscriptWindow {
 
     fn evict(&mut self) {
         while self.blocks.len() > self.cap {
-            // 逐出最旧，仅留 seq 锚点（seen_seq 保留：page 重叠重放直接丢弃）。
+            // Evict the oldest, keeping only the seq anchor (seen_seq retains the
+            // evicted seqs: replayed page overlap is discarded directly).
             self.blocks.pop_front();
         }
     }
 
-    /// 从 projections.turnOutline 解析轮次元数据（解析失败保留空，不臆造）。
+    /// Parse turn metadata from projections.turnOutline (on parse failure keep
+    /// it empty, never invent).
     fn parse_turn_outline(&mut self) {
         let Some(arr) = self
             .projections
@@ -425,7 +471,7 @@ impl TranscriptWindow {
     }
 }
 
-/// 从 wire 事件构造 Block（未知类型原样保留 raw，D-4）。
+/// Build a Block from a wire event (unknown types keep raw as-is, D-4).
 fn block_from_event(ev: &SessionWireEvent, seq: SessionSeq) -> Block {
     let t = ev.event_type.as_str();
     let data = ev.data.clone().unwrap_or(Value::Null);
@@ -517,7 +563,8 @@ fn record_request_id(rec: &SessionHistoryRecord) -> Option<&str> {
     }
 }
 
-/// 多会话窗口缓存（LRU，仅保留最近 3 窗口，Notes/06 §7）。
+/// Multi-session window cache (LRU, keeps only the 3 most recent windows,
+/// Notes/06 §7).
 #[derive(Debug, Default)]
 pub struct SessionStore {
     windows: HashMap<String, TranscriptWindow>,
@@ -542,7 +589,8 @@ impl SessionStore {
         self.windows.get_mut(id)
     }
 
-    /// 打开/触摸会话窗口：不存在则新建（LRU 逐出最久未用）。
+    /// Open/touch a session window: create it if absent (LRU-evicts the least
+    /// recently used).
     pub fn touch(&mut self, id: &str, cap: usize) -> &mut TranscriptWindow {
         if !self.windows.contains_key(id) {
             if self.order.len() >= self.cap.max(1) {
@@ -628,7 +676,7 @@ mod tests {
                 anchor_stable: true
             }
         );
-        // 重复 seq → Noop（AC-001-11）。
+        // Duplicate seq → Noop (AC-001-11).
         assert_eq!(
             w.apply(Incoming::FollowEvent(ev(
                 2,
@@ -650,7 +698,8 @@ mod tests {
             has_more: true,
             projections: None,
         });
-        // 同 requestId 已 apply：不同 seq 重放也必须跳过（AC-001-10）。
+        // Same requestId already applied: a replay with a different seq must
+        // also be skipped (AC-001-10).
         w.apply(Incoming::FollowEvent(ev(
             2,
             "assistant/message",
@@ -666,7 +715,7 @@ mod tests {
             ))),
             ApplyEffect::Noop
         );
-        // 同 seq 同 rid 再次重复。
+        // Same seq and same rid repeated again.
         assert_eq!(
             w.apply(Incoming::FollowEvent(ev(
                 2,
@@ -677,7 +726,8 @@ mod tests {
             ApplyEffect::Noop
         );
         assert_eq!(w.len(), 2);
-        // 恢复路径：重放被拒后，新 requestId 正常追加（状态不被污染）。
+        // Recovery path: after the replay is rejected, a new requestId
+        // appends normally (state not polluted).
         assert_eq!(
             w.apply(Incoming::FollowEvent(ev(
                 4,
@@ -709,7 +759,7 @@ mod tests {
             records: vec![
                 event_rec(4, "user/message", None),
                 event_rec(5, "user/message", None),
-                // 与窗口重叠（AC-001-11 并发交错）。
+                // Overlaps the window (AC-001-11 concurrent interleaving).
                 event_rec(6, "user/message", None),
             ],
             has_more: Some(false),
@@ -724,7 +774,7 @@ mod tests {
         assert!(!w.head_has_more(), "hasMore=false → 到顶");
         let seqs: Vec<u64> = w.blocks().map(|b| b.seq().0).collect();
         assert_eq!(seqs, vec![4, 5, 6, 7]);
-        // 全部重叠 → Noop。
+        // Everything overlaps → Noop.
         assert_eq!(
             w.apply(Incoming::Page {
                 records: vec![event_rec(4, "user/message", None)],
@@ -736,7 +786,8 @@ mod tests {
 
     #[test]
     fn out_of_order_event_inserted_sorted() {
-        // 乱序事件（seq < 尾部）不能盲尾插——必须二分定位保持升序。
+        // An out-of-order event (seq < tail) must not be blindly tail
+        // appended — binary-search insert to stay ascending.
         let mut w = TranscriptWindow::new(200);
         w.apply(Incoming::Snapshot {
             cursor: None,
@@ -753,7 +804,7 @@ mod tests {
             None,
             None,
         )));
-        // 修复到达 seq 15（介于 10/20 之间）。
+        // A repair arrives at seq 15 (between 10/20).
         assert_eq!(
             w.apply(Incoming::FollowEvent(ev(15, "user/message", None, None))),
             ApplyEffect::TailAppended {
@@ -768,7 +819,8 @@ mod tests {
     #[test]
     fn capacity_eviction_keeps_latest_and_anchor() {
         let mut w = TranscriptWindow::new(10);
-        // 先放 5 条（未满）：追加不逐出 → anchor_stable。
+        // First place 5 entries (not full yet): append evicts nothing →
+        // anchor_stable.
         let records: Vec<SessionHistoryRecord> = (1..=5)
             .map(|s| event_rec(s, "user/message", None))
             .collect();
@@ -793,7 +845,8 @@ mod tests {
                 "未满时追加 seq {s}：anchor 不动"
             );
         }
-        // 窗口满（10 条）后每次追加逐出最旧 → anchor 前进（unstable）。
+        // Once the window is full (10 entries), every append evicts the oldest
+        // → the anchor advances (unstable).
         for s in 11..=20 {
             assert_eq!(
                 w.apply(Incoming::FollowEvent(ev(
@@ -813,7 +866,8 @@ mod tests {
         let seqs: Vec<u64> = w.blocks().map(|b| b.seq().0).collect();
         assert_eq!(seqs, (11..=20).collect::<Vec<_>>());
         assert_eq!(w.head_seq(), Some(SessionSeq(11)));
-        // 已逐出 seq 的 page 重放 → Noop（seq 锚点语义，不重复加载）。
+        // Page replay of an already-evicted seq → Noop (seq anchor semantics,
+        // never loaded twice).
         assert_eq!(
             w.apply(Incoming::Page {
                 records: vec![event_rec(5, "user/message", None)],
@@ -902,7 +956,7 @@ mod tests {
             None,
             None,
         )));
-        // 重连 rebuild（不可修复缺口 → 整窗重建）。
+        // Reconnect rebuild (unfixable gap → full-window rebuild).
         w.apply(Incoming::Snapshot {
             cursor: None,
             records: vec![event_rec(7, "user/message", None)],
@@ -911,8 +965,9 @@ mod tests {
         });
         let seqs: Vec<u64> = w.blocks().map(|b| b.seq().0).collect();
         assert_eq!(seqs, vec![7]);
-        // 旧 requestId/seq 索引已被清空：旧 seq 可以重新进入。
-        // 乱序事件插入窗口头之前 → anchor 位移（unstable 语义正确）。
+        // The old requestId/seq indexes are cleared: old seqs may re-enter.
+        // An out-of-order event inserted before the window head → anchor shift
+        // (unstable semantics correct).
         assert_eq!(
             w.apply(Incoming::FollowEvent(ev(
                 2,
@@ -976,7 +1031,7 @@ mod tests {
         store.touch("d", 200);
         assert!(store.get("a").is_none(), "LRU 逐出最久未用");
         assert!(store.get("b").is_some());
-        // 触摸后 a 之外的顺序正确。
+        // After the touch, the order is correct for everyone except a.
         store.touch("b", 200);
         store.touch("e", 200);
         assert!(store.get("c").is_none());

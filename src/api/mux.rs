@@ -1,12 +1,14 @@
-//! WebSocket 多路复用 `/api/remote.mux`（Notes/03 §2.2）。
+//! WebSocket multiplexing for `/api/remote.mux` (Notes/03 §2.2).
 //!
-//! 设计要点（来自 Step 2 Prototype 验证结论）：
-//! - `WebSocketStream` 不可 Clone：多 stream responder 共享写半必须
-//!   `Arc<Mutex<SplitSink>>`，本实现为「单读循环分发 + 共享写锁」；
-//! - `cancel` 是尽力而为：客户端在 cancel 后**丢弃**该 stream 的在途帧
-//!   （从注册表摘除即隔离，不影响其他 stream）；
-//! - 连接断开时向所有活跃 stream 广播 `Transport` 错误，由上层 orchestrator
-//!   统一重连（上限 10s 指数退避）。
+//! Design notes (from the Step 2 Prototype validation):
+//! - `WebSocketStream` is not `Clone`: multiple stream responders must share the
+//!   write half through `Arc<Mutex<SplitSink>>`; this implementation uses a
+//!   "single read loop for dispatch + shared write lock";
+//! - `cancel` is best-effort: after a cancel the client **drops** that stream's
+//!   in-flight frames (removal from the registry isolates it; other streams are
+//!   unaffected);
+//! - On disconnect a `Transport` error is broadcast to all active streams, and
+//!   the upper orchestrator reconnects uniformly (10s exponential backoff cap).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -33,21 +35,21 @@ type WsStream = tokio_tungstenite::WebSocketStream<MaybeTlsStream<tokio::net::Tc
 /// Per-stream response channel registry.
 type StreamMap = HashMap<u64, mpsc::Sender<Result<Value, ClientError>>>;
 
-/// 一条 mux stream 的接收端。
+/// Receive end of one mux stream.
 pub struct StreamHandle {
     pub id: u64,
     rx: mpsc::Receiver<Result<Value, ClientError>>,
 }
 
 impl StreamHandle {
-    /// 下一帧：`Some(Ok(value))`=item；`Some(Err(e))`=stream error；
-    /// `None`=end / 连接关闭 / cancel 摘除。
+    /// Next frame: `Some(Ok(value))`=item; `Some(Err(e))`=stream error;
+    /// `None`=end / connection closed / removed by cancel.
     pub async fn next(&mut self) -> Option<Result<Value, ClientError>> {
         self.rx.recv().await
     }
 }
 
-/// 已连接的 mux：打开/取消 stream。
+/// A connected mux: open/cancel streams.
 pub struct Mux {
     sink: Arc<Mutex<Sink>>,
     streams: Arc<Mutex<StreamMap>>,
@@ -68,7 +70,8 @@ struct ServerFrame {
 }
 
 impl Mux {
-    /// 连接 `ws://{host}/api/remote.mux`，携带认证 cookie 完成握手。
+    /// Connect to `ws://{host}/api/remote.mux`, completing the handshake with
+    /// the auth cookie.
     pub async fn connect(ws_url: &str, cookie_header: &str) -> Result<Self, ClientError> {
         let mut req = ws_url
             .into_client_request()
@@ -86,7 +89,7 @@ impl Mux {
         Ok(Self::from_socket(ws))
     }
 
-    /// 从已建立连接的 socket 构造（测试/复用路径）。
+    /// Construct from an already-connected socket (test/reuse path).
     pub fn from_socket(ws: WsStream) -> Self {
         let (sink, mut stream) = ws.split();
         let streams: Arc<Mutex<StreamMap>> = Arc::new(Mutex::new(HashMap::new()));
@@ -97,7 +100,8 @@ impl Mux {
             next_id: AtomicU64::new(1),
         };
 
-        // 单读循环：item → 对应 stream 通道；end → 关闭通道；error → 错误帧。
+        // Single read loop: item → matching stream channel; end → close the
+        // channel; error → error frame.
         let streams2 = streams.clone();
         tokio::spawn(async move {
             loop {
@@ -142,12 +146,13 @@ impl Mux {
                                 }
                             }
                             _ => {
-                                // 未知帧类型容忍（Notes/03 §7 兼容动作），计入日志。
+                                // Tolerate unknown frame types (Notes/03 §7
+                                // compatibility action); log and skip.
                                 tracing::warn!(kind = %frame.kind, "mux 未知帧类型，跳过");
                             }
                         }
                     }
-                    Some(Ok(_)) => {} // ping/pong/binary 忽略
+                    Some(Ok(_)) => {} // ping/pong/binary ignored
                     Some(Err(e)) => {
                         tracing::warn!(error = %e, "mux 连接读错误，广播断开");
                         break;
@@ -155,7 +160,8 @@ impl Mux {
                     None => break,
                 }
             }
-            // 连接断开：所有活跃 stream 广播 Transport 错误（上层统一重连）。
+            // Connection closed: broadcast a Transport error to all active
+            // streams (the upper layer reconnects uniformly).
             let mut guard = streams2.lock().await;
             let ids = guard.keys().copied().collect::<Vec<_>>();
             for id in ids {
@@ -169,7 +175,7 @@ impl Mux {
         mux
     }
 
-    /// 打开一个 stream（open 帧），返回接收 handle。
+    /// Open a stream (open frame), returning the receive handle.
     pub async fn open_stream(
         &self,
         endpoint: &str,
@@ -185,7 +191,8 @@ impl Mux {
             "payload": {"args": args}
         });
         if let Err(e) = self.send(&frame).await {
-            // 打开发送失败：回滚注册并报错（fail-fast，不静默）。
+            // Open send failed: roll back the registration and fail fast
+            // (never fail silently).
             self.streams.lock().await.remove(&id);
             return Err(ClientError::Transport(format!(
                 "open {endpoint} 发送失败: {e}"
@@ -195,7 +202,8 @@ impl Mux {
         Ok(StreamHandle { id, rx })
     }
 
-    /// 取消 stream（cancel 帧 + 摘除注册表；后续在途帧被丢弃）。
+    /// Cancel a stream (cancel frame + registry removal; later in-flight
+    /// frames are dropped).
     pub async fn cancel_stream(&self, id: u64) {
         let frame = serde_json::json!({"type": "cancel", "streamId": id});
         let _ = self.send(&frame).await;

@@ -1,20 +1,23 @@
-//! 配置加载与 CLI 解析（REQ-001 §3 输入契约 / Notes/02 §7）。
+//! Config loading and CLI parsing (REQ-001 §3 input contract / Notes/02 §7).
 //!
-//! 安全约束（REQ-001 §7，D-2=A）：
-//! - `--token` 是**环境变量名选择器**（默认 `DSH_TOKEN`），secret 永不进入 argv；
-//! - token 优先级：CLI 选择器 > 环境变量 `DSH_TOKEN` > 配置文件 `server.token` > 交互粘贴；
-//! - 日志/展示必须脱敏（`redact`），非 loopback 地址显式警告。
+//! Security constraints (REQ-001 §7, D-2=A):
+//! - `--token` is an **environment variable name selector** (default
+//!   `DSH_TOKEN`); the secret never enters argv;
+//! - token precedence: CLI selector > env var `DSH_TOKEN` > config file
+//!   `server.token` > interactive paste;
+//! - log/display output must be redacted (`redact`); non-loopback addresses
+//!   trigger an explicit warning.
 
 use std::env;
 use std::path::PathBuf;
 
 use serde::Deserialize;
 
-/// CLI 解析结果。
+/// CLI parse result.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Cli {
     pub url: Option<String>,
-    /// 环境变量名选择器（D-2），非 secret 本身。
+    /// Environment variable name selector (D-2), not the secret itself.
     pub token_env: Option<String>,
     pub log_file: Option<String>,
     pub action: CliAction,
@@ -28,7 +31,7 @@ pub enum CliAction {
     Version,
 }
 
-/// `~/.config/dshtui/config.toml` 的完整结构（Notes/02 §7 草案）。
+/// Full structure of `~/.config/dshtui/config.toml` (Notes/02 §7 draft).
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -67,7 +70,7 @@ pub struct PerfConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct KeymapConfig {}
 
-/// 合并后的生效配置（CLI 覆盖文件）。
+/// Effective merged config (CLI overrides file).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Effective {
     pub url: String,
@@ -117,7 +120,8 @@ impl Default for PerfConfig {
 }
 
 impl Config {
-    /// 加载配置文件；文件不存在返回默认配置（不报错）。
+    /// Load the config file; a missing file returns the default config
+    /// (no error).
     pub fn load(path: Option<&std::path::Path>) -> Result<Self, ConfigError> {
         let path = match path {
             Some(p) => p.to_path_buf(),
@@ -137,7 +141,8 @@ impl Config {
         cfg.validate()
     }
 
-    /// 合并 CLI 覆盖并解析 token 来源（不包含交互粘贴——由调用方在 TTY 上补齐）。
+    /// Merge CLI overrides and resolve the token source (interactive paste is
+    /// excluded — the caller fills it in on the TTY).
     pub fn resolve(&self, cli: &Cli) -> Result<Effective, ConfigError> {
         let url = cli.url.clone().unwrap_or_else(|| {
             if self.server.url.trim().is_empty() {
@@ -147,7 +152,8 @@ impl Config {
             }
         });
 
-        // token 优先级：CLI 选择器 > DSH_TOKEN > 配置文件 > 无（交互粘贴）。
+        // token precedence: CLI selector > DSH_TOKEN > config file > none
+        // (interactive paste).
         let token = match &cli.token_env {
             Some(name) => Some(resolve_token_env(name)?),
             None => match env::var(DEFAULT_TOKEN_ENV) {
@@ -212,7 +218,8 @@ fn resolve_token_env(name: &str) -> Result<String, ConfigError> {
     }
 }
 
-/// 默认配置路径：`$XDG_CONFIG_HOME/dshtui/config.toml` 或 `~/.config/dshtui/config.toml`。
+/// Default config path: `$XDG_CONFIG_HOME/dshtui/config.toml` or
+/// `~/.config/dshtui/config.toml`.
 pub fn default_config_path() -> PathBuf {
     if let Some(xdg) = env::var_os("XDG_CONFIG_HOME") {
         if !xdg.is_empty() {
@@ -228,12 +235,14 @@ pub fn default_config_path() -> PathBuf {
     PathBuf::from(".config").join("dshtui").join("config.toml")
 }
 
-/// 解析 CLI 参数。`--token` 只接受环境变量名；secret 永不进入 argv。
-/// 兼容完整 argv 形式：首个非 `-` 开头参数视为程序名被跳过（argv[0]）。
+/// Parse CLI args. `--token` accepts only an environment variable name; the
+/// secret never enters argv.
+/// Compatible with the full argv form: the first argument not starting with
+/// `-` is treated as the program name and skipped (argv[0]).
 pub fn parse_cli<I: IntoIterator<Item = String>>(args: I) -> Result<Cli, String> {
     let mut cli = Cli::default();
     let mut it = args.into_iter().peekable();
-    // 跳过 argv[0]（程序名）。
+    // Skip argv[0] (program name).
     if let Some(first) = it.peek() {
         if !first.starts_with('-') {
             it.next();
@@ -272,7 +281,8 @@ pub fn parse_cli<I: IntoIterator<Item = String>>(args: I) -> Result<Cli, String>
     Ok(cli)
 }
 
-/// 启发式：疑似 secret 的环境变量名（长、含特殊字符）拒绝通过 `--token` 传入。
+/// Heuristic: environment variable names that look like secrets (long, with
+/// special characters) are rejected when passed via `--token`.
 fn looks_like_secret(v: &str) -> bool {
     v.len() > 64
         || !v
@@ -280,7 +290,8 @@ fn looks_like_secret(v: &str) -> bool {
             .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
 }
 
-/// 判定 URL 是否 loopback（默认仅连 loopback；非 loopback 需显式警告，REQ §7）。
+/// Determine whether a URL is loopback (loopback-only by default; a
+/// non-loopback address needs an explicit warning, REQ §7).
 pub fn is_loopback(url: &str) -> bool {
     matches!(
         host_of(url).to_ascii_lowercase().as_str(),
@@ -288,7 +299,7 @@ pub fn is_loopback(url: &str) -> bool {
     )
 }
 
-/// 提取 URL 的 host（支持 `[::1]:3080` IPv6 形式与 user@host）。
+/// Extract the URL host (supports the `[::1]:3080` IPv6 form and user@host).
 fn host_of(url: &str) -> &str {
     let rest = url.split("://").nth(1).unwrap_or(url);
     let authority = rest.split('/').next().unwrap_or(rest);
@@ -303,7 +314,7 @@ fn host_of(url: &str) -> &str {
     }
 }
 
-/// 配置/环境的展示与日志脱敏：绝不打印 token。
+/// Redact config/env display and logging: the token is never printed.
 pub fn redact_summary(eff: &Effective) -> String {
     format!(
         "url={} token={} window_messages={} page_size={} tick_ms={}",
@@ -349,7 +360,8 @@ mod tests {
         (dir, path)
     }
 
-    // 避免引入 tempfile 依赖的最小临时目录实现（每实例唯一路径，防并行测试互踩）。
+    // Minimal temp-dir implementation avoiding the tempfile dependency
+    // (unique per-instance path, prevents parallel tests from colliding).
     mod tempdir {
         use std::sync::atomic::{AtomicU64, Ordering};
         static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -416,7 +428,8 @@ mod tests {
 
     #[test]
     fn cli_rejects_secret_as_token_arg() {
-        // secret 形状（含小写/特殊字符）被拒——`--token` 只接受环境变量名（D-2）。
+        // Secret shapes (lowercase/special chars) are rejected — `--token`
+        // accepts only environment variable names (D-2).
         let err = parse_cli([
             "dshtui".to_string(),
             "--token".into(),
@@ -482,10 +495,11 @@ window_messages = 100
 
     #[test]
     fn resolve_precedence_cli_selector_over_env() {
-        // 环境变量是进程全局状态，优先级矩阵必须串行执行（单测试内顺序断言）。
+        // Environment variables are process-global state; the precedence
+        // matrix must run serially (ordered assertions within one test).
         let _g = EnvGuard::remove(&["DSH_TOKEN", "MY_DSH_TOKEN", "CLI_TOKEN", "NOPE_TOKEN"]);
 
-        // 1) CLI 选择器优先于 DSH_TOKEN。
+        // 1) CLI selector takes precedence over DSH_TOKEN.
         std::env::set_var("CLI_TOKEN", "from-cli");
         std::env::set_var("DSH_TOKEN", "from-default-env");
         let cfg = Config::load(Some(std::path::Path::new("/nonexistent/dshtui.toml"))).unwrap();
@@ -497,24 +511,25 @@ window_messages = 100
             .unwrap();
         assert_eq!(eff.token.as_deref(), Some("from-cli"));
 
-        // 2) DSH_TOKEN 优先于配置文件。
+        // 2) DSH_TOKEN takes precedence over the config file.
         let (_dir, path) = tmp_config("[server]\ntoken = \"cfg-token\"\n");
         let cfg = Config::load(Some(&path)).unwrap();
         let eff = cfg.resolve(&Cli::default()).unwrap();
         assert_eq!(eff.token.as_deref(), Some("from-default-env"));
 
-        // 3) 无环境变量时回退配置文件 token。
+        // 3) No env var → fall back to the config file token.
         std::env::remove_var("DSH_TOKEN");
         let eff = cfg.resolve(&Cli::default()).unwrap();
         assert_eq!(eff.token.as_deref(), Some("cfg-token"));
 
-        // 4) 全无 → token 为 None（主循环交互粘贴）。
+        // 4) Nothing at all → token is None (main loop pastes interactively).
         let (_dir2, path2) = tmp_config("");
         let cfg2 = Config::load(Some(&path2)).unwrap();
         let eff2 = cfg2.resolve(&Cli::default()).unwrap();
         assert_eq!(eff2.token, None);
 
-        // 5) CLI 选择的环境变量不存在 → 明确报错（失败场景：fail-fast）。
+        // 5) The CLI-selected env var does not exist → explicit error
+        // (failure scenario: fail-fast).
         let err = cfg2
             .resolve(&Cli {
                 token_env: Some("NOPE_TOKEN".into()),
@@ -526,7 +541,8 @@ window_messages = 100
             "err={err}"
         );
 
-        // 6) 恢复路径：报错后改用存在的环境变量必须正常成功（状态不被旧失败污染）。
+        // 6) Recovery path: after the error, using an existing env var must
+        // succeed normally (state not polluted by the old failure).
         std::env::set_var("CLI_TOKEN", "from-cli-again");
         let eff3 = cfg2
             .resolve(&Cli {
@@ -572,7 +588,8 @@ window_messages = 100
         assert!(s.contains("***"));
     }
 
-    /// 保存并恢复环境变量的测试护栏（失败场景：残留 env 会污染其他测试）。
+    /// Test guard that saves and restores environment variables (failure
+    /// scenario: leaked env would pollute other tests).
     struct EnvGuard(Vec<(String, Option<String>)>);
     impl EnvGuard {
         fn remove(names: &[&str]) -> Self {

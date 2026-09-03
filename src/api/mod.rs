@@ -1,7 +1,9 @@
-//! api 层聚合：DshClient（认证 + unary + mux 连接）。
+//! api layer aggregation: DshClient (auth + unary + mux connection).
 //!
-//! 协议边界（Notes/03）：所有 Remote API 封装集中在本层，禁止散落硬编码；
-//! 重连编排由 app 层单一 orchestrator 驱动（本层只提供 connect 原语）。
+//! Protocol boundary (Notes/03): all Remote API wrappers are centralized in
+//! this layer; no scattered hardcoding. Reconnect orchestration is driven by
+//! the single app-layer orchestrator (this layer only provides the connect
+//! primitive).
 
 pub mod auth;
 pub mod envelope;
@@ -18,18 +20,20 @@ pub use auth::AuthSession;
 pub use envelope::{Backoff, ClientError, ErrorClass};
 pub use mux::{Mux, StreamHandle};
 
-/// 远端客户端：reqwest（HTTP unary，cookie jar 仅内存）+ mux（WS 流）。
+/// Remote client: reqwest (HTTP unary, in-memory cookie jar) + mux (WS
+/// streams).
 pub struct DshClient {
     pub http: reqwest::Client,
     pub base: String,
     pub auth: AuthSession,
-    rpc_seq: AtomicU64,
 }
 
 impl DshClient {
-    /// 连接 + 认证（ADR-001 远端客户端；不拉起后端进程）。
+    /// Connect + authenticate (ADR-001 remote client; does not spawn a backend
+    /// process).
     pub async fn connect(base: &str, token: &str) -> Result<Self, ClientError> {
-        // cookie_store：认证 cookie 只存内存；不写磁盘。
+        // cookie_store: the auth cookie lives only in memory; never written to
+        // disk.
         let http = reqwest::Client::builder()
             .cookie_store(true)
             .redirect(reqwest::redirect::Policy::none())
@@ -40,11 +44,11 @@ impl DshClient {
             http,
             base: base.trim_end_matches('/').to_string(),
             auth,
-            rpc_seq: AtomicU64::new(1),
         })
     }
 
-    /// mux WS 地址：`ws://{host}/api/remote.mux`（HTTP→WS scheme 转换，仅 loopback）。
+    /// mux WS address: `ws://{host}/api/remote.mux` (HTTP→WS scheme conversion,
+    /// loopback only).
     pub fn mux_url(&self) -> Result<String, ClientError> {
         let ws_base = if let Some(rest) = self.base.strip_prefix("http://") {
             format!("ws://{rest}")
@@ -59,19 +63,14 @@ impl DshClient {
         Ok(format!("{ws_base}/api/remote.mux"))
     }
 
-    /// 打开 mux 连接（携带认证 cookie 握手）。
+    /// Open a mux connection (handshake with the auth cookie).
     pub async fn open_mux(&self) -> Result<Mux, ClientError> {
         Mux::connect(&self.mux_url()?, &self.auth.cookie_header()).await
     }
-
-    /// 生成 rpcId（计数器 + pid 前缀，进程内唯一）。
-    pub fn next_rpc_id(&self) -> String {
-        let n = self.rpc_seq.fetch_add(1, Ordering::Relaxed);
-        format!("dshtui-{}-{}", std::process::id(), n)
-    }
 }
 
-/// unary 调用：`POST {base}/api/{method}` envelope，校验 rpcId 回显，分类错误。
+/// unary call: `POST {base}/api/{method}` envelope, verify the rpcId echo,
+/// classify errors.
 pub async fn unary(
     http: &reqwest::Client,
     base: &str,

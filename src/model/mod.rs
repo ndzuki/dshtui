@@ -1,13 +1,17 @@
-//! model 层：窗口化转录本 + 投影快照 + 轻量元数据。
+//! model layer: windowed transcript + projection snapshot + lightweight
+//! metadata.
 //!
-//! 模型类型不依赖 reqwest/ratatui（纯同步、可表驱动测试）；
-//! seq/requestId/窗口容量/anchor 的唯一维护点（Step 3 是正确性 seam）。
+//! Model types do not depend on reqwest/ratatui (pure sync, table-driven
+//! testable); the single maintenance point for seq/requestId/window
+//! capacity/anchor (Step 3 is the correctness seam).
 
 pub mod projections;
+pub mod search;
 pub mod session;
 pub mod workspace;
 
 pub use projections::ProjectionSnapshot;
+pub use search::SearchIndex;
 pub use session::{
     ApplyEffect, Block, Incoming, PackedChunks, SessionStore, TranscriptWindow, TurnOutlineItem,
 };

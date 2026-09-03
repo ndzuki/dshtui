@@ -6,13 +6,23 @@ pub mod picker;
 pub mod sidebar;
 pub mod status;
 
-use ratatui::layout::Rect;
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
 use crate::app::AppState;
 
 pub use layout::{sidebar_width, split, LayoutAreas};
+
+/// 毫秒时间戳 → HH:MM（UTC 换算，纯展示用途；不引入 chrono 等新依赖）。
+pub(crate) fn format_hhmm(ms: i64) -> String {
+    let secs = ms.div_euclid(1000);
+    let hours = secs.rem_euclid(24 * 3600) / 3600;
+    let minutes = secs.rem_euclid(3600) / 60;
+    format!("{hours:02}:{minutes:02}")
+}
 
 /// Render one complete frame from read-only application state.
 pub fn render(frame: &mut Frame<'_>, app: &AppState) {
@@ -39,6 +49,66 @@ pub fn render(frame: &mut Frame<'_>, app: &AppState) {
     }
     status::render(frame, areas.status, app);
     picker::render(frame, frame.area(), app);
+    // FR-001-07：帮助 overlay 最后渲染，位于 picker 之上。
+    render_help(frame, frame.area(), app);
+}
+
+/// FR-001-07：居中带边框的键位帮助面板。
+fn render_help(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
+    if !app.help_open {
+        return;
+    }
+    let overlay = centered_rect(area, 70, 80);
+    frame.render_widget(Clear, overlay);
+    let keys: &[(&str, &str)] = &[
+        ("j / k", "上/下滚动"),
+        ("Ctrl+d / Ctrl+u", "半页滚动"),
+        ("G / gg", "跳到末尾 / 开头"),
+        ("f", "会话 picker（Enter 打开，Esc 关闭）"),
+        ("o", "打开选中会话"),
+        ("i", "输入"),
+        ("h / l", "折叠 / 展开项目"),
+        ("s", "停止"),
+        ("?", "帮助"),
+        ("q / Ctrl+c", "退出"),
+        ("r", "启动失败时重试探测"),
+    ];
+    let lines = keys
+        .iter()
+        .map(|(key, desc)| {
+            Line::from(vec![
+                Span::styled(
+                    format!("{key:<16}"),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(*desc),
+            ])
+        })
+        .collect::<Vec<_>>();
+    let panel =
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" 帮助 Help "));
+    frame.render_widget(panel, overlay);
+}
+
+fn centered_rect(area: Rect, width_percent: u16, height_percent: u16) -> Rect {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - height_percent) / 2),
+            Constraint::Percentage(height_percent),
+            Constraint::Percentage((100 - height_percent) / 2),
+        ])
+        .split(area);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - width_percent) / 2),
+            Constraint::Percentage(width_percent),
+            Constraint::Percentage((100 - width_percent) / 2),
+        ])
+        .split(vertical[1])[1]
 }
 
 fn render_details(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
@@ -77,6 +147,20 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
+    fn rendered_text(terminal: &Terminal<TestBackend>) -> String {
+        // 宽字符占两个 cell（后一 cell 为占位空格）：用 Span::width 跳过占位。
+        let mut skip = 0usize;
+        let mut out = String::new();
+        for cell in terminal.backend().buffer().content() {
+            if skip == 0 && !cell.skip {
+                out.push_str(cell.symbol());
+            }
+            skip = std::cmp::max(skip, ratatui::text::Span::raw(cell.symbol()).width())
+                .saturating_sub(1);
+        }
+        out
+    }
+
     #[test]
     fn complete_frame_renders_three_breakpoint_shapes() {
         let app = AppState::default();
@@ -88,5 +172,46 @@ mod tests {
             assert_eq!(areas.sidebar.width, expected_sidebar);
             assert!(areas.details.is_none());
         }
+    }
+
+    #[test]
+    fn help_overlay_shows_key_table_when_open() {
+        let mut app = AppState::default();
+        app.help_open = true;
+        app.conn = crate::app::ConnState::Ready;
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let text = rendered_text(&terminal);
+        assert!(text.contains("f"), "help must list `f` key, text={text}");
+        assert!(text.contains("q"), "help must list `q` key, text={text}");
+        assert!(text.contains("帮助"), "help panel title, text={text}");
+        assert!(text.contains("退出"), "help must list quit, text={text}");
+        assert!(
+            text.contains("picker"),
+            "help must list picker, text={text}"
+        );
+    }
+
+    #[test]
+    fn help_overlay_absent_when_closed() {
+        let mut app = AppState::default();
+        app.help_open = false;
+        app.conn = crate::app::ConnState::Ready;
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let text = rendered_text(&terminal);
+        // 状态条提示行常驻「[?]帮助」字样，故用面板专属内容断言未打开。
+        assert!(!text.contains("半页滚动"), "text={text}");
+        assert!(!text.contains("picker"), "text={text}");
+    }
+
+    #[test]
+    fn format_hhmm_converts_milliseconds_to_utc_clock() {
+        assert_eq!(format_hhmm(0), "00:00");
+        assert_eq!(format_hhmm(45_240_000), "12:34");
+        assert_eq!(format_hhmm(59_000), "00:00");
+        assert_eq!(format_hhmm(23 * 3_600_000 + 59 * 60_000), "23:59");
     }
 }

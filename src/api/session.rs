@@ -1,10 +1,12 @@
-//! session/* 端点封装（V0.1 子集：list / follow / page / cancel，Notes/03 §3/§4）。
+//! session/* endpoint wrappers (V0.1 subset: list / follow / page / cancel,
+//! Notes/03 §3/§4).
 //!
-//! - `session/list`：cursor 分页（unary）；
-//! - `session/follow`：snapshot + 增量事件（流）；
-//! - `session/page`：向上翻页前插（unary）；
-//! - `session/cancel`：退出前停止运行中会话的最小 wrapper（AC-001-08）；
-//! - `session/prompt` 属 REQ-002，不在本层实现。
+//! - `session/list`: cursor pagination (unary);
+//! - `session/follow`: snapshot + incremental events (stream);
+//! - `session/page`: older history prepend (unary);
+//! - `session/cancel`: minimal wrapper to stop the running session before
+//!   exit (AC-001-08);
+//! - `session/prompt` belongs to REQ-002 and is not implemented in this layer.
 
 use serde_json::Value;
 
@@ -13,7 +15,7 @@ use super::mux::{Mux, StreamHandle};
 use super::types::{PageResult, SessionAddress, SessionSeq};
 use super::unary;
 
-/// `session/list` 一页结果（容忍 items/nextCursor 字段缺失）。
+/// One `session/list` page (tolerant of missing items/nextCursor fields).
 #[derive(Debug, Clone, Default)]
 pub struct SessionListPage {
     pub raw_items: Vec<super::types::ListItemRaw>,
@@ -48,7 +50,8 @@ pub async fn list(
     })
 }
 
-/// 打开 `session/follow` 流；每帧是 `FollowFrame`（snapshot/event）。
+/// Open a `session/follow` stream; each frame is a `FollowFrame`
+/// (snapshot/event).
 pub async fn open_follow(
     mux: &Mux,
     address: &SessionAddress,
@@ -61,7 +64,8 @@ pub async fn open_follow(
     mux.open_stream("session/follow", args).await
 }
 
-/// `session/page`：向后分页（前插历史），throughSeq 为 follow 快照 cursor。
+/// `session/page`: paginate backwards (prepend history); throughSeq is the
+/// follow snapshot cursor.
 pub async fn page(
     http: &reqwest::Client,
     base: &str,
@@ -83,8 +87,10 @@ pub async fn page(
         .map_err(|e| ClientError::Protocol(format!("session/page 响应形状异常: {e}")))
 }
 
-/// `session/cancel`：停止运行中会话（退出语义 AC-001-08 的最小 wrapper）。
-/// 形状未在 Notes/03 字段级记录，按官方注册表 `{sessionId}` 约定，失败不影响退出流程。
+/// `session/cancel`: stop the running session (minimal wrapper for the
+/// AC-001-08 exit semantics).
+/// The shape is not recorded field-by-field in Notes/03; follow the official
+/// registry `{sessionId}` convention — a failure never breaks the exit flow.
 pub async fn cancel(
     http: &reqwest::Client,
     base: &str,
@@ -92,4 +98,48 @@ pub async fn cancel(
 ) -> Result<Value, ClientError> {
     let args = serde_json::json!({ "sessionId": session_id });
     unary(http, base, "session/cancel", args).await
+}
+
+/// One parsed item from the `session/follow` stream. Parsing of the follow
+/// frame shape lives HERE (api layer) — the transport loop in main must not
+/// interpret FollowFrame/SessionHistoryRecord wire fields itself.
+#[derive(Debug, Clone)]
+pub enum FollowItem {
+    Snapshot {
+        cursor: Option<super::types::SessionLogOffset>,
+        records: Vec<super::types::SessionHistoryRecord>,
+        has_more: bool,
+        projections: Option<Value>,
+    },
+    Event(super::types::SessionWireEvent),
+    Chunks(super::types::ChunkRow),
+}
+
+/// Parse one `session/follow` stream value (tolerant: unknown frame shapes are
+/// logged and skipped).
+pub fn parse_follow_item(value: &Value) -> Option<FollowItem> {
+    if let Ok(frame) = serde_json::from_value::<super::types::FollowFrame>(value.clone()) {
+        return match frame {
+            super::types::FollowFrame::Snapshot {
+                cursor,
+                records,
+                has_more,
+                projections,
+                ..
+            } => Some(FollowItem::Snapshot {
+                cursor,
+                records,
+                has_more: has_more.unwrap_or(false),
+                projections,
+            }),
+            super::types::FollowFrame::Event { event } => Some(FollowItem::Event(event)),
+        };
+    }
+    if let Ok(super::types::SessionHistoryRecord::Chunks { event: row }) =
+        serde_json::from_value::<super::types::SessionHistoryRecord>(value.clone())
+    {
+        return Some(FollowItem::Chunks(row));
+    }
+    tracing::warn!("session/follow 帧形态无法识别，跳过并计入日志");
+    None
 }

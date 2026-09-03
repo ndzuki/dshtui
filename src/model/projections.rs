@@ -1,17 +1,21 @@
-//! 投影快照（Notes/03 §5，ADR-008）。
+//! Projection snapshot (Notes/03 §5, ADR-008).
 //!
-//! 状态条数字**全部读取官方 projections，TUI 不自算**——本模块只做字段
-//! 读取与格式话的薄封装；字段缺失一律容忍（None），绝不臆造统计。
+//! The status bar numbers **all come from the official projections — the TUI
+//! never self-computes**. This module is only a thin wrapper for field reads
+//! and formatting; missing fields are always tolerated (None), statistics are
+//! never invented.
 
 use serde_json::Value;
 
-/// 官方 projections 快照（raw 原样保留；读取全部走 getter）。
+/// Official projections snapshot (raw preserved as-is; all reads go through
+/// getters).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ProjectionSnapshot {
     pub raw: Value,
 }
 
-/// 上下文压力（contextPressure）：pressureTokens/projectedTokens/contextWindow。
+/// Context pressure (contextPressure): pressureTokens/projectedTokens/
+/// contextWindow.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ContextPressure {
     pub pressure_tokens: Option<u64>,
@@ -20,7 +24,7 @@ pub struct ContextPressure {
 }
 
 impl ContextPressure {
-    /// 已用百分比（pressure/projected）；两者任一缺失 → None。
+    /// Used percentage (pressure/projected); if either is missing → None.
     pub fn percent(&self) -> Option<u64> {
         let p = self.pressure_tokens?;
         let total = self.projected_tokens?;
@@ -31,7 +35,7 @@ impl ContextPressure {
     }
 }
 
-/// token 用量（tokenUsage）：input/output/cache read/write。
+/// token usage (tokenUsage): input/output/cache read/write.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TokenUsage {
     pub input: Option<u64>,
@@ -40,7 +44,8 @@ pub struct TokenUsage {
     pub cache_write: Option<u64>,
 }
 
-/// 会话统计（sessionStats）：turns/steps/llmMs/toolMs/ttftMs/ttftSteps/decodeMs/decodeTokens。
+/// Session stats (sessionStats): turns/steps/llmMs/toolMs/ttftMs/ttftSteps/
+/// decodeMs/decodeTokens.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SessionStats {
     pub turns: Option<u64>,
@@ -53,7 +58,7 @@ pub struct SessionStats {
     pub decode_tokens: Option<u64>,
 }
 
-/// 模型选择（modelSelection）：lastUsed/next。
+/// Model selection (modelSelection): lastUsed/next.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ModelSelection {
     pub last_used: Option<String>,
@@ -92,18 +97,18 @@ impl ProjectionSnapshot {
         cur.as_bool()
     }
 
-    /// 标题（title / sessionListMetadata.title，官方口径）。
+    /// Title (title / sessionListMetadata.title, official convention).
     pub fn title(&self) -> Option<String> {
         self.get_str(&["title"])
             .or_else(|| self.get_str(&["sessionListMetadata", "title"]))
     }
 
-    /// 工作目录（cwd）。
+    /// Working directory (cwd).
     pub fn cwd(&self) -> Option<String> {
         self.get_str(&["cwd"])
     }
 
-    /// 运行中状态（官方 running 投影）。
+    /// Running state (official running projection).
     pub fn running(&self) -> Option<bool> {
         self.get_bool(&["running"])
     }
@@ -196,7 +201,8 @@ mod tests {
 
     #[test]
     fn context_percent_never_self_computed_elsewhere() {
-        // percent 只做除法格式化，不产生新统计；分母 0 必须 None 而非 panic/NaN。
+        // percent only formats a division, it creates no new statistic; a zero
+        // denominator must be None, not panic/NaN.
         let p = ProjectionSnapshot::new(serde_json::json!({
             "contextPressure": {"pressureTokens": 10, "projectedTokens": 0}
         }));

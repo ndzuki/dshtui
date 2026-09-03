@@ -1,4 +1,5 @@
-//! 工作区与会话元数据存储（Notes/06 §1：轻量元数据 ~500B/条，不保留完整 projections）。
+//! Workspace and session metadata store (Notes/06 §1: lightweight metadata
+//! ~500B/item; full projections are not kept).
 
 use std::collections::HashMap;
 
@@ -7,7 +8,7 @@ use nucleo::{Matcher, Utf32String};
 
 use crate::api::types::{SessionId, SessionMeta, WorkspaceId};
 
-/// 项目（workspace）行：id/title/成员会话 id。
+/// Project (workspace) row: id/title/member session ids.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct WorkspaceMeta {
     pub id: WorkspaceId,
@@ -15,12 +16,12 @@ pub struct WorkspaceMeta {
     pub session_ids: Vec<SessionId>,
 }
 
-/// 侧栏数据源：workspace/follow 分组 + session/list 会话行。
+/// Sidebar data source: workspace/follow grouping + session/list session rows.
 #[derive(Debug, Default)]
 pub struct WorkspaceStore {
     pub workspaces: Vec<WorkspaceMeta>,
     pub sessions: HashMap<SessionId, SessionMeta>,
-    /// session/list 分页游标（None=已到末尾）。
+    /// session/list pagination cursor (None=end reached).
     pub next_cursor: Option<String>,
 }
 
@@ -29,12 +30,28 @@ impl WorkspaceStore {
         Self::default()
     }
 
-    /// 增量 upsert 会话（list 分页合并，不整表重建，Notes/06 §1）。
+    /// Incremental session upsert (list pagination merges without rebuilding
+    /// the whole table, Notes/06 §1).
+    /// REQ §5 memory budget: beyond 20000 sessions keep only the most recent
+    /// 5000 (grouping summaries live in workspace rows and are not affected).
     pub fn upsert_session(&mut self, meta: SessionMeta) {
+        const CAP: usize = 20_000;
+        const KEEP: usize = 5_000;
         self.sessions.insert(meta.id.clone(), meta);
+        if self.sessions.len() > CAP {
+            let mut by_updated: Vec<SessionId> =
+                self.sessions.values().map(|m| m.id.clone()).collect();
+            by_updated.sort_by_key(|id| {
+                std::cmp::Reverse(self.sessions.get(id).map(|m| m.updated_at_ms).unwrap_or(0))
+            });
+            for stale in by_updated.into_iter().skip(KEEP) {
+                self.sessions.remove(&stale);
+            }
+        }
     }
 
-    /// 按 workspace id 找到分组并追加会话 id（不存在则忽略，等待 workspace/follow）。
+    /// Find the group by workspace id and append the session id (unknown
+    /// workspace → ignore, wait for workspace/follow).
     pub fn attach_session_to_workspace(&mut self, ws: &WorkspaceId, sid: &SessionId) {
         if let Some(w) = self.workspaces.iter_mut().find(|w| &w.id == ws) {
             if !w.session_ids.contains(sid) {
@@ -43,7 +60,8 @@ impl WorkspaceStore {
         }
     }
 
-    /// workspace/follow 增量合并（未知形态由 api 层容忍后传入原始 id/标题）。
+    /// Incremental workspace/follow merge (unknown shapes are tolerated by the
+    /// api layer before the raw id/title reaches here).
     pub fn upsert_workspace(&mut self, id: WorkspaceId, title: Option<String>) {
         match self.workspaces.iter_mut().find(|w| w.id == id) {
             Some(w) => {
@@ -59,17 +77,18 @@ impl WorkspaceStore {
         }
     }
 
-    /// 清空重建（重连后 workspace/follow snapshot）。
+    /// Clear and rebuild (workspace/follow snapshot after reconnect).
     pub fn clear_workspaces(&mut self) {
         self.workspaces.clear();
     }
 
-    /// 会话总数（侧栏统计，直接读 store 大小，非官方投影场景）。
+    /// Session count (sidebar statistic; reads the store size directly, not an
+    /// official projection).
     pub fn session_count(&self) -> usize {
         self.sessions.len()
     }
 
-    /// 供 picker 的会话迭代（按 updated_at_ms 降序）。
+    /// Iterate sessions for the picker (updated_at_ms descending).
     pub fn sessions_sorted(&self) -> Vec<&SessionMeta> {
         let mut v: Vec<&SessionMeta> = self.sessions.values().collect();
         v.sort_by_key(|m| std::cmp::Reverse(m.updated_at_ms));
@@ -141,7 +160,8 @@ mod tests {
         let mut store = WorkspaceStore::new();
         store.upsert_session(meta("a", 1, None));
         store.upsert_session(meta("b", 2, None));
-        // 分页第二页包含 a 的更新版本 → 不重复、取新值。
+        // Page 2 contains an updated version of a → no duplicate, take the new
+        // value.
         store.upsert_session(meta("a", 9, None));
         store.upsert_session(meta("c", 3, None));
         assert_eq!(store.session_count(), 3);
@@ -165,13 +185,13 @@ mod tests {
         store.upsert_workspace(WorkspaceId("ws1".into()), Some("项目A".into()));
         store.upsert_session(meta("s1", 1, Some("ws1")));
         store.attach_session_to_workspace(&WorkspaceId("ws1".into()), &SessionId("s1".into()));
-        // 重复 attach 不产生重复成员。
+        // Duplicate attach produces no duplicate members.
         store.attach_session_to_workspace(&WorkspaceId("ws1".into()), &SessionId("s1".into()));
         assert_eq!(store.workspaces.len(), 1);
         assert_eq!(store.workspaces[0].session_ids.len(), 1);
-        // 未知 workspace attach 安全忽略。
+        // Attach to an unknown workspace is safely ignored.
         store.attach_session_to_workspace(&WorkspaceId("nope".into()), &SessionId("s1".into()));
-        // 重连清空后重建。
+        // Reconnect: clear, then rebuild.
         store.clear_workspaces();
         assert!(store.workspaces.is_empty());
         assert_eq!(store.session_count(), 1, "清空 workspace 不影响会话");
@@ -234,5 +254,18 @@ mod tests {
             elapsed.as_millis()
         );
         eprintln!("picker_match_1042: {} ms", elapsed.as_millis());
+    }
+
+    #[test]
+    fn session_list_over_20000_keeps_recent_5000() {
+        // REQ §5: N > 20000 keeps only the most recent 5000.
+        let mut store = WorkspaceStore::new();
+        for i in 0..20_001 {
+            store.upsert_session(meta(&format!("s{i:05}"), i as i64, None));
+        }
+        assert_eq!(store.session_count(), 5_000);
+        // The newest (highest updated_at_ms) survives, the oldest does not.
+        assert!(store.sessions.contains_key(&SessionId("s20000".into())));
+        assert!(!store.sessions.contains_key(&SessionId("s00000".into())));
     }
 }

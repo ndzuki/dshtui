@@ -1,11 +1,14 @@
-//! 强类型 newtype 与 wire 结构（Notes/03 §4/§5/§7 兼容动作 #1）。
+//! Strongly-typed newtypes and wire structs (Notes/03 §4/§5/§7 compatibility
+//! action #1).
 //!
-//! 兼容策略（Notes/03 §7）：未知字段一律容忍（`#[serde(default)]`），未知事件
-//! 类型原样跳过但计入日志。字段命名以官方 Remote API 实读为准（D-3=A）。
+//! Compatibility strategy (Notes/03 §7): unknown fields are always tolerated
+//! (`#[serde(default)]`), unknown event types are skipped but logged. Field
+//! naming follows the official Remote API as actually read (D-3=A).
 
 use serde::{Deserialize, Serialize};
 
-// ---------- newtype（对齐官方 SessionSeq/SessionLogOffset 强类型方向） ----------
+// ---------- newtypes (aligned with the official SessionSeq/SessionLogOffset
+// strong typing) ----------
 
 macro_rules! newtype {
     ($name:ident, $inner:ty, $doc:expr) => {
@@ -30,21 +33,30 @@ macro_rules! newtype {
     };
 }
 
-newtype!(SessionId, String, "会话标识（官方 session id，字符串）");
-newtype!(WorkspaceId, String, "工作区/项目标识");
-newtype!(SessionSeq, u64, "事件序列号（单调）");
-newtype!(SessionLogOffset, u64, "日志 offset（page/follow 游标语义）");
+newtype!(
+    SessionId,
+    String,
+    "Session identifier (official session id, string)"
+);
+newtype!(WorkspaceId, String, "Workspace / project identifier");
+newtype!(SessionSeq, u64, "Event sequence number (monotonic)");
+newtype!(
+    SessionLogOffset,
+    u64,
+    "Log offset (page/follow cursor semantics)"
+);
 newtype!(
     RequestId,
     String,
-    "请求幂等键（D-4：重复送达按 requestId 幂等 apply）"
+    "Request idempotency key (D-4: repeated delivery applies idempotently)"
 );
 
-// 数值 newtype 允许 Copy（窗口 reducer 高频拷贝，避免 move 噪声）。
+// Numeric newtypes allow Copy (the window reducer copies them heavily; avoids
+// move noise).
 impl Copy for SessionSeq {}
 impl Copy for SessionLogOffset {}
 
-// ---------- session/page / session/follow 地址 ----------
+// ---------- session/page / session/follow address ----------
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -72,9 +84,9 @@ impl SessionAddress {
     }
 }
 
-// ---------- SessionHistoryRecord（Notes/03 §4.3 两类） ----------
+// ---------- SessionHistoryRecord (Notes/03 §4.3, two variants) ----------
 
-/// `{type:"event", event:{...}}` 或 `{type:"chunks", event:{chunkrow}}`。
+/// `{type:"event", event:{...}}` or `{type:"chunks", event:{chunkrow}}`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum SessionHistoryRecord {
@@ -84,7 +96,8 @@ pub enum SessionHistoryRecord {
     Chunks { event: ChunkRow },
 }
 
-/// 事件记录：type/seq/time/data + requestId（D-4 幂等键）+ 可忽略标记等。
+/// Event record: type/seq/time/data + requestId (D-4 idempotency key) +
+/// ignorable flag, etc.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionWireEvent {
@@ -93,7 +106,8 @@ pub struct SessionWireEvent {
     pub seq: Option<SessionSeq>,
     #[serde(default)]
     pub time: Option<i64>,
-    /// 幂等键：同 requestId 重复送达只 apply 一次（REQ-002 AC-002-06 基础契约）。
+    /// Idempotency key: duplicate deliveries with the same requestId apply
+    /// only once (REQ-002 AC-002-06 base contract).
     #[serde(default)]
     pub request_id: Option<String>,
     #[serde(default)]
@@ -102,12 +116,14 @@ pub struct SessionWireEvent {
     pub source_event_seqs: Option<Vec<u64>>,
     #[serde(default)]
     pub surface_op: Option<String>,
-    /// 原始 payload：未知块原样保留（D-4），不解析不丢弃。
+    /// Raw payload: unknown blocks are preserved as-is (D-4), never parsed,
+    /// never dropped.
     #[serde(default)]
     pub data: Option<serde_json::Value>,
 }
 
-/// packed chunk row（原样存储，不展开为逐 delta——官方低内存优化的关键）。
+/// packed chunk row (stored as-is, not expanded into per-delta items — key to
+/// the official low-memory optimization).
 #[derive(Debug, Clone, PartialEq)]
 pub enum ChunkRow {
     TextChunks(ChunkData),
@@ -184,13 +200,14 @@ pub struct ToolCallChunkData {
     pub dt: Vec<f64>,
 }
 
-// ---------- session/follow 帧（Notes/03 §4.2） ----------
+// ---------- session/follow frames (Notes/03 §4.2) ----------
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type")]
 pub enum FollowFrame {
-    /// 注意：serde 内部 tag 枚举的 variant 字段不受枚举级 rename_all 影响，
-    /// 必须逐字段显式 rename（camelCase 协议形状）。
+    /// Note: for serde internally-tagged enums, variant fields are not
+    /// affected by the enum-level rename_all; every field must be renamed
+    /// explicitly (camelCase protocol shape).
     #[serde(rename = "snapshot")]
     Snapshot {
         #[serde(default)]
@@ -208,7 +225,7 @@ pub enum FollowFrame {
     Event { event: SessionWireEvent },
 }
 
-// ---------- session/page 响应（Notes/03 §4.1） ----------
+// ---------- session/page response (Notes/03 §4.1) ----------
 
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -219,9 +236,10 @@ pub struct PageResult {
     pub has_more: Option<bool>,
 }
 
-// ---------- 会话列表（session/list 轻量元数据，Notes/06 §1） ----------
+// ---------- session list (session/list lightweight metadata, Notes/06 §1) ----------
 
-/// TUI 只保留轻量结构（~500B/条）；其余 projections 丢弃。
+/// The TUI keeps only a lightweight structure (~500B/item); the rest of the
+/// projections are discarded.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionMeta {
     pub id: SessionId,
@@ -236,7 +254,8 @@ pub struct SessionMeta {
     pub last_turn_preview: Option<String>,
 }
 
-/// session/list 原始条目（兼容两种形态：直接字段 / projections.values，Notes/03 §5）。
+/// Raw `session/list` entry (compatible with both shapes: direct fields /
+/// projections.values, Notes/03 §5).
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ListItemRaw {
@@ -247,7 +266,7 @@ pub struct ListItemRaw {
     pub parent_id: Option<String>,
     #[serde(default)]
     pub projections: Option<serde_json::Value>,
-    // 直接字段兜底（官方形态变化时仍可读）。
+    // Direct-field fallback (still readable when the official shape changes).
     #[serde(default)]
     pub title: Option<String>,
     #[serde(default)]
@@ -264,12 +283,14 @@ pub struct ListItemRaw {
     pub last_turn_preview: Option<String>,
 }
 
-/// 从原始条目提取轻量元数据（容忍字段缺失；id 缺失视为无效行）。
+/// Extract lightweight metadata from a raw entry (tolerates missing fields; a
+/// missing id is treated as an invalid row).
 pub fn meta_from_raw(raw: ListItemRaw) -> Option<SessionMeta> {
     if raw.id.is_empty() {
         return None;
     }
-    // projections 形态：{"values": {title, ...}}；sessionListMetadata 提供 lastPromptAt/blank。
+    // projections shape: {"values": {title, ...}}; sessionListMetadata
+    // provides lastPromptAt/blank.
     let vals = raw
         .projections
         .as_ref()
@@ -294,7 +315,8 @@ pub fn meta_from_raw(raw: ListItemRaw) -> Option<SessionMeta> {
         .or(raw.updated_at_ms)
         .unwrap_or(0);
 
-    // turnOutline 末条 response 摘要（≤120 字符，官方截断口径）。
+    // Summary of the last turnOutline response (≤120 chars, official
+    // truncation policy).
     let last_turn_preview = raw.last_turn_preview.clone().or_else(|| {
         vals.and_then(|v| v.get("turnOutline"))
             .and_then(|x| x.as_array())
@@ -355,7 +377,8 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
-        // 无 requestId 也容忍（官方可能不携带）。
+        // A missing requestId is also tolerated (the official server may not
+        // send one).
         let r: SessionHistoryRecord = serde_json::from_str(
             r#"{"type":"event","event":{"type":"assistant/message","seq":4,"data":{}}}"#,
         )
