@@ -153,12 +153,18 @@ impl KeyDecoder {
         match key.code {
             KeyCode::Esc => Some(Command::ClosePicker),
             KeyCode::Enter if key.modifiers.is_empty() => Some(Command::SubmitInput),
+            // REQ-002 FR-002-01: Ctrl+Enter / Alt+Enter insert a newline
+            // (either modifier).
             KeyCode::Enter
                 if key
                     .modifiers
-                    .contains(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
                 Some(Command::PickerInput("\n".into()))
+            }
+            // Ctrl+c keeps the global quit path while composing (AC-002-07).
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                Some(Command::Quit)
             }
             KeyCode::Char(c) if key.modifiers.is_empty() => {
                 Some(Command::PickerInput(c.to_string()))
@@ -322,5 +328,39 @@ mod tests {
             KeyEventKind::Release,
         ));
         assert_eq!(d.decode(InputMode::Normal, release), None);
+    }
+
+    #[test]
+    fn insert_enter_ctrl_or_alt_is_newline_plain_is_submit() {
+        // REQ-002 FR-002-01：Ctrl+Enter / Alt+Enter 换行；裸 Enter 发送。
+        let mut d = KeyDecoder::new();
+        let ctrl_enter = Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
+        assert_eq!(
+            d.decode(InputMode::Insert, ctrl_enter),
+            Some(Command::PickerInput("\n".into()))
+        );
+        let alt_enter = Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
+        assert_eq!(
+            d.decode(InputMode::Insert, alt_enter),
+            Some(Command::PickerInput("\n".into()))
+        );
+        let plain_enter = Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            d.decode(InputMode::Insert, plain_enter),
+            Some(Command::SubmitInput)
+        );
+        // Shift+Enter 等其它 modifier 组合不当作发送（V0.1 保守处理）。
+        let shift_enter = Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+        assert_ne!(
+            d.decode(InputMode::Insert, shift_enter),
+            Some(Command::SubmitInput)
+        );
+        // Ctrl+c keeps the global quit path while composing (AC-002-07).
+        let ctrl_c = Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert_eq!(
+            d.decode(InputMode::Insert, ctrl_c),
+            Some(Command::Quit),
+            "INSERT 中 Ctrl+c → Quit"
+        );
     }
 }

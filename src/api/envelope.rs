@@ -118,6 +118,20 @@ impl ClientError {
         ErrorClass::from_code(code)
     }
 
+    /// 稳定的错误码（Remote/Stream 用官方 `error.code`，其余用分类名）；
+    /// 供失败信息可断言与日志检索（REQ-002 AC-002-08/09）。
+    pub fn code(&self) -> String {
+        match self {
+            ClientError::Remote { code, .. } | ClientError::Stream { code, .. } => code.clone(),
+            ClientError::Transport(_) => "transport".into(),
+            ClientError::Auth(_) => "auth".into(),
+            ClientError::Http(_) => "http".into(),
+            ClientError::Envelope(_) => "envelope".into(),
+            ClientError::RpcIdMismatch { .. } => "rpc-id-mismatch".into(),
+            ClientError::Protocol(_) => "protocol".into(),
+        }
+    }
+
     pub fn class(&self) -> ErrorClass {
         match self {
             ClientError::Transport(_) => ErrorClass::Retryable,

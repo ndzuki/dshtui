@@ -1,6 +1,7 @@
 //! Ratatui view composition for the dshtui application.
 
 pub mod chat;
+pub mod composer;
 pub mod layout;
 pub mod picker;
 pub mod sidebar;
@@ -48,6 +49,8 @@ pub fn render(frame: &mut Frame<'_>, app: &AppState) {
         render_details(frame, details, app);
     }
     status::render(frame, areas.status, app);
+    // composer overlay 覆盖 body 底部、状态条上方（仅 INSERT 可见，REQ-002）。
+    composer::render(frame, areas.center, app);
     picker::render(frame, frame.area(), app);
     // FR-001-07：帮助 overlay 最后渲染，位于 picker 之上。
     render_help(frame, frame.area(), app);
@@ -66,11 +69,14 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         ("G / gg", "跳到末尾 / 开头"),
         ("f", "会话 picker（Enter 打开，Esc 关闭）"),
         ("o", "打开选中会话"),
-        ("i", "输入"),
+        ("i", "呼出 composer（无会话时提示）"),
+        ("Enter", "发送并收起（空输入不发）"),
+        ("Ctrl+Enter / Alt+Enter", "换行"),
+        ("Esc", "收起 composer（保留草稿）"),
+        ("s", "停止运行中的会话"),
         ("h / l", "折叠 / 展开项目"),
-        ("s", "停止"),
         ("?", "帮助"),
-        ("q / Ctrl+c", "退出"),
+        ("q / Ctrl+c", "退出（运行中先 stop）"),
         ("r", "启动失败时重试探测"),
     ];
     let lines = keys

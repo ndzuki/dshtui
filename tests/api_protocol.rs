@@ -2,14 +2,62 @@ use std::time::Duration;
 
 use dshtui::api::auth::authenticate;
 use dshtui::api::envelope::{remote_error, ClientRequest, ErrorClass, RpcError, ServerResponse};
-use dshtui::api::types::{FollowFrame, SessionSeq};
-use dshtui::api::Mux;
+use dshtui::api::session::{cancel, prompt, AcceptedValue};
+use dshtui::api::types::{
+    FollowFrame, PromptContentPart, PromptMode, PromptRequest, SessionId, SessionRequestId,
+    SessionSeq,
+};
+use dshtui::api::{ClientError, Mux};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::Message;
+
+/// 读一个 HTTP 请求到 body 边界，返回（请求头 + body 原文）。
+async fn read_request(socket: &mut tokio::net::TcpStream) -> String {
+    let mut request = Vec::new();
+    let mut buf = [0_u8; 4096];
+    loop {
+        let read = socket.read(&mut buf).await.unwrap();
+        if read == 0 {
+            break;
+        }
+        request.extend_from_slice(&buf[..read]);
+        if request.windows(4).any(|window| window == b"\r\n\r\n") {
+            break;
+        }
+    }
+    String::from_utf8_lossy(&request).into_owned()
+}
+
+async fn write_json_response(socket: &mut tokio::net::TcpStream, resp: Value) {
+    let body = resp.to_string();
+    socket
+        .write_all(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+}
+
+fn queue_prompt_request() -> PromptRequest {
+    PromptRequest {
+        request_id: SessionRequestId("client-minted-1".into()),
+        session_id: SessionId("sess-1".into()),
+        mode: PromptMode::Queue,
+        content: vec![PromptContentPart::Text {
+            text: "你好 draft".into(),
+        }],
+        client_time_zone: None,
+    }
+}
 
 #[test]
 fn typed_envelope_round_trips_request_and_response() {
@@ -176,5 +224,212 @@ async fn mux_open_stream_routes_item_and_end_frames() {
         .await
         .unwrap()
         .is_none());
+    server.await.unwrap();
+}
+
+// ---------- REQ-002: session/prompt + typed session/cancel ----------
+
+#[test]
+fn prompt_request_serializes_official_camel_case_shape() {
+    // 字段名实读（2026-09-04）: requestId/sessionId/mode/content/clientTimeZone。
+    let request = queue_prompt_request();
+    let encoded = serde_json::to_value(&request).unwrap();
+    assert_eq!(
+        encoded,
+        json!({
+            "requestId": "client-minted-1",
+            "sessionId": "sess-1",
+            "mode": "queue",
+            "content": [{"type": "text", "text": "你好 draft"}],
+        })
+    );
+    // clientTimeZone 省略（V0.1 不上送）。
+    assert!(encoded.get("clientTimeZone").is_none());
+
+    // steer 扩展位（V0.2/REQ-003）：同一类型可序列化。
+    let steer = serde_json::to_value(PromptRequest {
+        mode: PromptMode::Steer,
+        ..queue_prompt_request()
+    })
+    .unwrap();
+    assert_eq!(steer["mode"], "steer");
+}
+
+#[tokio::test]
+async fn prompt_unary_posts_official_args_and_parses_accepted() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let request = read_request(&mut socket).await;
+        assert!(request.starts_with("POST /api/session/prompt HTTP/1.1"));
+        let body: Value = serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(body["type"], "client-request");
+        assert_eq!(body["method"], "session/prompt");
+        let args = &body["payload"]["args"];
+        assert_eq!(args["requestId"], "client-minted-1");
+        assert_eq!(args["sessionId"], "sess-1");
+        assert_eq!(args["mode"], "queue");
+        assert_eq!(args["content"][0]["type"], "text");
+        assert_eq!(args["content"][0]["text"], "你好 draft");
+        assert!(args.get("clientTimeZone").is_none());
+        let rpc_id = body["rpcId"].as_str().unwrap().to_string();
+        write_json_response(
+            &mut socket,
+            json!({
+                "type": "server-response",
+                "rpcId": rpc_id,
+                "result": {"ok": true, "value": {"accepted": true}},
+            }),
+        )
+        .await;
+    });
+
+    let http = reqwest::Client::new();
+    let accepted = prompt(&http, &format!("http://{addr}"), &queue_prompt_request())
+        .await
+        .unwrap();
+    assert_eq!(accepted, AcceptedValue { accepted: true });
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn prompt_unary_surfaces_remote_error_code_and_class() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let request = read_request(&mut socket).await;
+        let body: Value = serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        let rpc_id = body["rpcId"].as_str().unwrap().to_string();
+        write_json_response(
+            &mut socket,
+            json!({
+                "type": "server-response",
+                "rpcId": rpc_id,
+                "result": {"ok": false, "error": {
+                    "code": "gateway/bad-request",
+                    "message": "非法请求",
+                    "details": {"scope": "session"}
+                }},
+            }),
+        )
+        .await;
+    });
+
+    let http = reqwest::Client::new();
+    let err = prompt(&http, &format!("http://{addr}"), &queue_prompt_request())
+        .await
+        .unwrap_err();
+    match err {
+        ClientError::Remote {
+            code,
+            message,
+            class,
+        } => {
+            assert_eq!(code, "gateway/bad-request", "错误码保留");
+            assert_eq!(message, "非法请求");
+            assert_eq!(class, ErrorClass::UserFacing);
+        }
+        other => panic!("预期 Remote 错误，得到 {other:?}"),
+    }
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn cancel_unary_returns_typed_accepted_receipt() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let request = read_request(&mut socket).await;
+        assert!(request.starts_with("POST /api/session/cancel HTTP/1.1"));
+        let body: Value = serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(body["method"], "session/cancel");
+        assert_eq!(body["payload"]["args"]["sessionId"], "sess-1");
+        let rpc_id = body["rpcId"].as_str().unwrap().to_string();
+        write_json_response(
+            &mut socket,
+            json!({
+                "type": "server-response",
+                "rpcId": rpc_id,
+                "result": {"ok": true, "value": {"accepted": true}},
+            }),
+        )
+        .await;
+    });
+
+    let http = reqwest::Client::new();
+    let accepted = cancel(&http, &format!("http://{addr}"), "sess-1")
+        .await
+        .unwrap();
+    assert_eq!(accepted, AcceptedValue { accepted: true });
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn cancel_unary_surfaces_rejection_without_panicking() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let request = read_request(&mut socket).await;
+        let body: Value = serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        let rpc_id = body["rpcId"].as_str().unwrap().to_string();
+        write_json_response(
+            &mut socket,
+            json!({
+                "type": "server-response",
+                "rpcId": rpc_id,
+                "result": {"ok": false, "error": {
+                    "code": "session/agent-busy",
+                    "message": "忙",
+                }},
+            }),
+        )
+        .await;
+    });
+
+    let http = reqwest::Client::new();
+    let err = cancel(&http, &format!("http://{addr}"), "sess-1")
+        .await
+        .unwrap_err();
+    match err {
+        ClientError::Remote { code, .. } => assert_eq!(code, "session/agent-busy"),
+        other => panic!("预期 Remote 错误，得到 {other:?}"),
+    }
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn accepted_false_receipt_is_a_typed_rejection_ac002_09() {
+    // ok:true 但 value.accepted=false（服务端拒绝）：必须成为 typed 失败，
+    // 不能被静默当作成功（AC-002-09 被服务端拒绝路径）。
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let request = read_request(&mut socket).await;
+        let body: Value = serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        let rpc_id = body["rpcId"].as_str().unwrap().to_string();
+        write_json_response(
+            &mut socket,
+            json!({
+                "type": "server-response",
+                "rpcId": rpc_id,
+                "result": {"ok": true, "value": {"accepted": false}},
+            }),
+        )
+        .await;
+    });
+
+    let http = reqwest::Client::new();
+    let err = cancel(&http, &format!("http://{addr}"), "sess-1")
+        .await
+        .unwrap_err();
+    match err {
+        ClientError::Protocol(msg) => assert!(msg.contains("accepted=false"), "msg={msg}"),
+        other => panic!("预期 Protocol 错误，得到 {other:?}"),
+    }
     server.await.unwrap();
 }

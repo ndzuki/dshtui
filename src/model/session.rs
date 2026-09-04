@@ -25,7 +25,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use serde_json::Value;
 
 use crate::api::types::{
-    ChunkRow, SessionHistoryRecord, SessionLogOffset, SessionSeq, SessionWireEvent,
+    ChunkRow, SessionHistoryRecord, SessionLogOffset, SessionRequestId, SessionSeq,
+    SessionWireEvent,
 };
 
 /// Window element (packed chunk rows stored as-is, never expanded into
@@ -117,6 +118,24 @@ pub struct TurnOutlineItem {
     pub response: Option<String>,
 }
 
+/// Optimistic echo status (REQ-002 §5): reconciled away when a durable event
+/// with the same requestId arrives; `Failed` marks this send only and is never
+/// auto-resent (AC-002-08).
+#[derive(Debug, Clone, PartialEq)]
+pub enum PendingEchoStatus {
+    Pending,
+    Failed { code: String, message: String },
+}
+
+/// Optimistic echo reconciliation record (created by the send path; occupies
+/// no seq and never touches the seen indexes).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingEcho {
+    pub request_id: SessionRequestId,
+    pub text: String,
+    pub status: PendingEchoStatus,
+}
+
 /// Input entering the window (AppState maps api events to this type).
 #[derive(Debug, Clone)]
 pub enum Incoming {
@@ -174,6 +193,9 @@ pub struct TranscriptWindow {
     turn_outline: Vec<TurnOutlineItem>,
     seen_seq: HashSet<u64>,
     seen_request: HashSet<String>,
+    /// 本地乐观回显（与 durable 分存：pending 不占 seq、不写 seen 索引；
+    /// durable 同 requestId 到达即对账移除——Step 3 Prototype 验证）。
+    pending: VecDeque<PendingEcho>,
 }
 
 impl Default for TranscriptWindow {
@@ -193,6 +215,7 @@ impl TranscriptWindow {
             turn_outline: Vec::new(),
             seen_seq: HashSet::new(),
             seen_request: HashSet::new(),
+            pending: VecDeque::new(),
         }
     }
 
@@ -248,6 +271,48 @@ impl TranscriptWindow {
         self.seen_seq.contains(&seq.0)
     }
 
+    // ---------- optimistic echo seam (REQ-002 Step 3) ----------
+
+    /// Optimistic echo records (send order).
+    pub fn pending(&self) -> impl Iterator<Item = &PendingEcho> {
+        self.pending.iter()
+    }
+
+    /// Create the local echo on send (no seq, no seen indexes; visible in the
+    /// next frame).
+    pub fn echo(&mut self, request_id: SessionRequestId, text: &str) {
+        self.pending.push_back(PendingEcho {
+            request_id,
+            text: text.to_string(),
+            status: PendingEchoStatus::Pending,
+        });
+    }
+
+    /// Mark a send failed (Pending → Failed only; never auto-resend, AC-002-08).
+    pub fn fail_echo(&mut self, request_id: &SessionRequestId, code: &str, message: &str) {
+        if let Some(echo) = self
+            .pending
+            .iter_mut()
+            .find(|e| e.request_id == *request_id && e.status == PendingEchoStatus::Pending)
+        {
+            echo.status = PendingEchoStatus::Failed {
+                code: code.to_string(),
+                message: message.to_string(),
+            };
+        }
+    }
+
+    /// requestId reconciliation funnel: a durable hit retires the matching
+    /// pending regardless of its status (a failed echo must not duplicate a
+    /// later durable commit, AC-002-06).
+    fn reconcile_pending(&mut self, ids: &HashSet<&str>) {
+        if ids.is_empty() {
+            return;
+        }
+        self.pending
+            .retain(|e| !ids.contains(e.request_id.0.as_str()));
+    }
+
     // ---------- write entry (single funnel) ----------
 
     pub fn apply(&mut self, incoming: Incoming) -> ApplyEffect {
@@ -280,6 +345,10 @@ impl TranscriptWindow {
         self.cursor = cursor;
         self.head_has_more = has_more;
         self.projections = projections.unwrap_or(Value::Null);
+        // Pending survives the rebuild: a snapshot carrying the same
+        // requestId reconciles it away (AC-002-06).
+        let ids = records_reconcile_ids(&records);
+        self.reconcile_pending(&ids);
         for rec in records {
             self.ingest_record(rec);
         }
@@ -289,6 +358,13 @@ impl TranscriptWindow {
     }
 
     fn apply_event(&mut self, ev: &SessionWireEvent) -> ApplyEffect {
+        // Reconcile first: pending never occupies the seen indexes, so the
+        // durable event always passes the dedup gates and then retires the
+        // matching pending (Step 3 Prototype validation).
+        if let Some(id) = ev.reconcile_id() {
+            let ids = HashSet::from([id]);
+            self.reconcile_pending(&ids);
+        }
         let Some(seq) = ev.seq else {
             // Event without seq: cannot take part in dedup/sorting; log it
             // as-is and never put it in the window.
@@ -362,6 +438,10 @@ impl TranscriptWindow {
         if let Some(hm) = has_more {
             self.head_has_more = hm;
         }
+        // Reconciliation runs outside the insertion count: a fully overlapping
+        // page may still retire a pending echo.
+        let ids = records_reconcile_ids(&records);
+        self.reconcile_pending(&ids);
         let head_before = self.head_seq();
         let mut inserted = 0usize;
         for rec in records {
@@ -563,6 +643,20 @@ fn record_request_id(rec: &SessionHistoryRecord) -> Option<&str> {
     }
 }
 
+/// Reconciliation requestIds across one batch of history records (wire shape
+/// knowledge lives in `SessionWireEvent::reconcile_id`, api layer).
+fn records_reconcile_ids(records: &[SessionHistoryRecord]) -> HashSet<&str> {
+    let mut ids = HashSet::new();
+    for rec in records {
+        if let SessionHistoryRecord::Event { event } = rec {
+            if let Some(id) = event.reconcile_id() {
+                ids.insert(id);
+            }
+        }
+    }
+    ids
+}
+
 /// Multi-session window cache (LRU, keeps only the 3 most recent windows,
 /// Notes/06 §7).
 #[derive(Debug, Default)]
@@ -611,7 +705,7 @@ impl SessionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::types::SessionSeq;
+    use crate::api::types::{SessionRequestId, SessionSeq};
 
     fn ev(seq: u64, r#type: &str, rid: Option<&str>, data: Option<Value>) -> SessionWireEvent {
         SessionWireEvent {
@@ -1036,5 +1130,186 @@ mod tests {
         store.touch("e", 200);
         assert!(store.get("c").is_none());
         assert!(store.get("b").is_some());
+    }
+
+    // ---------- REQ-002 乐观回显与 requestId 对账（Step 3） ----------
+
+    fn pending_texts(w: &TranscriptWindow) -> Vec<String> {
+        w.pending().map(|e| e.text.clone()).collect()
+    }
+
+    #[test]
+    fn echo_visible_and_reconciled_by_durable_event_ac002_06() {
+        let mut w = TranscriptWindow::new(200);
+        w.apply(Incoming::Snapshot {
+            cursor: None,
+            records: vec![],
+            has_more: true,
+            projections: None,
+        });
+        w.echo(SessionRequestId("req-1".into()), "hello");
+        assert_eq!(pending_texts(&w), vec!["hello"], "pending 立即可见");
+        assert_eq!(w.len(), 0, "pending 不占 durable blocks/seq");
+
+        // durable user/message 同 requestId 到达：只保留一个 durable 块。
+        assert_eq!(
+            w.apply(Incoming::FollowEvent(ev(
+                10,
+                "user/message",
+                Some("req-1"),
+                None
+            ))),
+            ApplyEffect::TailAppended {
+                appended: 1,
+                anchor_stable: true
+            }
+        );
+        assert!(
+            pending_texts(&w).is_empty(),
+            "durable 到达 → pending 对账移除"
+        );
+        assert_eq!(w.len(), 1);
+
+        // 重复事件/回放：Noop，不重复显示。
+        assert_eq!(
+            w.apply(Incoming::FollowEvent(ev(
+                10,
+                "user/message",
+                Some("req-1"),
+                None
+            ))),
+            ApplyEffect::Noop
+        );
+        assert_eq!(w.len(), 1);
+        assert!(pending_texts(&w).is_empty(), "回放不再生 pending");
+    }
+
+    #[test]
+    fn pending_never_pollutes_seen_indexes() {
+        // FAIL 条件反证：pending 若写入 seen_request，同 requestId 的 durable
+        // 事件会被幂等去重吞掉 → 消息永久丢失。这里断言 durable 能正常落地。
+        let mut w = TranscriptWindow::new(200);
+        w.apply(Incoming::Snapshot {
+            cursor: None,
+            records: vec![],
+            has_more: true,
+            projections: None,
+        });
+        w.echo(SessionRequestId("req-9".into()), "text");
+        assert_eq!(
+            w.apply(Incoming::FollowEvent(ev(
+                3,
+                "user/message",
+                Some("req-9"),
+                None
+            ))),
+            ApplyEffect::TailAppended {
+                appended: 1,
+                anchor_stable: true
+            },
+            "durable 必须穿过请求去重门（pending 不占 seen 索引）"
+        );
+        assert_eq!(w.len(), 1);
+        assert!(pending_texts(&w).is_empty());
+    }
+
+    #[test]
+    fn snapshot_rebuild_reconciles_pending_without_duplicate() {
+        let mut w = TranscriptWindow::new(200);
+        w.echo(SessionRequestId("req-7".into()), "snap");
+        // 重连快照含同 requestId：pending 对账移除，仅一个 durable 块。
+        w.apply(Incoming::Snapshot {
+            cursor: Some(SessionLogOffset(7)),
+            records: vec![event_rec(7, "user/message", Some("req-7"))],
+            has_more: false,
+            projections: None,
+        });
+        assert!(pending_texts(&w).is_empty());
+        assert_eq!(w.len(), 1);
+        // 快照重放（同内容再来一次）→ 重建后仍只有一个块。
+        w.apply(Incoming::Snapshot {
+            cursor: Some(SessionLogOffset(7)),
+            records: vec![event_rec(7, "user/message", Some("req-7"))],
+            has_more: false,
+            projections: None,
+        });
+        assert_eq!(w.len(), 1);
+
+        // 快照不含该 requestId：pending 保留，后到 durable 再 retire。
+        let mut w2 = TranscriptWindow::new(200);
+        w2.echo(SessionRequestId("req-8".into()), "keep");
+        w2.apply(Incoming::Snapshot {
+            cursor: Some(SessionLogOffset(1)),
+            records: vec![event_rec(1, "user/message", None)],
+            has_more: false,
+            projections: None,
+        });
+        assert_eq!(pending_texts(&w2), vec!["keep"]);
+        w2.apply(Incoming::FollowEvent(ev(
+            9,
+            "user/message",
+            Some("req-8"),
+            None,
+        )));
+        assert!(pending_texts(&w2).is_empty());
+        assert_eq!(w2.len(), 2);
+    }
+
+    #[test]
+    fn fail_echo_marks_error_and_durable_later_retires_it() {
+        let mut w = TranscriptWindow::new(200);
+        w.echo(SessionRequestId("req-f".into()), "boom");
+        w.fail_echo(
+            &SessionRequestId("req-f".into()),
+            "gateway/bad-request",
+            "非法请求",
+        );
+        let echo = w.pending().next().unwrap();
+        assert!(matches!(
+            &echo.status,
+            PendingEchoStatus::Failed { code, message }
+                if code == "gateway/bad-request" && message == "非法请求"
+        ));
+        // 失败不自动重发：window 自身不产生任何新块/回显。
+        assert_eq!(w.len(), 0);
+        assert_eq!(w.pending().count(), 1);
+        // 服务端最终仍提交（错误响应与提交竞态）：durable 到达 retire 失败回显。
+        w.apply(Incoming::FollowEvent(ev(
+            20,
+            "user/message",
+            Some("req-f"),
+            None,
+        )));
+        assert!(
+            pending_texts(&w).is_empty(),
+            "失败回显被 durable 对账 retire"
+        );
+        assert_eq!(w.len(), 1);
+    }
+
+    #[test]
+    fn official_nested_source_rpc_id_reconciles_too() {
+        // 官方 durable user 消息的 requestId 位于 source（user-rpc.rpcId，
+        // 2026-09-04 实读），顶层可能缺 requestId。
+        let mut w = TranscriptWindow::new(200);
+        w.echo(SessionRequestId("req-nested".into()), "hi");
+        let event = ev(
+            5,
+            "user/message",
+            None,
+            Some(serde_json::json!({
+                "content": "hi",
+                "source": {"user-rpc": {"kind": "user", "rpcId": "req-nested"}}
+            })),
+        );
+        assert_eq!(
+            w.apply(Incoming::FollowEvent(event)),
+            ApplyEffect::TailAppended {
+                appended: 1,
+                anchor_stable: true
+            }
+        );
+        assert!(pending_texts(&w).is_empty(), "官方嵌套 source.rpcId 也对账");
+        assert_eq!(w.len(), 1);
     }
 }

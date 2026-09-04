@@ -1,5 +1,6 @@
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
-use dshtui::app::{AppState, Mode};
+use dshtui::api::types::{SessionId, SessionLogOffset};
+use dshtui::app::{AppEvent, AppState, Mode};
 use dshtui::input::{map_key, Command, InputMode, KeyDecoder};
 
 fn key(code: KeyCode) -> Event {
@@ -91,4 +92,52 @@ fn picker_command_updates_app_mode_and_query() {
     app.handle_command(Command::ClosePicker);
     assert_eq!(app.mode, Mode::Normal);
     assert!(!app.picker.open);
+}
+
+#[test]
+fn insert_mode_decodes_and_routes_composer_lifecycle_ac002_01_04() {
+    // 无活动会话：i 不进入 INSERT（AC-002-12 状态层语义见 app 单测）。
+    let mut app = AppState::default();
+    let mut decoder = KeyDecoder::new();
+    let cmd = decoder
+        .decode(InputMode::Normal, key(KeyCode::Char('i')))
+        .unwrap();
+    assert_eq!(cmd, Command::InsertMode);
+    app.handle_command(cmd);
+    assert_eq!(app.mode, Mode::Normal, "无会话 i 不进入 INSERT");
+
+    // 打开会话后 i → INSERT。
+    app.handle_command(Command::OpenSession(SessionId("s1".into())));
+    app.handle(AppEvent::FollowSnapshot {
+        session_id: SessionId("s1".into()),
+        cursor: Some(SessionLogOffset(0)),
+        records: vec![],
+        has_more: true,
+        projections: Some(serde_json::json!({"running": false})),
+    });
+    app.handle_command(Command::InsertMode);
+    assert_eq!(app.mode, Mode::Insert);
+    assert!(app.composer.visible);
+
+    // Ctrl+Enter 换行 → 草稿含 \n（modifier 判定修正）。
+    let newline = decoder
+        .decode(
+            InputMode::Insert,
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL)),
+        )
+        .unwrap();
+    assert_eq!(newline, Command::PickerInput("\n".into()));
+    app.handle_command(newline);
+    assert_eq!(app.draft.as_ref().map(|d| d.text.as_str()), Some("\n"));
+
+    // Esc 收起但草稿保留（AC-002-04）。
+    app.handle_command(Command::ClosePicker);
+    assert_eq!(app.mode, Mode::Normal);
+    assert!(!app.composer.visible);
+    assert_eq!(app.draft.as_ref().map(|d| d.text.as_str()), Some("\n"));
+
+    // 再次 i：草稿还在。
+    app.handle_command(Command::InsertMode);
+    assert_eq!(app.draft.as_ref().map(|d| d.text.as_str()), Some("\n"));
+    assert!(app.composer.visible);
 }

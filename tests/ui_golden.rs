@@ -1,6 +1,6 @@
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use dshtui::api::types::{SessionHistoryRecord, SessionId, SessionSeq, SessionWireEvent};
-use dshtui::app::{AppEvent, AppState, ConnState};
+use dshtui::app::{AppEvent, AppState, ConnState, DraftState, Mode, StopState};
 use dshtui::model::Incoming;
 use dshtui::ui;
 use ratatui::backend::TestBackend;
@@ -22,13 +22,17 @@ fn event(seq: u64, event_type: &str, content: Option<&str>) -> SessionHistoryRec
 }
 
 fn rendered_text(terminal: &Terminal<TestBackend>) -> String {
-    terminal
-        .backend()
-        .buffer()
-        .content()
-        .iter()
-        .map(|cell| cell.symbol())
-        .collect()
+    // 宽字符占两个 cell（后一 cell 为占位空格）：用 Span::width 跳过占位。
+    let mut skip = 0usize;
+    let mut out = String::new();
+    for cell in terminal.backend().buffer().content() {
+        if skip == 0 && !cell.skip {
+            out.push_str(cell.symbol());
+        }
+        skip =
+            std::cmp::max(skip, ratatui::text::Span::raw(cell.symbol()).width()).saturating_sub(1);
+    }
+    out
 }
 
 #[test]
@@ -110,4 +114,62 @@ fn key_resize_event_updates_render_breakpoint_state() {
     assert_eq!(app.width, 120);
     assert_eq!(app.height, 30);
     assert_eq!(app.viewport.height, 28);
+}
+
+#[test]
+fn composer_overlay_visible_in_insert_and_hidden_in_normal_ac002_01() {
+    let mut app = AppState::new(20);
+    app.conn = ConnState::Ready;
+    app.active_session = Some(SessionId("sess-1".into()));
+    app.mode = Mode::Insert;
+    app.composer.visible = true;
+    app.composer.active_session = Some(SessionId("sess-1".into()));
+    app.draft = Some(DraftState {
+        text: "你好 draft".into(),
+        cursor: 8,
+        bound_session: SessionId("sess-1".into()),
+    });
+    let backend = TestBackend::new(80, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::render(frame, &app)).unwrap();
+    let insert = rendered_text(&terminal);
+    assert!(
+        insert.contains("Composer"),
+        "INSERT 显示 composer, text={insert}"
+    );
+    assert!(insert.contains("你好 draft"), "草稿可见, text={insert}");
+
+    // NORMAL：composer 收起不可见。
+    app.mode = Mode::Normal;
+    app.composer.visible = false;
+    terminal.draw(|frame| ui::render(frame, &app)).unwrap();
+    let normal = rendered_text(&terminal);
+    assert!(
+        !normal.contains("Composer"),
+        "NORMAL 不显示 composer, text={normal}"
+    );
+}
+
+#[test]
+fn stopping_state_and_insert_mode_render_in_status_ac002_05() {
+    let mut app = AppState::new(20);
+    app.conn = ConnState::Ready;
+    app.active_session = Some(SessionId("sess-1".into()));
+    // 官方投影 running=true（停止转场中）。
+    app.sessions.touch("sess-1", 20).apply(Incoming::Snapshot {
+        cursor: None,
+        records: vec![],
+        has_more: false,
+        projections: Some(serde_json::json!({"running": true})),
+    });
+    app.stop = StopState {
+        requested_session: Some(SessionId("sess-1".into())),
+    };
+    app.mode = Mode::Insert;
+    let backend = TestBackend::new(120, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::render(frame, &app)).unwrap();
+    let text = rendered_text(&terminal);
+    assert!(text.contains("停止中"), "本地停止中转场, text={text}");
+    assert!(text.contains("INSERT"), "INSERT 模式指示, text={text}");
 }
