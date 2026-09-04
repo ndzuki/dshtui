@@ -1553,13 +1553,27 @@ impl AppState {
         self.cursor_block = idx;
     }
 
-    /// Enter 语义（D-17/AC-003-03）：历史命中选中项优先 → 打开命中会话；
-    /// 否则跳到窗口首个匹配。
+    /// Enter 语义（D-17/AC-003-03）：历史命中选中项优先 → 打开命中会话，
+    /// 并以 snippet 作为窗口内二次定位词（快照到达后 window_changed 自动
+    /// 重算命中并高亮）；否则跳到窗口首个匹配。
     fn search_confirm(&mut self) -> Vec<Cmd> {
         if let Some(hit) = self.search.history_hits.get(self.search.history_selection) {
             let sid = hit.session_id.clone();
-            self.close_search();
-            return self.open_session(sid);
+            // snippet 截取为可检索词：去掉截断省略号与首尾空白（服务端
+            // ≤240 码点截断后缀 "…"，模糊匹配需按原文词面）。
+            let snippet = hit
+                .snippet
+                .trim()
+                .trim_matches(|c: char| c == '…' || c == '.')
+                .trim()
+                .to_string();
+            let cmds = self.open_session(sid);
+            // 重新打开窗口内搜索 overlay：snippet 二次定位（D-17 收缩）。
+            self.open_search();
+            self.search.query = snippet.clone();
+            self.recompute_window_matches();
+            // 全历史词仍按原查询保留（不重复触发 session/search）。
+            return cmds;
         }
         if let Some(item_index) = self.search.window_matches.first().copied() {
             let item = &self.search_index.items()[item_index];
@@ -3028,7 +3042,21 @@ mod tests {
             "打开命中会话"
         );
         assert_eq!(s.active_session.as_ref(), Some(&SessionId("sess-9".into())));
-        assert!(!s.search.open, "打开后关闭搜索 overlay");
+        // snippet 二次窗口内定位：搜索 overlay 保持打开且 query = snippet
+        // （截断省略号已去掉）。
+        assert!(s.search.open, "搜索 overlay 保持打开（二次定位）");
+        assert_eq!(s.search.query, "deploy 排查");
+        // 窗口快照到达（含命中内容）→ 窗口内即时命中自动重算并高亮。
+        assistant_md(&mut s, "sess-9", 10, "deploy 排查 的结论在这里");
+        assert!(
+            !s.search.window_matches.is_empty(),
+            "snippet 在窗口内二次定位命中"
+        );
+        assert_eq!(s.search.cursor, 0);
+        // Esc 关闭搜索，会话保持打开。
+        s.handle_command(C::ClosePicker);
+        assert!(!s.search.open);
+        assert_eq!(s.active_session.as_ref(), Some(&SessionId("sess-9".into())));
     }
 
     #[test]
