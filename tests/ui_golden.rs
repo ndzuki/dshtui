@@ -25,7 +25,7 @@ fn event(seq: u64, event_type: &str, content: Option<&str>) -> SessionHistoryRec
 }
 
 fn rendered_text(terminal: &Terminal<TestBackend>) -> String {
-    // 宽字符占两个 cell（后一 cell 为占位空格）：用 Span::width 跳过占位。
+    // 宽字符占两个 cell（后一 cell 为占位空格）：跳过占位。
     let mut skip = 0usize;
     let mut out = String::new();
     for cell in terminal.backend().buffer().content() {
@@ -301,4 +301,193 @@ fn copied_toast_and_steer_label_render_in_status_ac003_06_08() {
     let text = rendered_text(&terminal);
     assert!(text.contains("STEER"), "状态条 STEER, text={text}");
     assert!(text.contains("copied"), "复制 toast, text={text}");
+}
+
+// ---------- REQ-004 V0.2 图片（Step 5 渲染层 golden） ----------
+
+fn nested_image_event(seq: u64) -> SessionHistoryRecord {
+    SessionHistoryRecord::Event {
+        event: SessionWireEvent {
+            event_type: "assistant/message".into(),
+            seq: Some(SessionSeq(seq)),
+            time: None,
+            request_id: None,
+            ignorable: None,
+            source_event_seqs: None,
+            surface_op: None,
+            data: Some(serde_json::json!({
+                "content": [
+                    {"type": "text", "text": "two images inline"},
+                    {"type": "image", "attachmentId": "nested-1", "name": "nested.png", "dims": "4x5"},
+                    {"type": "image", "attachmentId": "nested-2", "name": "second.png", "width": 6, "height": 7}
+                ]
+            })),
+        },
+    }
+}
+
+fn image_event(seq: u64, attachment_id: &str, name: &str, dims: &str) -> SessionHistoryRecord {
+    SessionHistoryRecord::Event {
+        event: SessionWireEvent {
+            event_type: "message/image".to_string(),
+            seq: Some(SessionSeq(seq)),
+            time: None,
+            request_id: None,
+            ignorable: None,
+            source_event_seqs: None,
+            surface_op: None,
+            data: Some(serde_json::json!({
+                "attachmentId": attachment_id,
+                "name": name,
+                "dims": dims
+            })),
+        },
+    }
+}
+
+fn image_window(records: Vec<SessionHistoryRecord>) -> dshtui::model::TranscriptWindow {
+    let mut window = dshtui::model::TranscriptWindow::new(20);
+    window.apply(Incoming::Snapshot {
+        cursor: None,
+        records,
+        has_more: false,
+        projections: None,
+    });
+    window
+}
+
+#[test]
+fn image_placeholders_are_rendered_per_block_with_name_and_dims() {
+    // AC-004-01：同消息多图逐块独立占位 `名称 · 宽×高`。
+    let window = image_window(vec![
+        nested_image_event(1),
+        image_event(2, "att-a", "a.png", "10x20"),
+        event(3, "user/message", Some("two images below")),
+        image_event(4, "att-b", "b.png", "30x40"),
+    ]);
+    let mut app = AppState::default();
+    app.conn = ConnState::Ready;
+    app.kitty_capable = true;
+    app.active_session = Some(SessionId("sess-1".into()));
+    app.sessions.touch("sess-1", 20).apply(Incoming::Snapshot {
+        cursor: None,
+        records: vec![],
+        has_more: false,
+        projections: None,
+    });
+    // 直接替换窗口内容为图片窗口（golden 断言语义）。
+    *app.sessions.touch("sess-1", 20) = window;
+    let backend = TestBackend::new(100, 12);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::render(frame, &app)).unwrap();
+    let text = rendered_text(&terminal);
+    assert!(text.contains("a.png · 10x20"), "text={text}");
+    assert!(text.contains("b.png · 30x40"), "text={text}");
+    assert!(text.contains("two images below"), "text={text}");
+    // AC-004-01：同一事件内的两张图片逐块独立占位（宿主消息保留）。
+    assert!(text.contains("nested.png · 4x5"), "text={text}");
+    assert!(text.contains("second.png · 6x7"), "text={text}");
+    assert!(
+        text.contains("two images inline"),
+        "宿主文本保留, text={text}"
+    );
+    assert!(
+        !text.contains("[o]系统查看器"),
+        "Kitty 占位不带查看器提示, text={text}"
+    );
+}
+
+#[test]
+fn image_placeholder_backfills_meta_and_shows_error_without_crash() {
+    // AC-004-06：失败 → 错误占位 + 可读提示不崩溃；成功 → 元数据回填。
+    let window = image_window(vec![image_event(1, "att-x", "x.png", "10x20")]);
+    let mut app = AppState::default();
+    app.conn = ConnState::Ready;
+    app.kitty_capable = true;
+    app.active_session = Some(SessionId("sess-1".into()));
+    *app.sessions.touch("sess-1", 20) = window.clone();
+    let backend = TestBackend::new(100, 10);
+    let mut terminal = Terminal::new(backend).unwrap();
+
+    // 拉取成功回填：AttachmentRef 覆盖占位标注（位置不变）。
+    app.image_meta.insert(
+        dshtui::api::types::AttachmentId("att-x".into()),
+        dshtui::model::AttachmentRef::from(
+            &dshtui::api::attachment::parse_response(&serde_json::json!({
+                "attachment": {
+                    "attachmentId": "att-x",
+                    "mediaType": "image/png",
+                    "bytes": 10,
+                    "width": 640,
+                    "height": 480,
+                    "name": "fetched.png"
+                },
+                "data": "AQ=="
+            }))
+            .unwrap(),
+        ),
+    );
+    terminal.draw(|frame| ui::render(frame, &app)).unwrap();
+    let ok_text = rendered_text(&terminal);
+    assert!(ok_text.contains("fetched.png · 640x480"), "text={ok_text}");
+
+    // 失败：错误占位 + 可读提示，应用不崩溃。
+    app.image_errors.insert(
+        dshtui::api::types::AttachmentId("att-x".into()),
+        "拉取失败: 断网".into(),
+    );
+    terminal.draw(|frame| ui::render(frame, &app)).unwrap();
+    let err_text = rendered_text(&terminal);
+    assert!(err_text.contains("✗"), "text={err_text}");
+    assert!(err_text.contains("拉取失败: 断网"), "text={err_text}");
+}
+
+#[test]
+fn non_kitty_placeholder_shows_system_viewer_hint() {
+    // AC-004-03/07：非 Kitty 占位 + 系统查看器提示；Kitty 无提示。
+    let window = image_window(vec![image_event(1, "att-x", "x.png", "10x20")]);
+    let mut app = AppState::default();
+    app.conn = ConnState::Ready;
+    app.kitty_capable = false;
+    app.active_session = Some(SessionId("sess-1".into()));
+    *app.sessions.touch("sess-1", 20) = window.clone();
+    let backend = TestBackend::new(100, 10);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::render(frame, &app)).unwrap();
+    let text = rendered_text(&terminal);
+    assert!(text.contains("x.png · 10x20"), "text={text}");
+    assert!(
+        text.contains("[image placeholder] [o]system viewer"),
+        "text={text}"
+    );
+    assert!(text.contains("path:att-x"), "text={text}");
+
+    app.kitty_capable = true;
+    terminal.draw(|frame| ui::render(frame, &app)).unwrap();
+    let kitty_text = rendered_text(&terminal);
+    assert!(!kitty_text.contains("[o]系统查看器"), "text={kitty_text}");
+}
+
+#[test]
+fn image_view_mode_shows_image_status_and_actions() {
+    // AC-004-05 状态栏：IMAGE 徽标 + [o]系统查看器 [y]复制路径 [q]关闭。
+    let mut app = AppState::default();
+    app.conn = ConnState::Ready;
+    app.mode = dshtui::app::Mode::ImageView;
+    app.image_view.open_view(
+        SessionSeq(1),
+        dshtui::api::types::AttachmentId("att-x".into()),
+        Some("x.png".into()),
+        Some("10x20".into()),
+    );
+    let backend = TestBackend::new(100, 12);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::render(frame, &app)).unwrap();
+    let text = rendered_text(&terminal);
+    assert!(text.contains("IMAGE"), "text={text}");
+    assert!(
+        text.contains("[o]系统查看器 [y]复制路径 [q]关闭"),
+        "text={text}"
+    );
+    assert!(text.contains("加载中"), "text={text}");
 }

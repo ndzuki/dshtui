@@ -186,3 +186,240 @@ fn optimistic_echo_reconciles_against_durable_event_and_snapshot_ac002_06() {
     );
     assert_eq!(seqs(&window), vec![6], "快照重放不重复");
 }
+
+// ---------- REQ-004 V0.2 图片模型（Step 2） ----------
+
+#[test]
+fn nested_image_reference_is_found_through_children() {
+    let mut window = TranscriptWindow::new(20);
+    window.apply(Incoming::FollowEvent(SessionWireEvent {
+        event_type: "assistant/message".into(),
+        seq: Some(SessionSeq(1)),
+        time: None,
+        request_id: None,
+        ignorable: None,
+        source_event_seqs: None,
+        surface_op: None,
+        data: Some(serde_json::json!({
+            "content": [{
+                "type": "text",
+                "children": [{
+                    "kind": "attachment",
+                    "attachmentId": "nested-att",
+                    "name": "nested.png",
+                    "width": 12,
+                    "height": 8
+                }]
+            }]
+        })),
+    }));
+    let blocks: Vec<_> = window.blocks().collect();
+    assert_eq!(blocks.len(), 2, "host message + one image: {blocks:?}");
+    assert!(
+        matches!(blocks[0], dshtui::model::Block::AssistantMessage { .. }),
+        "host block preserved: {blocks:?}"
+    );
+    match &blocks[1] {
+        dshtui::model::Block::Image {
+            attachment_id,
+            name,
+            ..
+        } => {
+            assert_eq!(attachment_id.as_deref(), Some("nested-att"));
+            assert_eq!(name.as_deref(), Some("nested.png"));
+        }
+        other => panic!("expected nested image block, got {other:?}"),
+    };
+}
+
+#[test]
+fn same_event_multiple_images_expand_to_blocks_in_wire_order() {
+    // AC-004-01: 同消息多图逐块独立占位；宿主消息文本不丢。
+    let mut window = TranscriptWindow::new(20);
+    let eff = window.apply(Incoming::FollowEvent(SessionWireEvent {
+        event_type: "user/message".into(),
+        seq: Some(SessionSeq(7)),
+        time: None,
+        request_id: None,
+        ignorable: None,
+        source_event_seqs: None,
+        surface_op: None,
+        data: Some(serde_json::json!({
+            "content": [
+                {"type": "text", "text": "look at these"},
+                {"type": "image", "attachmentId": "img-1", "name": "one.png", "dims": "1x1"},
+                {"type": "image", "attachmentId": "img-2", "name": "two.png", "width": 2, "height": 3}
+            ]
+        })),
+    }));
+    assert_eq!(
+        eff,
+        dshtui::model::ApplyEffect::TailAppended {
+            appended: 3,
+            anchor_stable: true,
+        },
+        "one event expands to three blocks"
+    );
+    let blocks: Vec<_> = window.blocks().collect();
+    assert_eq!(blocks.len(), 3, "{blocks:?}");
+    match &blocks[0] {
+        dshtui::model::Block::UserMessage { content, .. } => {
+            assert_eq!(content, "look at these", "宿主文本不丢");
+        }
+        other => panic!("expected host user message, got {other:?}"),
+    }
+    match (&blocks[1], &blocks[2]) {
+        (
+            dshtui::model::Block::Image {
+                attachment_id: a,
+                name: n,
+                ..
+            },
+            dshtui::model::Block::Image {
+                attachment_id: b,
+                name: m,
+                dims,
+                ..
+            },
+        ) => {
+            assert_eq!(a.as_deref(), Some("img-1"));
+            assert_eq!(n.as_deref(), Some("one.png"));
+            assert_eq!(b.as_deref(), Some("img-2"));
+            assert_eq!(m.as_deref(), Some("two.png"));
+            assert_eq!(dims.as_deref(), Some("2x3"), "width/height fallback dims");
+        }
+        other => panic!("expected two image blocks, got {other:?}"),
+    }
+    assert_eq!(window.len(), 3);
+}
+
+#[test]
+fn media_type_whitelist_only_allows_png_jpeg_webp_gif() {
+    use dshtui::model::image::is_supported_image;
+    for ok in ["image/png", "image/jpeg", "image/webp", "image/gif"] {
+        assert!(is_supported_image(ok), "{ok} must be whitelisted");
+    }
+    for bad in [
+        "image/svg+xml",
+        "video/mp4",
+        "application/octet-stream",
+        "",
+        "image/bmp",
+    ] {
+        assert!(!is_supported_image(bad), "{bad} must be rejected");
+    }
+}
+
+#[test]
+fn attachment_ref_maps_api_payload_to_internal_snake_case() {
+    use dshtui::api::attachment::parse_response;
+    use dshtui::model::image::AttachmentRef;
+    let data = parse_response(&serde_json::json!({
+        "attachment": {
+            "attachmentId": "att-1",
+            "mediaType": "image/png",
+            "bytes": 1024,
+            "width": 640,
+            "height": 480,
+            "name": "design.png",
+            "originalDimensions": {"width": 1280, "height": 960}
+        },
+        "data": "AQ=="
+    }))
+    .unwrap();
+    let r: AttachmentRef = AttachmentRef::from(&data);
+    assert_eq!(r.attachment_id.0, "att-1");
+    assert_eq!(r.media_type.0, "image/png");
+    assert_eq!(r.bytes, 1024);
+    assert_eq!((r.width, r.height), (640, 480));
+    assert_eq!(r.name.as_deref(), Some("design.png"));
+    assert_eq!(
+        r.original_dimensions.map(|d| (d.width, d.height)),
+        Some((1280, 960))
+    );
+
+    // 可选字段缺失不崩（官方只剥离路径，name/originalDimensions 可缺）。
+    let minimal = parse_response(&serde_json::json!({
+        "attachment": {"attachmentId": "att-2", "mediaType": "image/gif"},
+        "data": ""
+    }))
+    .unwrap();
+    let minimal = AttachmentRef::from(&minimal);
+    assert!(minimal.name.is_none());
+    assert!(minimal.original_dimensions.is_none());
+    assert!(minimal.width == 0 && minimal.height == 0);
+}
+
+#[test]
+fn image_view_state_transitions_loading_rendered_failed_closed() {
+    use dshtui::api::types::{AttachmentId, SessionSeq};
+    use dshtui::model::image::{ImageViewPhase, ImageViewState};
+
+    let mut state = ImageViewState::default();
+    assert!(!state.open);
+
+    // 打开 → Loading，锚点记录来源 Block.seq（防串图）。
+    state.open_view(
+        SessionSeq(42),
+        AttachmentId("att-1".into()),
+        Some("a.png".into()),
+        Some("10x20".into()),
+    );
+    assert!(state.open);
+    assert_eq!(state.phase, ImageViewPhase::Loading);
+    assert_eq!(state.block_seq, Some(SessionSeq(42)));
+    assert_eq!(
+        state.attachment_id.as_ref().map(|a| a.0.as_str()),
+        Some("att-1")
+    );
+    assert_eq!(state.name.as_deref(), Some("a.png"));
+    assert!(state.error.is_none());
+
+    // Loading → Rendered。
+    state.mark_rendered();
+    assert_eq!(state.phase, ImageViewPhase::Rendered);
+
+    // 重新打开（幂等锚点路径）先回 Loading 再失败：失败带 code/message。
+    state.open_view(SessionSeq(43), AttachmentId("att-2".into()), None, None);
+    state.mark_failed("decode/unsupported".into(), "格式不支持".into());
+    assert_eq!(state.phase, ImageViewPhase::Failed);
+    let err = state.error.as_ref().unwrap();
+    assert_eq!(
+        (err.code.as_str(), err.message.as_str()),
+        ("decode/unsupported", "格式不支持")
+    );
+
+    // 关闭 → open=false、清空展示上下文。
+    state.close();
+    assert!(!state.open);
+    assert_eq!(state.phase, ImageViewPhase::Closed);
+    assert!(state.error.is_none());
+}
+
+#[test]
+fn image_block_identity_is_extracted_from_block_image_only() {
+    use dshtui::api::types::SessionSeq;
+    use dshtui::model::image::image_block_of;
+    use dshtui::model::Block;
+    let image = Block::Image {
+        seq: SessionSeq(7),
+        attachment_id: Some("att-7".into()),
+        name: Some("x.png".into()),
+        dims: Some("12x34".into()),
+    };
+    let r = image_block_of(&image).expect("image block identity");
+    assert_eq!(r.seq, SessionSeq(7));
+    assert_eq!(
+        r.attachment_id.as_ref().map(|a| a.0.as_str()),
+        Some("att-7")
+    );
+    assert_eq!(r.name.as_deref(), Some("x.png"));
+    assert_eq!(r.dims.as_deref(), Some("12x34"));
+
+    assert!(image_block_of(&Block::UserMessage {
+        seq: SessionSeq(8),
+        content: "hi".into(),
+        time: None,
+    })
+    .is_none());
+}

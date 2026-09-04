@@ -16,20 +16,30 @@
 //!   exit (AC-001-08);
 //! - permission errors (PERMISSION_DENIED) are not auto-retried (Notes/03 §8).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::api::types::ChunkRow;
 use crate::api::types::{
-    ApprovalEvent, ApprovalOutcome, ControlItem, ListItemRaw, PromptContentPart, PromptMode,
-    PromptRequest, SearchHit, SessionHistoryRecord, SessionId, SessionLogOffset, SessionRequestId,
-    SessionSeq, SessionWireEvent,
+    ApprovalEvent, ApprovalOutcome, AttachmentId, ControlItem, ListItemRaw, PromptContentPart,
+    PromptMode, PromptRequest, SearchHit, SessionHistoryRecord, SessionId, SessionLogOffset,
+    SessionRequestId, SessionSeq, SessionWireEvent,
 };
 use crate::api::{ClientError, ErrorClass};
 use crate::model::{
-    block_plain_text, block_yank_target, selection_text, ApplyEffect, DraftRegistry, DraftState,
-    Incoming, InputHistory, SearchIndex, SearchKindFilter, SessionStore, VisualMode,
-    VisualSelection, WorkspaceStore, YankBackend, YankState,
+    block_plain_text, block_yank_target, selection_text, ApplyEffect, AttachmentRef, DraftRegistry,
+    DraftState, ImageViewState, Incoming, InputHistory, SearchIndex, SearchKindFilter,
+    SessionStore, VisualMode, VisualSelection, WorkspaceStore, YankBackend, YankState,
 };
+
+/// 已编码的 Kitty 帧（ratatui-image `Protocol` 对象；`Box<dyn Protocol>` 无
+/// Debug，手工实现避免 AppState 丢失 Debug 派生）。
+pub struct KittyFrame(pub Box<dyn ratatui_image::protocol::Protocol>);
+
+impl std::fmt::Debug for KittyFrame {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KittyFrame").finish_non_exhaustive()
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Mode {
@@ -44,6 +54,8 @@ pub enum Mode {
     Visual,
     /// 审批到达强制进入的模态（REQ-003，`y/n/q/Esc` 决策后回先前模式）。
     Approval,
+    /// ImageView（REQ-004 V0.2：仅 Kitty 渲染态出现，`q` 回 NORMAL）。
+    ImageView,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -73,6 +85,9 @@ pub struct Viewport {
     pub follow_tail: bool,
     /// Visible height (lines).
     pub height: usize,
+    /// 焦点块锚点（REQ-004 引入，供 REQ-003「光标在链接上」复用）：当前
+    /// 焦点块 seq（最小实现 = 视口内首个可见图片块，随滚动/重建刷新）。
+    pub focused_seq: Option<SessionSeq>,
 }
 
 impl Default for Viewport {
@@ -81,6 +96,7 @@ impl Default for Viewport {
             offset: 0,
             follow_tail: true,
             height: 24,
+            focused_seq: None,
         }
     }
 }
@@ -339,6 +355,37 @@ pub enum AppEvent {
         backend: YankBackend,
         ok: bool,
     },
+    // ---------- REQ-004 V0.2 图片事件 ----------
+    /// 拉取+解码+kitty 编码成功（spawn_blocking 回写）。
+    AttachmentReady {
+        session_id: SessionId,
+        attachment_id: AttachmentId,
+        block_seq: SessionSeq,
+        /// 拉取元数据（占位回填）。
+        meta: AttachmentRef,
+        /// 已编码 Kitty 帧（非 Kitty 路径为 None）。
+        frame: Option<KittyFrame>,
+        /// 缓存条目（临时文件已落盘）。
+        entry: crate::model::ImageCacheEntry,
+        /// true = 缓存命中重解码（不再 complete 入缓存）。
+        cached: bool,
+        /// 本次打开是否为「非 Kitty 直达系统查看器」。
+        for_viewer: bool,
+    },
+    /// 拉取/解码失败。
+    AttachmentFailed {
+        session_id: SessionId,
+        attachment_id: AttachmentId,
+        block_seq: SessionSeq,
+        /// Remote `error.code` / `network` / `decode/unsupported` /
+        /// `decode/corrupt` / `encode/failed`（§6 分类依据）。
+        code: String,
+        /// 可读提示。
+        message: String,
+        /// 网络断连 → 既有指数退避重连；权限/格式类不自动重试。
+        retryable: bool,
+        for_viewer: bool,
+    },
 }
 
 /// Orchestration commands emitted by the reducer (executed by the run loop).
@@ -402,6 +449,31 @@ pub enum Cmd {
     CopyToClipboard {
         text: String,
     },
+    // ---------- REQ-004 V0.2 ----------
+    /// `session/attachment` 拉取 + 解码 + kitty 编码（单飞已在 reducer 判定）。
+    FetchAttachment {
+        session_id: SessionId,
+        attachment_id: AttachmentId,
+        block_seq: SessionSeq,
+        /// 非 Kitty：成功后直达系统查看器（不进入 ImageView）。
+        for_viewer: bool,
+    },
+    /// 从缓存临时文件重新解码渲染（缓存命中路径）。
+    RenderCachedImage {
+        session_id: SessionId,
+        attachment_id: AttachmentId,
+        block_seq: SessionSeq,
+        temp_file: std::path::PathBuf,
+        media_type: crate::api::types::MediaType,
+    },
+    /// 系统查看器打开原图（`open`/`xdg-open` 子进程不阻塞）。
+    OpenSystemViewer {
+        path: std::path::PathBuf,
+    },
+    /// 复制图片路径/附件名到剪贴板（arboard，不可用降级提示）。
+    CopyImageText {
+        text: String,
+    },
 }
 
 #[derive(Debug)]
@@ -441,6 +513,8 @@ pub struct AppState {
     /// Most recent user-facing error (shown in the status bar/guidance area,
     /// no spam).
     pub last_error: Option<String>,
+    /// 一次性成功反馈（如 `copied`，状态条显示，04 §4.4）。
+    pub notice: Option<String>,
     /// Startup guidance (AC-001-02).
     pub startup_guidance: Option<String>,
     /// Terminal size (render breakpoint input).
@@ -459,6 +533,30 @@ pub struct AppState {
     pub collapsed_workspaces: HashSet<crate::api::types::WorkspaceId>,
     list_cursor: Option<String>,
     list_loaded: bool,
+    // ---------- REQ-004 V0.2 图片 ----------
+    /// 终端 Kitty 能力（启动检测一次，06 §6）：true → ImageView 渲染路径，
+    /// false → 占位 `o`/`Enter` 直达系统查看器（AC-004-07）。
+    pub kitty_capable: bool,
+    /// IMAGEVIEW 模式状态（来源块锚点 + 拉取/解码/渲染阶段）。
+    pub image_view: ImageViewState,
+    /// 已渲染的 Kitty 帧（Rendered 阶段持有）。
+    pub image_frame: Option<KittyFrame>,
+    /// 拉取成功的附件元数据（attachment_id → AttachmentRef；占位回填标注）。
+    pub image_meta: HashMap<AttachmentId, AttachmentRef>,
+    /// 拉取/解码失败（attachment_id → 可读提示；错误占位）。
+    pub image_errors: HashMap<AttachmentId, String>,
+    /// 拉取/解码在途（attachment_id；幂等判定与加载指示）。
+    pub image_loading: HashSet<AttachmentId>,
+    /// kitty image id 分配源（每帧唯一）。
+    kitty_frame_id: u16,
+    /// 图片缓存（LRU + 预算 + 单飞，Arc 供 spawn_blocking 共享）。
+    pub image_cache: std::sync::Arc<crate::cache::image_cache::ImageCache>,
+    /// 未入缓存的临时文件（拉取即弃/系统查看器持有），进程退出清理。
+    transient_files: Vec<std::path::PathBuf>,
+    /// 当前 ImageView 展示附件的临时文件路径（未入缓存时系统查看器/复制用）。
+    view_temp_path: Option<std::path::PathBuf>,
+    /// Non-Kitty viewer request target; stale completions must not launch a viewer.
+    pub pending_viewer: Option<(SessionId, SessionSeq, AttachmentId)>,
 }
 
 impl Default for AppState {
@@ -487,6 +585,7 @@ impl Default for AppState {
             quit_requested: false,
             exited: false,
             last_error: None,
+            notice: None,
             startup_guidance: None,
             width: 80,
             height: 24,
@@ -499,6 +598,19 @@ impl Default for AppState {
             collapsed_workspaces: HashSet::new(),
             list_cursor: None,
             list_loaded: false,
+            kitty_capable: false,
+            image_view: ImageViewState::default(),
+            image_frame: None,
+            image_meta: HashMap::new(),
+            image_errors: HashMap::new(),
+            image_loading: HashSet::new(),
+            kitty_frame_id: 0,
+            image_cache: std::sync::Arc::new(crate::cache::image_cache::ImageCache::new(
+                crate::config::DEFAULT_CACHE_BYTES,
+            )),
+            transient_files: Vec::new(),
+            view_temp_path: None,
+            pending_viewer: None,
         }
     }
 }
@@ -847,6 +959,7 @@ impl AppState {
                 self.width = width;
                 self.height = height;
                 self.viewport.height = height.saturating_sub(2).max(1) as usize;
+                self.refresh_focus();
                 vec![]
             }
             AppEvent::SearchHistoryDebounced { query, generation } => {
@@ -1027,6 +1140,42 @@ impl AppState {
                 }
                 vec![]
             }
+            AppEvent::AttachmentReady {
+                session_id,
+                attachment_id,
+                block_seq,
+                meta,
+                frame,
+                entry,
+                cached,
+                for_viewer,
+            } => self.on_attachment_ready(
+                session_id,
+                attachment_id,
+                block_seq,
+                meta,
+                frame,
+                entry,
+                cached,
+                for_viewer,
+            ),
+            AppEvent::AttachmentFailed {
+                session_id,
+                attachment_id,
+                block_seq,
+                code,
+                message,
+                retryable,
+                for_viewer,
+            } => self.on_attachment_failed(
+                session_id,
+                attachment_id,
+                block_seq,
+                code,
+                message,
+                retryable,
+                for_viewer,
+            ),
         }
     }
 
@@ -1118,6 +1267,7 @@ impl AppState {
             }
             ApplyEffect::Noop => {}
         }
+        self.refresh_focus();
     }
 
     fn scroll_to_bottom(&mut self) {
@@ -1301,6 +1451,293 @@ impl AppState {
         vec![Cmd::CancelSession(sid)]
     }
 
+    // ---------- REQ-004 V0.2 图片状态机 ----------
+
+    /// 焦点块锚点刷新：最小实现 = 视口内首个可见图片块 seq（随滚动/重建/
+    /// resize 刷新；REQ-003「光标在链接上」复用同一锚点）。
+    fn refresh_focus(&mut self) {
+        self.viewport.focused_seq = self.focused_image_block().map(|b| b.seq);
+    }
+
+    /// 视口内首个可见图片块（供 `o`/`Enter` 打开与锚点维护）。
+    pub fn focused_image_block(&self) -> Option<crate::model::ImageBlockRef> {
+        let window = self.active_window()?;
+        if let Some(seq) = self.viewport.focused_seq {
+            if let Some(block) = window
+                .blocks()
+                .find(|block| block.seq() == seq)
+                .and_then(crate::model::image_block_of)
+            {
+                return Some(block);
+            }
+        }
+        let height = self.viewport.height.max(1);
+        let start = self.viewport.offset;
+        let end = (start + height).min(window.len());
+        window
+            .blocks()
+            .skip(start)
+            .take(end.saturating_sub(start))
+            .find_map(crate::model::image_block_of)
+    }
+
+    fn viewer_target_matches(
+        &self,
+        session_id: &SessionId,
+        block_seq: SessionSeq,
+        attachment_id: &AttachmentId,
+    ) -> bool {
+        self.pending_viewer
+            .as_ref()
+            .is_some_and(|(target_session, target_seq, target_id)| {
+                target_session == session_id
+                    && *target_seq == block_seq
+                    && target_id == attachment_id
+            })
+    }
+
+    fn active_image_view_target(
+        &self,
+        session_id: &SessionId,
+        block_seq: SessionSeq,
+        attachment_id: &AttachmentId,
+    ) -> bool {
+        self.active_session.as_ref() == Some(session_id)
+            && self.mode == Mode::ImageView
+            && self.image_view.block_seq == Some(block_seq)
+            && self.image_view.attachment_id.as_ref() == Some(attachment_id)
+    }
+
+    /// 当前 ImageView 展示附件的临时文件路径（缓存托管 → 缓存条目；
+    /// 未入缓存 → view_temp_path）。
+    fn view_image_path(&self) -> Option<std::path::PathBuf> {
+        let att_id = self.image_view.attachment_id.as_ref()?;
+        if let Some(entry) = self.image_cache.get(att_id) {
+            return Some(entry.temp_file);
+        }
+        self.view_temp_path.clone()
+    }
+
+    /// 打开焦点图片块（两级键位 D-14）：
+    /// - 已开任何 ImageView（V0.2 单图）→ 聚焦已有视图（幂等 no-op）；
+    /// - 同 attachment_id 在途 → no-op（幂等，不重复 session/attachment）；
+    /// - Kitty → ImageView（缓存命中重解码，未命中单飞拉取）；
+    /// - 非 Kitty → 拉取落盘后直达系统查看器（AC-004-07）。
+    fn open_focused_image(&mut self) -> Vec<Cmd> {
+        let Some(block) = self.focused_image_block() else {
+            return vec![];
+        };
+        if self.mode == Mode::ImageView {
+            // AC-004-08：不叠加第二个 ImageView。
+            return vec![];
+        }
+        let Some(att_id) = block.attachment_id.clone() else {
+            // 防御：占位缺 attachment_id（不应发生）→ 提示不崩溃。
+            self.last_error = Some("图片块缺少 attachment_id，无法打开".into());
+            return vec![];
+        };
+        if self.image_loading.contains(&att_id) {
+            // AC-004-08：在途幂等 no-op（聚焦已有加载）。
+            return vec![];
+        }
+        let Some(session_id) = self.active_session.clone() else {
+            return vec![];
+        };
+        match self.image_cache.acquire(&att_id) {
+            crate::cache::image_cache::Acquire::Cached(entry) => {
+                if !self.kitty_capable {
+                    // 非 Kitty 缓存命中：直达系统查看器。无网络往返、无后续
+                    // ready 事件——不登记 pending_viewer（避免残留状态）。
+                    return vec![Cmd::OpenSystemViewer {
+                        path: entry.temp_file,
+                    }];
+                }
+                self.image_cache.pin(&att_id);
+                self.image_view.open_view(
+                    block.seq,
+                    att_id.clone(),
+                    block.name.clone(),
+                    block.dims.clone(),
+                );
+                self.mode = Mode::ImageView;
+                vec![Cmd::RenderCachedImage {
+                    session_id,
+                    attachment_id: att_id,
+                    block_seq: block.seq,
+                    temp_file: entry.temp_file,
+                    media_type: entry.media_type,
+                }]
+            }
+            crate::cache::image_cache::Acquire::InFlight => vec![],
+            crate::cache::image_cache::Acquire::Started => {
+                self.image_loading.insert(att_id.clone());
+                if !self.kitty_capable {
+                    // AC-004-07：非 Kitty 拉取后直达系统查看器，不进入
+                    // ImageView。
+                    self.pending_viewer = Some((session_id.clone(), block.seq, att_id.clone()));
+                    return vec![Cmd::FetchAttachment {
+                        session_id,
+                        attachment_id: att_id,
+                        block_seq: block.seq,
+                        for_viewer: true,
+                    }];
+                }
+                self.image_cache.pin(&att_id);
+                self.image_view.open_view(
+                    block.seq,
+                    att_id.clone(),
+                    block.name.clone(),
+                    block.dims.clone(),
+                );
+                self.mode = Mode::ImageView;
+                vec![Cmd::FetchAttachment {
+                    session_id,
+                    attachment_id: att_id,
+                    block_seq: block.seq,
+                    for_viewer: false,
+                }]
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn on_attachment_ready(
+        &mut self,
+        session_id: SessionId,
+        attachment_id: AttachmentId,
+        block_seq: SessionSeq,
+        meta: AttachmentRef,
+        frame: Option<KittyFrame>,
+        entry: crate::model::ImageCacheEntry,
+        cached: bool,
+        for_viewer: bool,
+    ) -> Vec<Cmd> {
+        let image_view_target = self.active_session.as_ref() == Some(&session_id)
+            && self.mode == Mode::ImageView
+            && self.image_view.block_seq == Some(block_seq)
+            && self.image_view.attachment_id.as_ref() == Some(&attachment_id);
+        let viewer_target = self.viewer_target_matches(&session_id, block_seq, &attachment_id);
+        self.image_loading.remove(&attachment_id);
+        if !cached && !image_view_target && !viewer_target {
+            let _ = std::fs::remove_file(&entry.temp_file);
+            self.image_cache.abort(&attachment_id);
+            self.image_cache.unpin(&attachment_id);
+            return vec![];
+        }
+        if !cached {
+            self.image_meta.insert(attachment_id.clone(), meta);
+            match self.image_cache.complete(&attachment_id, entry.clone()) {
+                crate::cache::image_cache::InsertOutcome::Cached => {}
+                crate::cache::image_cache::InsertOutcome::NotCached => {
+                    if !image_view_target && !viewer_target {
+                        let _ = std::fs::remove_file(&entry.temp_file);
+                    } else {
+                        self.transient_files.push(entry.temp_file.clone());
+                        self.view_temp_path = Some(entry.temp_file.clone());
+                    }
+                }
+            }
+        }
+        if !image_view_target && !viewer_target {
+            self.image_cache.abort(&attachment_id);
+            self.image_cache.unpin(&attachment_id);
+            return vec![];
+        }
+        self.image_errors.remove(&attachment_id);
+        if cached {
+            // The cache entry already owns the file; do not re-account it.
+            self.view_temp_path = None;
+        }
+        if for_viewer || !self.kitty_capable {
+            // 非 Kitty：直达系统查看器（AC-004-07），模式保持 NORMAL。
+            self.pending_viewer = None;
+            return vec![Cmd::OpenSystemViewer {
+                path: entry.temp_file,
+            }];
+        }
+        // 防串图（AC-004-09）：视图已关/已换块 → 丢弃帧与状态。
+        if self.mode != Mode::ImageView || self.image_view.block_seq != Some(block_seq) {
+            return vec![];
+        }
+        match frame {
+            Some(f) => {
+                self.image_frame = Some(f);
+                self.image_view.mark_rendered();
+            }
+            None => {
+                self.image_view
+                    .mark_failed("encode/failed".into(), "kitty 帧缺失".into());
+            }
+        }
+        vec![]
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn on_attachment_failed(
+        &mut self,
+        _session_id: SessionId,
+        attachment_id: AttachmentId,
+        block_seq: SessionSeq,
+        code: String,
+        message: String,
+        retryable: bool,
+        for_viewer: bool,
+    ) -> Vec<Cmd> {
+        let current_target = self.active_image_view_target(&_session_id, block_seq, &attachment_id)
+            || self.viewer_target_matches(&_session_id, block_seq, &attachment_id);
+        self.image_loading.remove(&attachment_id);
+        self.image_cache.abort(&attachment_id);
+        self.image_cache.unpin(&attachment_id);
+        if !current_target {
+            // Stale failures must not reconnect the active session.
+            return vec![];
+        }
+        // 错误占位 + 可读提示（AC-004-06）。
+        let hint = format!("{code}: {message}");
+        self.image_errors
+            .insert(attachment_id.clone(), hint.clone());
+        if !for_viewer
+            && self.mode == Mode::ImageView
+            && self.image_view.block_seq == Some(block_seq)
+        {
+            self.image_view.mark_failed(code.clone(), message.clone());
+        }
+        if retryable {
+            // 断网走既有指数退避重连（AC-004-06；恢复后可重开）。
+            return self.handle_disconnected(format!("attachment 拉取网络错误: {code} {message}"));
+        }
+        // 权限/格式类不自动重试（AC-004-06）。
+        vec![]
+    }
+
+    /// 进程退出清理：删除未入缓存的临时文件（06 §9；缓存目录由
+    /// ImageCache Drop 清理）。
+    pub fn cleanup_transient_files(&mut self) {
+        if let Some(id) = self.image_view.attachment_id.clone() {
+            self.image_cache.unpin(&id);
+        }
+        for path in self.transient_files.drain(..) {
+            if let Err(e) = std::fs::remove_file(&path) {
+                tracing::debug!(path = %path.display(), error = %e, "临时文件清理失败（忽略）");
+            }
+        }
+    }
+
+    /// 注入 config 的 `cache_bytes` 预算（main 启动时调用一次）。
+    pub fn set_cache_budget(&mut self, budget: u64) {
+        self.image_cache.set_budget(budget);
+    }
+
+    /// kitty image id 分配（在 u8 空间循环，避免饱和后永久复用 255）。
+    pub fn next_kitty_frame_id(&mut self) -> u8 {
+        self.kitty_frame_id = if self.kitty_frame_id >= u16::from(u8::MAX) {
+            1
+        } else {
+            self.kitty_frame_id + 1
+        };
+        self.kitty_frame_id as u8
+    }
+
     // ---------- input commands (Step 5 keymap maps here) ----------
 
     pub fn handle_command(&mut self, cmd: crate::input::Command) -> Vec<Cmd> {
@@ -1389,6 +1826,8 @@ impl AppState {
                     }
                     vec![]
                 }
+                // IMAGEVIEW：Esc 无语义（`q` 关闭，D-14）。
+                Mode::ImageView => vec![],
             },
             C::PickerDown => {
                 if self.mode == Mode::Search {
@@ -1512,12 +1951,74 @@ impl AppState {
             }
             C::NextTurn => self.jump_turn(1),
             C::PrevTurn => self.jump_turn(-1),
-            C::OpenSelected => match self.focus {
-                Focus::Sidebar => self.open_session_from_selection(),
-                // Center 焦点：`o`/`Enter` 打开光标处链接；非链接 no-op 提示
-                // （D-19，AC-003-04/20）。
-                _ => self.open_external_at_cursor(),
-            },
+            C::OpenSelected => {
+                // Center 焦点两级语义：图片占位 → REQ-004 打开图片；
+                // 否则 `o` 打开光标处链接（D-19，AC-003-04/20）。
+                if self.focus == Focus::Center && self.focused_image_block().is_some() {
+                    self.open_focused_image()
+                } else {
+                    match self.focus {
+                        Focus::Sidebar => self.open_session_from_selection(),
+                        _ => self.open_external_at_cursor(),
+                    }
+                }
+            }
+            C::OpenFocused => {
+                // NORMAL Enter：仅中心区图片焦点打开图片（D-14）。
+                if self.focus == Focus::Center && self.focused_image_block().is_some() {
+                    self.open_focused_image()
+                } else {
+                    vec![]
+                }
+            }
+            C::ImageViewClose => {
+                // AC-004-05 `q`：关闭 ImageView 回 transcript（NORMAL）。
+                if self.mode == Mode::ImageView {
+                    if let Some(id) = self.image_view.attachment_id.clone() {
+                        self.image_cache.unpin(&id);
+                    }
+                    self.mode = Mode::Normal;
+                    self.image_view.close();
+                    self.image_frame = None;
+                    // 未入缓存且不再展示：立即回收临时文件。
+                    if let Some(path) = self.view_temp_path.take() {
+                        if let Some(pos) = self.transient_files.iter().position(|p| *p == path) {
+                            self.transient_files.swap_remove(pos);
+                        }
+                        let _ = std::fs::remove_file(&path);
+                    }
+                }
+                vec![]
+            }
+            C::ImageViewCopy => {
+                // AC-004-05 `y`：复制图片路径/附件名（arboard 在 main 执行，
+                // 不可用降级提示不崩溃）。
+                if self.mode != Mode::ImageView {
+                    return vec![];
+                }
+                let text = self
+                    .view_image_path()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .or_else(|| self.image_view.name.clone())
+                    .or_else(|| self.image_view.attachment_id.as_ref().map(|a| a.0.clone()));
+                match text {
+                    Some(t) => vec![Cmd::CopyImageText { text: t }],
+                    None => vec![],
+                }
+            }
+            C::ImageViewOpenExternal => {
+                // AC-004-05 `o`：系统查看器打开原图（不阻塞，main 执行）。
+                if self.mode != Mode::ImageView {
+                    return vec![];
+                }
+                match self.view_image_path() {
+                    Some(path) => vec![Cmd::OpenSystemViewer { path }],
+                    None => {
+                        self.last_error = Some("图片尚未就绪，暂不能打开系统查看器".into());
+                        vec![]
+                    }
+                }
+            }
             C::StopRunning => self.request_stop(),
             C::CollapseProject => {
                 for workspace in &self.workspaces.workspaces {
@@ -1940,6 +2441,7 @@ impl AppState {
         }
         // 焦点块游标随视口移动（上下文 yank/视觉选择/跳轮的锚）。
         self.cursor_block = self.viewport.offset.min(len.saturating_sub(1));
+        self.refresh_focus();
         cmds
     }
 
@@ -1967,6 +2469,12 @@ impl AppState {
         if let Some(d) = self.draft.take() {
             self.drafts.set(d);
         }
+        if let Some(old_id) = self.image_view.attachment_id.clone() {
+            self.image_cache.unpin(&old_id);
+        }
+        self.image_view.close();
+        self.image_frame = None;
+        self.view_temp_path = None;
         self.active_session = Some(sid.clone());
         self.viewport.follow_tail = true;
         self.cursor_block = 0;
@@ -2071,6 +2579,19 @@ mod tests {
             .iter()
             .any(|c| matches!(c, Cmd::LoadSessionList { .. })));
         assert!(cmds.iter().any(|c| matches!(c, Cmd::OpenWorkspaceFollow)));
+    }
+
+    #[test]
+    fn kitty_frame_id_wraps_from_255_to_1() {
+        // AC-004-09：kitty image id 在 u8 空间循环（255 → 1），避免饱和后
+        // 永久复用同一 id。
+        let mut s = AppState {
+            kitty_frame_id: 254,
+            ..AppState::default()
+        };
+        assert_eq!(s.next_kitty_frame_id(), 255);
+        assert_eq!(s.next_kitty_frame_id(), 1);
+        assert_eq!(s.next_kitty_frame_id(), 2);
     }
 
     #[test]

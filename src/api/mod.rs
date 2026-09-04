@@ -6,6 +6,7 @@
 //! primitive).
 
 pub mod approval;
+pub mod attachment;
 pub mod auth;
 pub mod envelope;
 pub mod mux;
@@ -38,6 +39,7 @@ impl DshClient {
         let http = reqwest::Client::builder()
             .cookie_store(true)
             .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(30))
             .build()
             .map_err(|e| ClientError::Http(format!("HTTP 客户端构建失败: {e}")))?;
         let auth = auth::authenticate(&http, base, token).await?;

@@ -19,6 +19,8 @@ pub enum InputMode {
     Visual,
     /// 审批弹窗（REQ-003，y/n/q/Esc 决策）。
     Approval,
+    /// REQ-004 V0.2：IMAGEVIEW 模式（仅 Kitty 渲染态出现，D-14）。
+    ImageView,
 }
 
 /// Domain commands emitted by the input layer.
@@ -40,6 +42,8 @@ pub enum Command {
     PickerBackspace,
     SubmitInput,
     OpenSelected,
+    /// NORMAL 模式 Enter：打开焦点块（图片占位 → 打开 ImageView / 系统查看器）。
+    OpenFocused,
     OpenHelp,
     CloseHelp,
     Quit,
@@ -81,6 +85,13 @@ pub enum Command {
     /// INSERT `↑`/`↓` 输入历史（REQ-F06）。
     HistoryPrev,
     HistoryNext,
+    // ---------- REQ-004 IMAGEVIEW 级键位（D-14） ----------
+    /// `y`：复制图片路径/附件名。
+    ImageViewCopy,
+    /// `o`：系统查看器打开原图。
+    ImageViewOpenExternal,
+    /// `q`：关闭 ImageView 回 transcript（NORMAL）。
+    ImageViewClose,
 }
 
 /// Stateful decoder for multi-key Normal-mode commands such as `gg`.
@@ -116,6 +127,7 @@ impl KeyDecoder {
             InputMode::Search => self.search(key),
             InputMode::Visual => self.visual(key),
             InputMode::Approval => self.approval(key),
+            InputMode::ImageView => self.image_view(key),
         }
     }
 
@@ -160,6 +172,10 @@ impl KeyDecoder {
                     ('[', false) => Some(Command::PrevTurn),
                     _ => None,
                 }
+            }
+            KeyCode::Enter if !ctrl => {
+                self.pending_g = false;
+                Some(Command::OpenFocused)
             }
             KeyCode::Esc => {
                 self.pending_g = false;
@@ -281,6 +297,18 @@ impl KeyDecoder {
         match key.code {
             KeyCode::Esc | KeyCode::Char('?') => Some(Command::CloseHelp),
             KeyCode::Char('q') => Some(Command::Quit),
+            _ => None,
+        }
+    }
+
+    /// REQ-004 IMAGEVIEW 级键位（D-14；Notes/05 §10 状态栏）：
+    /// `o` 系统查看器 / `y` 复制路径 / `q` 关闭。
+    fn image_view(&mut self, key: KeyEvent) -> Option<Command> {
+        self.pending_g = false;
+        match key.code {
+            KeyCode::Char('o') if key.modifiers.is_empty() => Some(Command::ImageViewOpenExternal),
+            KeyCode::Char('y') if key.modifiers.is_empty() => Some(Command::ImageViewCopy),
+            KeyCode::Char('q') if key.modifiers.is_empty() => Some(Command::ImageViewClose),
             _ => None,
         }
     }
@@ -463,6 +491,52 @@ mod tests {
             d.decode(InputMode::Insert, ctrl_c),
             Some(Command::Quit),
             "INSERT 中 Ctrl+c → Quit"
+        );
+    }
+}
+
+#[cfg(test)]
+mod image_view_tests {
+    use super::*;
+
+    fn key(code: KeyCode) -> Event {
+        Event::Key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    #[test]
+    fn image_view_keys_map_to_viewer_copy_close() {
+        let mut d = KeyDecoder::new();
+        assert_eq!(
+            d.decode(InputMode::ImageView, key(KeyCode::Char('o'))),
+            Some(Command::ImageViewOpenExternal)
+        );
+        assert_eq!(
+            d.decode(InputMode::ImageView, key(KeyCode::Char('y'))),
+            Some(Command::ImageViewCopy)
+        );
+        assert_eq!(
+            d.decode(InputMode::ImageView, key(KeyCode::Char('q'))),
+            Some(Command::ImageViewClose)
+        );
+        // 其余键不产生命令（不误触）。
+        assert_eq!(
+            d.decode(InputMode::ImageView, key(KeyCode::Char('j'))),
+            None
+        );
+        assert_eq!(d.decode(InputMode::ImageView, key(KeyCode::Enter)), None);
+    }
+
+    #[test]
+    fn normal_enter_emits_open_focused() {
+        let mut d = KeyDecoder::new();
+        assert_eq!(
+            d.decode(InputMode::Normal, key(KeyCode::Enter)),
+            Some(Command::OpenFocused)
+        );
+        // o 保持原有 OpenSelected 语义。
+        assert_eq!(
+            d.decode(InputMode::Normal, key(KeyCode::Char('o'))),
+            Some(Command::OpenSelected)
         );
     }
 }
