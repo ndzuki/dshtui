@@ -45,7 +45,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         let mut spans = vec![
             Span::styled(
                 format!("{} ", item.kind.label()),
-                Style::default().fg(kind_color(item.kind.label())),
+                Style::default().fg(kind_color(&item.kind)),
             ),
             Span::raw(item.display.clone()),
         ];
@@ -81,11 +81,17 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         }
     }
 
-    // 底部：匹配计数 / 空查询提示 / 错误。
+    // 底部：匹配计数 / 空查询提示 / 错误 / hasMore 提示。
     if let Some(error) = &app.search.history_error {
         lines.push(Line::from(Span::styled(
             format!("  {error}"),
             Style::default().fg(Color::Red),
+        )));
+    }
+    if let Some(hint) = &app.search.history_hint {
+        lines.push(Line::from(Span::styled(
+            format!("  {hint}"),
+            Style::default().fg(Color::Yellow),
         )));
     }
     let footer = match app.search.window_matches.len() {
@@ -107,13 +113,13 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
     );
 }
 
-fn kind_color(kind: &str) -> Color {
+fn kind_color(kind: &crate::model::SearchKind) -> Color {
     match kind {
-        "code" => Color::Green,
-        "link" => Color::Cyan,
-        "image" => Color::Magenta,
-        "tool" => Color::Yellow,
-        _ => Color::Gray,
+        crate::model::SearchKind::Code { .. } => Color::Green,
+        crate::model::SearchKind::Link { .. } => Color::Cyan,
+        crate::model::SearchKind::Image { .. } => Color::Magenta,
+        crate::model::SearchKind::ToolCall { .. } => Color::Yellow,
+        crate::model::SearchKind::Text => Color::Gray,
     }
 }
 

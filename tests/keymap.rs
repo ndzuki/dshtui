@@ -267,9 +267,10 @@ fn approval_mode_keys_decode_ac003_07() {
         decoder.decode(InputMode::Approval, key(KeyCode::Char('a'))),
         Some(Command::ApprovalAlways)
     );
+    // Enter 在 APPROVAL 无语义（§3 键位边界，scope creep 移除）。
     assert_eq!(
         decoder.decode(InputMode::Approval, key(KeyCode::Enter)),
-        Some(Command::PickerConfirm)
+        None
     );
 }
 

@@ -6,9 +6,8 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block as TuiBlock, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 
-use crate::api::types::ChunkRow;
 use crate::app::{AppState, Mode};
-use crate::model::{Block, PackedChunks, PendingEcho, PendingEchoStatus, TranscriptWindow};
+use crate::model::{Block, PendingEcho, PendingEchoStatus, TranscriptWindow};
 
 use super::format_hhmm;
 use super::markdown;
@@ -27,7 +26,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         frame.render_widget(body, area);
         return;
     };
-    let mut lines = window_lines(window);
+    let mut lines = window_lines_with_width(window, area.width as usize);
     apply_highlights(&mut lines, app);
     draw_lines(
         frame,
@@ -47,7 +46,7 @@ pub fn render_window(
     offset: usize,
     follow_tail: bool,
 ) {
-    let lines = window_lines(window);
+    let lines = window_lines_with_width(window, area.width as usize);
     draw_lines(frame, area, lines, offset, follow_tail);
 }
 
@@ -71,12 +70,19 @@ fn draw_lines(
     frame.render_widget(paragraph, area);
 }
 
-/// 窗口全部行：durable 块（markdown 块可多行）+ 乐观回显行。
+/// 窗口全部行：durable 块（markdown 块可多行）+ 乐观回显行。默认宽度 80
+/// （无上下文渲染）；`render`/`render_window` 用真实宽度走
+/// `window_lines_with_width`。
 pub fn window_lines(window: &TranscriptWindow) -> Vec<ChatLine> {
+    window_lines_with_width(window, 80)
+}
+
+/// 窗口全部行（指定宽度：markdown 换行与渲染缓存 key 都依赖它）。
+pub fn window_lines_with_width(window: &TranscriptWindow, width: usize) -> Vec<ChatLine> {
     let len = window.len();
     let mut out = Vec::new();
     for (i, block) in window.blocks().enumerate() {
-        for line in block_lines(block, i + 1 == len) {
+        for line in block_lines(block, i + 1 == len, width) {
             out.push(ChatLine {
                 block_index: Some(i),
                 line,
@@ -167,7 +173,7 @@ fn echo_line(echo: &PendingEcho) -> Line<'static> {
 /// FR-001-04 §4：携带 time 的 Block 渲染 HH:MM 前缀（UTC，纯展示）；
 /// 状态标记：running（空 chunks 的 assistant）●、pending（末尾 user 等待回复）…、
 /// error（tool result isError）!。助手块经 markdown 渲染（REQ-003），可多行。
-fn block_lines(block: &Block, is_last: bool) -> Vec<Line<'static>> {
+fn block_lines(block: &Block, is_last: bool, width: usize) -> Vec<Line<'static>> {
     let mut spans: Vec<Span<'static>> = Vec::new();
     match block {
         Block::UserMessage { seq, content, time } => {
@@ -213,26 +219,27 @@ fn block_lines(block: &Block, is_last: bool) -> Vec<Line<'static>> {
                 return vec![Line::from(spans)];
             }
             // REQ-003：助手内容 markdown 渲染（标题/列表/表格/代码高亮）。
-            // 流式中未闭合代码块先纯文本（AC-003-02）。
-            let text = chunks_joined_text(chunks);
+            // 流式中未闭合代码块先纯文本（AC-003-02）；渲染结果走
+            // markdown::markdown_lines 缓存（懒执行，Notes/06 §5）。
+            let text = crate::model::search::chunks_text(chunks);
             if markdown::has_unclosed_fence(&text) {
                 spans.push(Span::raw(single_line(&text)));
                 return vec![Line::from(spans)];
             }
-            let width = 60usize;
-            let mut lines = markdown::markdown_lines(&text, width);
+            let lines = markdown::markdown_lines(&text, width);
             if lines.is_empty() {
                 spans.push(Span::raw("(packed chunks)"));
                 return vec![Line::from(spans)];
             }
             // 首行接在 A/seq 前缀后；后续行等宽缩进保持对齐。
-            let first = lines.remove(0);
-            spans.extend(first.spans);
+            let mut iter = lines.iter();
+            let first = iter.next().expect("lines 非空");
+            spans.extend(first.spans.clone());
             let mut out = vec![Line::from(spans)];
             let indent = Span::raw("        "); // 8 空格，与 "A 12345 " 对齐
-            for line in lines {
+            for line in iter {
                 let mut line_spans = vec![indent.clone()];
-                line_spans.extend(line.spans);
+                line_spans.extend(line.spans.clone());
                 out.push(Line::from(line_spans));
             }
             out
@@ -348,33 +355,6 @@ fn push_time(spans: &mut Vec<Span<'static>>, time: Option<i64>) {
             Style::default().fg(Color::DarkGray),
         ));
     }
-}
-
-/// 拼接 packed chunk rows 为完整文本（REQ-003 markdown 渲染源；保留换行，
-/// 不像 V0.1 那样压成单行）。
-fn chunks_joined_text(chunks: &PackedChunks) -> String {
-    let mut parts = Vec::with_capacity(chunks.rows.len());
-    for row in &chunks.rows {
-        let part = match row {
-            ChunkRow::TextChunks(data) => data.texts.join(""),
-            ChunkRow::ReasoningChunks(data) => {
-                let text = data.texts.join("");
-                if text.is_empty() {
-                    "reasoning".to_string()
-                } else {
-                    format!("reasoning: {text}")
-                }
-            }
-            ChunkRow::ToolCallChunks(data) => {
-                format!("tool: {}", data.name.as_deref().unwrap_or("call"))
-            }
-            ChunkRow::Unknown { event_type, .. } => format!("unknown chunk: {event_type}"),
-        };
-        if !part.is_empty() {
-            parts.push(part);
-        }
-    }
-    parts.join("\n")
 }
 
 fn single_line(text: &str) -> String {

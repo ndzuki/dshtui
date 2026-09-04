@@ -45,7 +45,6 @@ pub enum SearchKindFilter {
     Link,
     Image,
     ToolCall,
-    Text,
 }
 
 impl SearchKindFilter {
@@ -70,7 +69,6 @@ impl SearchKindFilter {
             SearchKindFilter::Link => matches!(kind, SearchKind::Link { .. }),
             SearchKindFilter::Image => matches!(kind, SearchKind::Image { .. }),
             SearchKindFilter::ToolCall => matches!(kind, SearchKind::ToolCall { .. }),
-            SearchKindFilter::Text => matches!(kind, SearchKind::Text),
         }
     }
 }
@@ -161,7 +159,7 @@ fn push_block_items(out: &mut Vec<SearchItem>, block: &Block) {
             push_text_item(out, seq, content);
         }
         Block::AssistantMessage { chunks, .. } => {
-            let text = chunks_text_public(chunks);
+            let text = chunks_text(chunks);
             push_markdown_items(out, seq, &text);
         }
         Block::ToolCall { name, args_raw, .. } => {
@@ -235,29 +233,33 @@ fn push_markdown_items(out: &mut Vec<SearchItem>, seq: SessionSeq, text: &str) {
 
 /// Concatenated text of the packed chunk rows (same seam the UI renders; also
 /// the copy source for visual selection, model/yank.rs).
-pub fn chunks_text_public(chunks: &PackedChunks) -> String {
-    let mut out = String::new();
+/// Concatenated text of the packed chunk rows（行间以 \n 连接，保留换行
+/// 语义；搜索索引、上下文复制与 markdown 渲染共用同一点——ui/chat.rs 不再
+/// 单独拼接，避免两处语义分化）。
+pub fn chunks_text(chunks: &PackedChunks) -> String {
+    let mut parts: Vec<String> = Vec::with_capacity(chunks.rows.len());
     for row in &chunks.rows {
-        match row {
+        let part = match row {
             crate::api::types::ChunkRow::TextChunks(d)
-            | crate::api::types::ChunkRow::ReasoningChunks(d) => {
-                for t in &d.texts {
-                    out.push_str(t);
-                }
-            }
+            | crate::api::types::ChunkRow::ReasoningChunks(d) => d.texts.join(""),
             crate::api::types::ChunkRow::ToolCallChunks(t) => {
+                let mut s = String::new();
                 if let Some(n) = &t.name {
-                    out.push_str(n);
+                    s.push_str(n);
                 }
                 if let Some(a) = &t.args {
-                    out.push(' ');
-                    out.push_str(&a.to_string());
+                    s.push(' ');
+                    s.push_str(&a.to_string());
                 }
+                s
             }
-            crate::api::types::ChunkRow::Unknown { .. } => {}
+            crate::api::types::ChunkRow::Unknown { .. } => continue,
+        };
+        if !part.is_empty() {
+            parts.push(part);
         }
     }
-    out
+    parts.join("\n")
 }
 
 /// Extract fenced code blocks `(lang, code)` in document order (pulldown-cmark).

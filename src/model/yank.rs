@@ -30,23 +30,14 @@ impl VisualSelection {
     }
 }
 
-/// Clipboard backend in use (AC-003-08 fallback chain).
+/// Clipboard backend in use (AC-003-08 fallback chain; §5 字段表四值）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum YankBackend {
     #[default]
     Unavailable,
     System,
     Osc52,
-}
-
-impl YankBackend {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            YankBackend::Unavailable => "unavailable",
-            YankBackend::System => "system",
-            YankBackend::Osc52 => "osc52",
-        }
-    }
+    Tmux,
 }
 
 /// Yank state (memory only; `last` never written to disk or logs).
@@ -86,16 +77,16 @@ impl YankTarget {
 /// result text, image → name, otherwise the paragraph text.
 pub fn block_yank_target(block: &Block) -> Option<YankTarget> {
     match block {
-        Block::ToolCall { args_raw, .. } => {
-            args_raw.as_ref().map(|v| YankTarget::Code(v.to_string()))
-        }
+        // ToolCall 不在 AC-003-12 上下文 yank 清单（仅 代码块/链接/图片/
+        // 工具结果/段落）→ None（视觉选择仍可按可见文本复制）。
+        Block::ToolCall { .. } => None,
         Block::ToolResult { content, .. } => Some(YankTarget::ToolResult(content.clone())),
         Block::Image { name, .. } => name
             .clone()
             .map(YankTarget::Image)
             .or_else(|| Some(YankTarget::Image("image".into()))),
         Block::AssistantMessage { chunks, .. } => {
-            let text = crate::model::search::chunks_text_public(chunks);
+            let text = crate::model::search::chunks_text(chunks);
             // 代码块优先（AC-003-03：`y` 复制整块代码，Notes/04 §4.4）。
             if let Some((_, code)) = crate::model::search::extract_code_blocks(&text)
                 .into_iter()
@@ -130,7 +121,7 @@ pub fn block_yank_target(block: &Block) -> Option<YankTarget> {
 pub fn block_plain_text(block: &Block) -> String {
     match block {
         Block::UserMessage { content, .. } => content.clone(),
-        Block::AssistantMessage { chunks, .. } => crate::model::search::chunks_text_public(chunks),
+        Block::AssistantMessage { chunks, .. } => crate::model::search::chunks_text(chunks),
         Block::ToolCall { name, args_raw, .. } => match (name, args_raw) {
             (Some(n), Some(a)) => format!("{n} {a}"),
             (Some(n), None) => n.clone(),
@@ -206,7 +197,9 @@ mod tests {
     }
 
     #[test]
-    fn tool_call_yanks_args_as_code() {
+    fn tool_call_is_not_a_context_yank_target() {
+        // AC-003-12 清单不含工具调用（上下文 yank → None；视觉选择仍可
+        // 按可见文本复制）。
         let b = Block::ToolCall {
             seq: SessionSeq(3),
             call_id: Some("c1".into()),
@@ -214,10 +207,7 @@ mod tests {
             args_raw: Some(serde_json::json!({"command": "ls"})),
             time: None,
         };
-        assert_eq!(
-            block_yank_target(&b),
-            Some(YankTarget::Code(r#"{"command":"ls"}"#.into()))
-        );
+        assert_eq!(block_yank_target(&b), None);
     }
 
     #[test]

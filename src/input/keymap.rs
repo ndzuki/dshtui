@@ -263,7 +263,7 @@ impl KeyDecoder {
     }
 
     /// APPROVAL 键位（REQ-003 §3.5）：y 允许 / n 拒绝 / q·Esc 中止（cancelled）；
-    /// a 显示始终允许指引（非 outcome）；Enter 等同 y。
+    /// a 显示始终允许指引（非 outcome）；Enter 无语义（§3 键位边界）。
     fn approval(&mut self, key: KeyEvent) -> Option<Command> {
         self.pending_g = false;
         match key.code {
@@ -272,7 +272,6 @@ impl KeyDecoder {
             KeyCode::Char('n') if key.modifiers.is_empty() => Some(Command::ApprovalReject),
             KeyCode::Char('q') if key.modifiers.is_empty() => Some(Command::ApprovalCancel),
             KeyCode::Char('a') if key.modifiers.is_empty() => Some(Command::ApprovalAlways),
-            KeyCode::Enter if key.modifiers.is_empty() => Some(Command::PickerConfirm),
             _ => None,
         }
     }

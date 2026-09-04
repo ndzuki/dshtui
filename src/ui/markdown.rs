@@ -4,11 +4,16 @@
 //! - 闭合代码块经 `RenderHooks::render_code_block` 交 `syntect` 语法高亮
 //!   （懒执行：SyntaxSet/Theme 进程级 OnceLock 缓存）；
 //! - 流式中未闭合代码块不进 markdown 路径（先纯文本，AC-003-02），判定用
-//!   `has_unclosed_fence`。
+//!   `has_unclosed_fence`（pulldown-cmark 事件流，不用行计数——代码块内以
+//!   ``` 开头的示例行不会被误判）；
+//! - `markdown_lines` 结果按（内容哈希, 宽度）进程级 LRU 缓存（Notes/06 §5
+//!   懒执行 + 缓存当前窗口；流式尾块每次内容变化哈希不同，自动失效）。
 //!
 //! 纯函数层：不依赖 AppState/transport，TestBackend golden 与单测直接断言。
 
-use std::sync::OnceLock;
+use std::collections::HashMap;
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -18,22 +23,59 @@ use ratatui_markdown::theme::ThemeConfig;
 /// 进程级缓存：默认语法集（换行版）与高亮主题（懒加载一次）。
 static SYNTAX_SET: OnceLock<syntect::parsing::SyntaxSet> = OnceLock::new();
 static HIGHLIGHT_THEME: OnceLock<syntect::highlighting::Theme> = OnceLock::new();
+/// markdown 渲染缓存行类型。
+type RenderLines = Arc<Vec<Line<'static>>>;
+/// markdown 渲染结果缓存（(内容哈希, 宽度) → 行）；上限 128 条，超出整表
+/// 清空（窗口有界，重建成本可接受，防止流式内容无限膨胀）。
+static RENDER_CACHE: OnceLock<Mutex<HashMap<(u64, usize), RenderLines>>> = OnceLock::new();
+const RENDER_CACHE_CAP: usize = 128;
 
-/// markdown → styled lines（纯函数）。宽 0 时按最小 20 列渲染。
-pub fn markdown_lines(md: &str, width: usize) -> Vec<Line<'static>> {
-    let renderer = MarkdownRenderer::new(width.max(20)).with_render_hooks(Box::new(HighlightHooks));
+/// markdown → styled lines（纯函数 + 缓存）。宽 0 时按最小 20 列渲染。
+pub fn markdown_lines(md: &str, width: usize) -> RenderLines {
+    let width = width.max(20);
+    let mut hasher = DefaultHasher::new();
+    md.hash(&mut hasher);
+    let key = (hasher.finish(), width);
+    let cache = RENDER_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(hit) = cache.lock().expect("cache lock").get(&key) {
+        return Arc::clone(hit);
+    }
+    let renderer = MarkdownRenderer::new(width).with_render_hooks(Box::new(HighlightHooks));
     let blocks = renderer.parse(md);
-    renderer.render(&blocks, &ThemeConfig::default())
+    let lines = Arc::new(renderer.render(&blocks, &ThemeConfig::default()));
+    let mut guard = cache.lock().expect("cache lock");
+    if guard.len() >= RENDER_CACHE_CAP {
+        guard.clear();
+    }
+    guard.insert(key, Arc::clone(&lines));
+    lines
 }
 
-/// 代码块是否未闭合（按行首 ``` 计数，奇数=未闭合）。流式内容未闭合时
-/// 先纯文本渲染（AC-003-02），闭合后再高亮。
+/// 代码块是否未闭合（CommonMark 行级状态机：pulldown-cmark 在 EOF 处隐式
+/// 闭合围栏，与 AC-003-02「流式中未闭合块先纯文本」口径不符，故手工判定）：
+/// - 围栏打开后，代码内容行以 ``` 开头不误判（只认「反引号串后仅空白且
+///   长度 ≥ 打开串」的闭合围栏）；
+/// - 到文本末尾仍打开 → 未闭合（流式先纯文本）。
 pub fn has_unclosed_fence(text: &str) -> bool {
-    let fences = text
-        .lines()
-        .filter(|line| line.trim_start().starts_with("```"))
-        .count();
-    fences % 2 == 1
+    let mut open_len: Option<usize> = None;
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        let Some(rest) = trimmed.strip_prefix("```") else {
+            continue;
+        };
+        let run = 3 + rest.len() - rest.trim_start_matches('`').len();
+        match open_len {
+            Some(opener) => {
+                // 闭合围栏：反引号串后仅空白，且长度 ≥ 打开串。
+                if run >= opener && rest.trim_start_matches('`').trim().is_empty() {
+                    open_len = None;
+                }
+                // 否则为代码内容行（如 ```example），忽略。
+            }
+            None => open_len = Some(run),
+        }
+    }
+    open_len.is_some()
 }
 
 struct HighlightHooks;
@@ -178,5 +220,9 @@ mod tests {
         assert!(!has_unclosed_fence("纯文本没有围栏"));
         // 行内出现的 ``` 不算围栏。
         assert!(!has_unclosed_fence("说明 `code` 的用法\n"));
+        // 代码块内以 ``` 开头的示例行不误判（只认等长闭合围栏）。
+        assert!(!has_unclosed_fence("```\n```example\nlet x = 1;\n```"));
+        // 更长的闭合围栏（≥ 打开串）也可关闭。
+        assert!(!has_unclosed_fence("```rust\nfn main() {}\n````"));
     }
 }

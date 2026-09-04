@@ -120,14 +120,14 @@ pub struct SearchState {
     /// 防抖 generation：stale 结果/触发直接丢弃（模式 15 in-flight 去重）。
     pub history_generation: u64,
     pub history_error: Option<String>,
+    /// hasMore=true 的用户可见提示（细化关键词，无翻页 RPC）。
+    pub history_hint: Option<String>,
+    /// Enter 后进入结果巡览：n/N/y/j/k 为命令；未锁定时它们是输入字符
+    /// （AC-003-05 与「输入实时过滤」的模态内两段式）。
+    pub results_locked: bool,
 }
 
 impl SearchState {
-    /// 当前命中总数（状态条 `N/N matches`）。
-    pub fn total(&self) -> usize {
-        self.window_matches.len()
-    }
-
     /// 前缀过滤 + 有效查询词（`/c x` → (Code, "x")）。
     pub fn terms(&self) -> (SearchKindFilter, String) {
         let (filter, term) = SearchKindFilter::from_prefix(&self.query);
@@ -177,6 +177,48 @@ impl StopState {
 pub struct PageGuard {
     pub generation: u64,
     pub in_flight: bool,
+}
+
+/// `loadThrough(seq)` 分页上限（REQ-003 §6：防无界分页；200 条/页口径）。
+pub const LOAD_THROUGH_MAX_PAGES: usize = 20;
+
+/// 官方 projections 的「待审批」候选键（wire 字段 `[未验证]`，容忍布尔/
+/// 非空数组/状态字符串三种形状，AC-003-18 降级检测）。
+const APPROVAL_PENDING_KEYS: &[&str] = &[
+    "awaitingApproval",
+    "waitingApproval",
+    "pendingApproval",
+    "approvalPending",
+    "needsApproval",
+];
+
+/// 官方投影是否存在待审批信号（仅布尔 true/非空数组/状态字符串；缺失或
+/// false 均视为无待审批，不臆造）。
+pub fn projections_await_approval(projections: &serde_json::Value) -> bool {
+    for key in APPROVAL_PENDING_KEYS {
+        let Some(v) = projections.get(key) else {
+            continue;
+        };
+        match v {
+            serde_json::Value::Bool(b) => {
+                if *b {
+                    return true;
+                }
+            }
+            serde_json::Value::Array(a) => {
+                if !a.is_empty() {
+                    return true;
+                }
+            }
+            serde_json::Value::String(s)
+                if matches!(s.as_str(), "pending" | "awaiting" | "waiting") =>
+            {
+                return true;
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 /// Events entering AppState (from api tasks / the input layer / the frame
@@ -408,6 +450,10 @@ pub struct AppState {
     pub window_cap: usize,
     page_guard: PageGuard,
     want_backfill: bool,
+    /// `loadThrough(seq)` 在途目标：每页合并后 reducer 判断是否已覆盖，
+    /// 未覆盖且仍有更多历史则继续发下一页（AC-003-09 按 seq 落位）。
+    load_through_target: Option<SessionSeq>,
+    load_through_pages: usize,
     running_sessions: HashSet<SessionId>,
     /// Workspaces collapsed via `h` (FR-001-03); `l` expands all.
     pub collapsed_workspaces: HashSet<crate::api::types::WorkspaceId>,
@@ -447,6 +493,8 @@ impl Default for AppState {
             window_cap: 200,
             page_guard: PageGuard::default(),
             want_backfill: false,
+            load_through_target: None,
+            load_through_pages: 0,
             running_sessions: HashSet::new(),
             collapsed_workspaces: HashSet::new(),
             list_cursor: None,
@@ -581,6 +629,14 @@ impl AppState {
                     .and_then(|p| p.get("running"))
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
+                // AC-003-18 检测：官方投影出现待审批信号且无弹窗事件 →
+                // 收缩为状态条 `等待审批`（不转发 approval/request 的
+                // 目标版本路径）。
+                if self.approval.event.is_none() {
+                    if let Some(p) = projections.as_ref() {
+                        self.approval.waiting_hint = projections_await_approval(p);
+                    }
+                }
                 if running {
                     self.running_sessions.insert(session_id.clone());
                 } else {
@@ -814,9 +870,13 @@ impl AppState {
                 }
                 self.search.history_loading = false;
                 self.search.history_error = None;
+                self.search.history_hint = None;
                 self.search.history_hits = items;
                 self.search.history_selection = 0;
                 if has_more {
+                    // 用户可见提示（§4：达上限 20 → 提示细化关键词，无翻页）。
+                    self.search.history_hint =
+                        Some("命中已达上限（20），请细化关键词（hasMore）".to_string());
                     tracing::debug!("session/search hasMore=true（提示细化关键词，无翻页）");
                 }
                 vec![]
@@ -893,6 +953,12 @@ impl AppState {
                         .get("running")
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false);
+                    // AC-003-18 检测：官方投影出现待审批信号且无弹窗事件 →
+                    // 收缩为状态条 `等待审批`（不转发 approval/request 的
+                    // 目标版本路径）。
+                    if self.approval.event.is_none() {
+                        self.approval.waiting_hint = projections_await_approval(&projections);
+                    }
                     if running {
                         self.running_sessions.insert(session_id.clone());
                     } else {
@@ -919,6 +985,34 @@ impl AppState {
                     self.adjust_viewport(&eff);
                     self.window_changed();
                 }
+                // AC-003-09 落位：目标 seq 已覆盖 → 落位并结束；未覆盖且
+                // 仍有更多历史 → 发下一页（每页一次命令，渲染不被阻塞）；
+                // 页数/历史耗尽 → 提示并结束。
+                let Some(target) = self.load_through_target else {
+                    return vec![];
+                };
+                if self.scroll_to_seq(target) {
+                    if let Some(idx) = self.active_window().and_then(|w| w.offset_of(target)) {
+                        self.cursor_block = idx;
+                    }
+                    self.load_through_target = None;
+                    self.load_through_pages = 0;
+                    return vec![];
+                }
+                if has_more == Some(true) {
+                    self.load_through_pages += 1;
+                    if self.load_through_pages >= LOAD_THROUGH_MAX_PAGES {
+                        tracing::warn!(seq = %target, "loadThrough 达到分页上限仍未覆盖目标轮");
+                        self.last_error = Some("目标轮不在可达历史范围内".to_string());
+                        self.load_through_target = None;
+                        self.load_through_pages = 0;
+                        return vec![];
+                    }
+                    return vec![Cmd::LoadThrough { seq: target }];
+                }
+                self.last_error = Some("目标轮不在已加载历史范围内".to_string());
+                self.load_through_target = None;
+                self.load_through_pages = 0;
                 vec![]
             }
             AppEvent::CopyDone { backend, ok } => {
@@ -970,6 +1064,9 @@ impl AppState {
         // Void the in-flight page (generation is kept, guarding against stale
         // resurrection).
         self.page_guard.in_flight = false;
+        // 断线中止 loadThrough（恢复后可由跳轮重新发起，目标不被旧状态污染）。
+        self.load_through_target = None;
+        self.load_through_pages = 0;
         tracing::warn!(%reason, "连接断开 → reconnecting");
         vec![Cmd::Reconnect { delay_ms: 500 }]
     }
@@ -1295,6 +1392,10 @@ impl AppState {
             },
             C::PickerDown => {
                 if self.mode == Mode::Search {
+                    if !self.search.results_locked {
+                        // 编辑段：j 是输入字符。
+                        return self.search_input("j");
+                    }
                     let total = self.search.history_hits.len();
                     if total > 0 {
                         self.search.history_selection =
@@ -1307,6 +1408,10 @@ impl AppState {
             }
             C::PickerUp => {
                 if self.mode == Mode::Search {
+                    if !self.search.results_locked {
+                        // 编辑段：k 是输入字符。
+                        return self.search_input("k");
+                    }
                     self.search.history_selection = self.search.history_selection.saturating_sub(1);
                 } else {
                     self.picker.selection = self.picker.selection.saturating_sub(1);
@@ -1367,8 +1472,22 @@ impl AppState {
                 }
                 vec![]
             }
-            C::SearchNext => self.search_next(1),
-            C::SearchPrev => self.search_next(-1),
+            // SEARCH 两段式：编辑段（未锁定）n/N/y/j/k 是输入字符；Enter 后
+            // 结果巡览段（锁定）才是命令（AC-003-05 与「输入实时过滤」兼容）。
+            C::SearchNext => {
+                if self.mode == Mode::Search && !self.search.results_locked {
+                    self.search_input("n")
+                } else {
+                    self.search_next(1)
+                }
+            }
+            C::SearchPrev => {
+                if self.mode == Mode::Search && !self.search.results_locked {
+                    self.search_input("N")
+                } else {
+                    self.search_next(-1)
+                }
+            }
             C::VisualStart { line } => {
                 if self.mode == Mode::Normal {
                     self.start_visual(line);
@@ -1378,7 +1497,9 @@ impl AppState {
             C::VisualYank => self.visual_yank(),
             C::YankContext => match self.mode {
                 Mode::Visual => self.visual_yank(),
-                // SEARCH 中 `y` 复制当前命中（代码块 → 整块，AC-003-03）。
+                // SEARCH 中 `y` 复制当前命中（代码块 → 整块，AC-003-03）；
+                // 编辑段先作为输入字符。
+                Mode::Search if !self.search.results_locked => self.search_input("y"),
                 Mode::Search => self.search_yank(),
                 _ => self.context_yank(),
             },
@@ -1419,10 +1540,7 @@ impl AppState {
                     }
                 }
                 Mode::Search => self.search_confirm(),
-                Mode::Approval => {
-                    // Enter 在审批弹窗等同 `y`（允许本次）。
-                    self.approval_decide(ApprovalOutcome::AllowedOnce)
-                }
+                // APPROVAL 仅 y/n/q/Esc/a（§3 键位边界；Enter 无语义，no-op）。
                 Mode::Normal if self.outline.open => self.outline_confirm(),
                 _ => vec![],
             },
@@ -1485,6 +1603,8 @@ impl AppState {
         self.search.history_hits.clear();
         self.search.history_selection = 0;
         self.search.history_error = None;
+        self.search.history_hint = None;
+        self.search.results_locked = false;
         // 打开即作废在途搜索（generation 递增 → 旧触发/结果全部丢弃）。
         self.search.history_generation = self.search.history_generation.wrapping_add(1);
     }
@@ -1494,16 +1614,20 @@ impl AppState {
         self.search.open = false;
         self.search.history_generation = self.search.history_generation.wrapping_add(1);
         self.search.history_loading = false;
+        self.search.results_locked = false;
     }
 
     fn search_input(&mut self, text: &str) -> Vec<Cmd> {
         self.search.query.push_str(text);
+        // 输入变更 → 回到编辑段（n/N/y/j/k 恢复为字符输入）。
+        self.search.results_locked = false;
         self.recompute_window_matches();
         self.schedule_history_search()
     }
 
     fn search_input_backspace(&mut self) -> Vec<Cmd> {
         self.search.query.pop();
+        self.search.results_locked = false;
         self.recompute_window_matches();
         self.schedule_history_search()
     }
@@ -1555,8 +1679,10 @@ impl AppState {
 
     /// Enter 语义（D-17/AC-003-03）：历史命中选中项优先 → 打开命中会话，
     /// 并以 snippet 作为窗口内二次定位词（快照到达后 window_changed 自动
-    /// 重算命中并高亮）；否则跳到窗口首个匹配。
+    /// 重算命中并高亮）；否则跳到窗口首个匹配。Enter 同时锁定结果巡览段
+    /// （n/N/y/j/k 恢复为命令，AC-003-05）。
     fn search_confirm(&mut self) -> Vec<Cmd> {
+        self.search.results_locked = true;
         if let Some(hit) = self.search.history_hits.get(self.search.history_selection) {
             let sid = hit.session_id.clone();
             // snippet 截取为可检索词：去掉截断省略号与首尾空白（服务端
@@ -1734,7 +1860,8 @@ impl AppState {
         }
     }
 
-    /// 跳转目标 seq：窗口已含 → 直接落位；否则 loadThrough 分页拉取。
+    /// 跳转目标 seq：窗口已含 → 直接落位；否则 loadThrough 逐页拉取，
+    /// 目标记录在 `load_through_target`（每页合并后 reducer 判断落位）。
     fn jump_to_seq(&mut self, seq: SessionSeq) -> Vec<Cmd> {
         if self.scroll_to_seq(seq) {
             if let Some(idx) = self.active_window().and_then(|w| w.offset_of(seq)) {
@@ -1742,6 +1869,8 @@ impl AppState {
             }
             vec![]
         } else {
+            self.load_through_target = Some(seq);
+            self.load_through_pages = 0;
             vec![Cmd::LoadThrough { seq }]
         }
     }
@@ -3126,6 +3255,150 @@ mod tests {
         });
         let after = s.active_window().unwrap().len();
         assert_eq!(after, before + 40, "seq 去重合并无重复: {before}→{after}");
+        // 落位：目标 seq 5 已在窗口内 → 游标落位、loadThrough 结束。
+        assert_eq!(
+            s.cursor_block,
+            s.active_window()
+                .and_then(|w| w.offset_of(SessionSeq(5)))
+                .unwrap(),
+            "loadThrough 完成后按 seq 落位（AC-003-09）"
+        );
+        assert!(s.load_through_target.is_none());
+    }
+
+    #[test]
+    fn load_through_requeues_until_target_covered_ac003_09() {
+        let mut s = AppState::default();
+        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle(AppEvent::FollowSnapshot {
+            session_id: SessionId("s1".into()),
+            cursor: Some(SessionLogOffset(100)),
+            records: (81..=100)
+                .map(|n| SessionHistoryRecord::Event {
+                    event: SessionWireEvent {
+                        event_type: "user/message".into(),
+                        seq: Some(SessionSeq(n)),
+                        time: None,
+                        request_id: None,
+                        ignorable: None,
+                        source_event_seqs: None,
+                        surface_op: None,
+                        data: Some(serde_json::json!({"content": format!("轮{n}")})),
+                    },
+                })
+                .collect(),
+            has_more: true,
+            projections: Some(serde_json::json!({
+                "turnOutline": [{"turn": 1, "seq": 10, "prompt": "很早就轮"}]
+            })),
+        });
+        let cmds = s.handle_command(C::NextTurn);
+        assert_eq!(
+            cmds,
+            vec![Cmd::LoadThrough {
+                seq: SessionSeq(10)
+            }]
+        );
+        // 第一页（seq 41..=80）未覆盖目标 10 且有更多历史 → reducer 续页。
+        let cmds = s.handle(AppEvent::LoadThroughPage {
+            session_id: SessionId("s1".into()),
+            records: (41..=80)
+                .map(|n| SessionHistoryRecord::Event {
+                    event: SessionWireEvent {
+                        event_type: "user/message".into(),
+                        seq: Some(SessionSeq(n)),
+                        time: None,
+                        request_id: None,
+                        ignorable: None,
+                        source_event_seqs: None,
+                        surface_op: None,
+                        data: Some(serde_json::json!({"content": format!("轮{n}")})),
+                    },
+                })
+                .collect(),
+            has_more: Some(true),
+        });
+        assert_eq!(
+            cmds,
+            vec![Cmd::LoadThrough {
+                seq: SessionSeq(10)
+            }],
+            "未覆盖且有更多历史 → 续页（逐页命令，不阻塞渲染）"
+        );
+        assert_eq!(s.load_through_pages, 1);
+        // 第二页覆盖目标 → 落位并结束。
+        let cmds = s.handle(AppEvent::LoadThroughPage {
+            session_id: SessionId("s1".into()),
+            records: (1..=40)
+                .map(|n| SessionHistoryRecord::Event {
+                    event: SessionWireEvent {
+                        event_type: "user/message".into(),
+                        seq: Some(SessionSeq(n)),
+                        time: None,
+                        request_id: None,
+                        ignorable: None,
+                        source_event_seqs: None,
+                        surface_op: None,
+                        data: Some(serde_json::json!({"content": format!("轮{n}")})),
+                    },
+                })
+                .collect(),
+            has_more: Some(false),
+        });
+        assert!(cmds.is_empty(), "覆盖后结束: {cmds:?}");
+        assert_eq!(
+            s.cursor_block,
+            s.active_window()
+                .and_then(|w| w.offset_of(SessionSeq(10)))
+                .unwrap()
+        );
+        assert!(s.load_through_target.is_none());
+    }
+
+    #[test]
+    fn approval_pending_projection_shows_waiting_hint_ac003_18() {
+        // 目标版本不转发 approval/request：官方投影出现待审批信号 → 状态条
+        // 等待审批（弹窗不出现、不阻塞）。
+        let mut s = AppState::default();
+        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle(AppEvent::FollowSnapshot {
+            session_id: SessionId("s1".into()),
+            cursor: Some(SessionLogOffset(0)),
+            records: vec![],
+            has_more: false,
+            projections: Some(serde_json::json!({"running": true, "awaitingApproval": true})),
+        });
+        assert!(s.approval.waiting_hint, "投影待审批信号 → 状态条等待审批");
+        assert!(!s.approval.visible);
+        // 投影清除 → hint 消失；弹窗事件路径不受影响。
+        s.handle(AppEvent::FollowSnapshot {
+            session_id: SessionId("s1".into()),
+            cursor: Some(SessionLogOffset(0)),
+            records: vec![],
+            has_more: false,
+            projections: Some(serde_json::json!({"running": false, "awaitingApproval": false})),
+        });
+        assert!(!s.approval.waiting_hint);
+        // 弹窗事件到达 → 正常审批模态（hint 关闭）。
+        s.handle(AppEvent::ApprovalRequest {
+            event: ApprovalEvent {
+                client_id: "c".into(),
+                event_id: "e".into(),
+                raw: serde_json::json!({"type": "approval/request"}),
+            },
+        });
+        assert!(s.approval.visible);
+        assert!(!s.approval.waiting_hint);
+        // 判定函数形状容忍：字符串/数组也识别；缺失/false 不识别。
+        assert!(projections_await_approval(
+            &serde_json::json!({"pendingApproval": "awaiting"})
+        ));
+        assert!(projections_await_approval(
+            &serde_json::json!({"approvalPending": [1]})
+        ));
+        assert!(!projections_await_approval(
+            &serde_json::json!({"running": true})
+        ));
     }
 
     #[test]
@@ -3220,6 +3493,15 @@ mod tests {
         s.handle_command(C::PickerInput("deploy".into()));
         assert_eq!(s.search.window_matches.len(), 3, "三个窗口命中");
         assert_eq!(s.search.cursor, 0);
+        // 编辑段：n/N 是输入字符（查询可含这些字母，AC-003-14 无吞字）。
+        assert!(!s.search.results_locked);
+        s.handle_command(C::SearchNext);
+        assert_eq!(s.search.query, "deployn", "编辑段 n 为输入字符");
+        s.handle_command(C::PickerBackspace);
+        assert_eq!(s.search.query, "deploy");
+        // Enter → 结果巡览段（锁定）：n/N 才是巡览命令（AC-003-05）。
+        s.handle_command(C::PickerConfirm);
+        assert!(s.search.results_locked);
         s.handle_command(C::SearchNext);
         assert_eq!(s.search.cursor, 1, "n 前进");
         s.handle_command(C::SearchPrev);
@@ -3243,7 +3525,9 @@ mod tests {
         assistant_md(&mut s, "s1", 1, "```json\n{\"k\": \"v\"}\n```\n\n说明");
         s.handle_command(C::StartSearch);
         s.handle_command(C::PickerInput("k".into()));
-        // 当前命中是 code 块（搜索索引文本 = 代码内容）。
+        // Enter 锁定结果巡览段（当前命中是 code 块：索引文本 = 代码内容）。
+        s.handle_command(C::PickerConfirm);
+        assert!(s.search.results_locked);
         let cmds = s.handle_command(C::YankContext);
         assert_eq!(cmds.len(), 1);
         let Cmd::CopyToClipboard { text } = &cmds[0] else {

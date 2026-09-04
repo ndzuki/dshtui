@@ -73,6 +73,17 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
                     .fg(Color::Magenta)
                     .add_modifier(Modifier::BOLD),
             ));
+            // §4：VISUAL 选择区反色 + `selected N lines` 计数。
+            if let Some(sel) = &app.yank.visual {
+                let (start, end) = sel.range();
+                spans.push(Span::styled(
+                    format!(
+                        " selected {} lines",
+                        end.saturating_sub(start).saturating_add(1)
+                    ),
+                    Style::default().fg(Color::Magenta),
+                ));
+            }
         }
         crate::app::Mode::Approval => {
             spans.push(Span::styled(
@@ -476,6 +487,29 @@ mod tests {
         assert!(
             rendered.contains("停止中"),
             "本地停止中转场, text={rendered}"
+        );
+    }
+
+    #[test]
+    fn visual_mode_shows_selected_line_count_ac003_12() {
+        let mut app = AppState::default();
+        app.conn = ConnState::Ready;
+        app.mode = crate::app::Mode::Visual;
+        app.yank.visual = Some(crate::model::VisualSelection {
+            anchor: 2,
+            cursor: 4,
+            mode: crate::model::VisualMode::Line,
+        });
+        let backend = TestBackend::new(120, 2);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render(frame, Rect::new(0, 0, 120, 2), &app))
+            .unwrap();
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains("VISUAL"), "text={rendered}");
+        assert!(
+            rendered.contains("selected 3 lines"),
+            "§4 selected N lines 计数, text={rendered}"
         );
     }
 

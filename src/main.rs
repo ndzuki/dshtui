@@ -34,8 +34,8 @@ const LOG_ROTATE_BYTES: u64 = 5 * 1024 * 1024; // REQ §6: 5MB log rotation.
 const SEARCH_TIMEOUT: Duration = Duration::from_secs(15);
 /// 搜索防抖窗口（AC-003-14：连续输入只保留最新）。
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(300);
-/// `loadThrough` 循环上限（REQ-003 §6：200 条/页，防止无界分页）。
-const LOAD_THROUGH_MAX_PAGES: usize = 20;
+/// `loadThrough` 单页条数（Notes/03 §4.4：200 条/页覆盖目标 seq）。
+const LOAD_THROUGH_PAGE_SIZE: usize = 200;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
@@ -641,54 +641,47 @@ async fn execute_one(
             }
         }
         Cmd::LoadThrough { seq } => {
-            // AC-003-09：200 条/页循环直到窗口覆盖目标 seq 或没有更多历史
-            // （上限防无界分页）；与 follow/page 增量同走 REQ-001 seq 去重
-            // 合并（AC-003-15）。
+            // AC-003-09：每次命令只拉一页（200 条/页口径，Notes/03 §4.4）；
+            // 落位判断与续页由 reducer（LoadThroughPage 事件）完成——逐页
+            // 之间照常渲染，不阻塞帧循环。分页上限在
+            // `AppState::LOAD_THROUGH_MAX_PAGES`。
             let Some(client) = client.as_ref() else {
                 return;
             };
             let Some(session_id) = app.active_session.clone() else {
                 return;
             };
-            for _ in 0..LOAD_THROUGH_MAX_PAGES {
-                let covered = app.active_window().and_then(|w| w.offset_of(seq)).is_some();
-                if covered {
-                    tracing::debug!(seq = %seq, "loadThrough 已覆盖目标 seq");
-                    break;
+            let (through_seq, before_seq) = match app.sessions.get(&session_id.0) {
+                Some(w) => (
+                    w.cursor().map(|c| SessionSeq(c.0)).unwrap_or(SessionSeq(0)),
+                    w.head_seq(),
+                ),
+                None => {
+                    tracing::warn!(seq = %seq, "loadThrough 目标会话无窗口，中止");
+                    return;
                 }
-                let (through_seq, before_seq) = match app.sessions.get(&session_id.0) {
-                    Some(w) => (
-                        w.cursor().map(|c| SessionSeq(c.0)).unwrap_or(SessionSeq(0)),
-                        w.head_seq(),
-                    ),
-                    None => break,
-                };
-                match session::page(
-                    &client.http,
-                    &client.base,
-                    &SessionAddress::session(&session_id.0),
-                    through_seq,
-                    before_seq,
-                    page_size.max(1),
-                )
-                .await
-                {
-                    Ok(page) => {
-                        let has_more = page.has_more;
-                        commands.extend(app.handle(AppEvent::LoadThroughPage {
-                            session_id: session_id.clone(),
-                            records: page.records,
-                            has_more,
-                        }));
-                        if has_more != Some(true) {
-                            break;
-                        }
-                    }
-                    Err(error) => {
-                        tracing::warn!(error = %error, "loadThrough 分页失败");
-                        app.last_error = Some(format!("跳轮加载失败: {error}"));
-                        break;
-                    }
+            };
+            match session::page(
+                &client.http,
+                &client.base,
+                &SessionAddress::session(&session_id.0),
+                through_seq,
+                before_seq,
+                LOAD_THROUGH_PAGE_SIZE,
+            )
+            .await
+            {
+                Ok(page) => {
+                    let has_more = page.has_more;
+                    commands.extend(app.handle(AppEvent::LoadThroughPage {
+                        session_id: session_id.clone(),
+                        records: page.records,
+                        has_more,
+                    }));
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error, "loadThrough 分页失败");
+                    app.last_error = Some(format!("跳轮加载失败: {error}"));
                 }
             }
         }
@@ -825,16 +818,37 @@ fn spawn_control_reader(
 /// 剪贴板写入降级链（AC-003-08）：arboard（系统剪贴板）→ OSC52（终端转义）
 /// → 失败提示。仅用户主动复制时输出转义序列（REQ-003 §7）；内容不落盘。
 fn clipboard_write(text: String) -> (dshtui::model::YankBackend, bool) {
+    // arboard（系统剪贴板）→ OSC52（终端转义）→ tmux buffer → 失败
+    // （AC-003-08 降级链，§5 字段表）。
     if let Ok(mut clipboard) = arboard::Clipboard::new() {
         if clipboard.set_text(text.clone()).is_ok() {
             return (dshtui::model::YankBackend::System, true);
         }
     }
     let escape = format!("\x1b]52;c;{}\x07", base64_encode(text.as_bytes()));
-    if writeln!(io::stdout(), "{escape}").is_ok() {
+    let mut out = io::stdout();
+    if writeln!(out, "{escape}").is_ok() && out.flush().is_ok() {
         return (dshtui::model::YankBackend::Osc52, true);
     }
-    (dshtui::model::YankBackend::Unavailable, false)
+    match std::process::Command::new("tmux")
+        .args(["load-buffer", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            let mut stdin = child
+                .stdin
+                .take()
+                .ok_or(std::io::Error::other("no stdin"))?;
+            stdin.write_all(text.as_bytes())?;
+            drop(stdin);
+            child.wait().map(|status| status.success())
+        }) {
+        Ok(true) => (dshtui::model::YankBackend::Tmux, true),
+        _ => (dshtui::model::YankBackend::Unavailable, false),
+    }
 }
 
 /// RFC 4648 标准字母表 base64（OSC52 需要；不引入新依赖）。
@@ -967,14 +981,15 @@ mod tests {
 
     #[test]
     fn clipboard_write_never_panics_ac003_08() {
-        // 无显示服务器环境：arboard 失败 → OSC52 转义输出；任何环境组合
-        // 都不崩溃（AC-003-08 应用不崩溃），且失败时明确报 Unavailable。
+        // 无显示服务器环境：arboard 失败 → OSC52 转义输出 → tmux buffer →
+        // Unavailable；任何环境组合都不崩溃（AC-003-08 应用不崩溃）。
         let (backend, ok) = clipboard_write("test-yank".into());
         assert!(!ok || backend != dshtui::model::YankBackend::Unavailable);
         assert!(matches!(
             backend,
             dshtui::model::YankBackend::System
                 | dshtui::model::YankBackend::Osc52
+                | dshtui::model::YankBackend::Tmux
                 | dshtui::model::YankBackend::Unavailable
         ));
     }
