@@ -5,6 +5,7 @@
 //! the single app-layer orchestrator (this layer only provides the connect
 //! primitive).
 
+pub mod approval;
 pub mod auth;
 pub mod envelope;
 pub mod mux;
@@ -115,5 +116,24 @@ pub async fn unary(
                 "{method} 返回 ok=false 但缺少 error"
             ))),
         }
+    }
+}
+
+/// unary with an explicit deadline (REQ-003: search/approval replies must not
+/// hang forever; the baseline `unary` has no timeout of its own). A timeout
+/// surfaces as a Transport-class error so the existing reconnect/error
+/// classification applies.
+pub async fn unary_with_timeout(
+    http: &reqwest::Client,
+    base: &str,
+    method: &str,
+    args: Value,
+    timeout: std::time::Duration,
+) -> Result<Value, ClientError> {
+    match tokio::time::timeout(timeout, unary(http, base, method, args)).await {
+        Ok(res) => res,
+        Err(_elapsed) => Err(ClientError::Transport(format!(
+            "{method} 请求超时（>{timeout:?}）"
+        ))),
     }
 }

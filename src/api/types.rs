@@ -321,6 +321,96 @@ pub struct PageResult {
     pub has_more: Option<bool>,
 }
 
+// ---------- session/search (REQ-003 §3; official read 0.1.2-rc.1) ----------
+
+/// One session-level search hit (`{sessionId, snippet}` — NO seq/turn,
+/// server truncates the snippet at ≤240 code points).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchHit {
+    pub session_id: SessionId,
+    #[serde(default)]
+    pub snippet: String,
+}
+
+/// `session/search` result: at most 20 items, `hasMore` only hints to narrow
+/// the query (there is no paging RPC).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchResult {
+    #[serde(default)]
+    pub items: Vec<SearchHit>,
+    #[serde(default)]
+    pub has_more: bool,
+}
+
+// ---------- session/control stream items (REQ-003 §3) ----------
+
+/// One parsed `session/control` frame. The wire shapes of the queue/jobs/
+/// projection replacement frames are not fully verified; unknown payloads are
+/// preserved raw and only the `projections.running` fact is consumed.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ControlItem {
+    /// First frame of the stream (`SessionControlBaseline`).
+    Baseline {
+        queues: serde_json::Value,
+        jobs: serde_json::Value,
+        projections: serde_json::Value,
+        raw: serde_json::Value,
+    },
+    /// Replacement frames (queue/jobs/projection).
+    Queue {
+        queue: serde_json::Value,
+    },
+    Jobs {
+        jobs: serde_json::Value,
+    },
+    Projection {
+        projection: serde_json::Value,
+    },
+    /// Unknown frame kind: preserved, never dropped silently.
+    Unknown {
+        kind: String,
+        raw: serde_json::Value,
+    },
+}
+
+// ---------- approval (REQ-003 §3/§7; D-18 event source correction) ----------
+
+/// Official `ApprovalOutcome` vocabulary (`@deepseek-ai/dsh-user-approval`,
+/// read 0.1.2-rc.1). `allowed-once` is the only authorizing value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ApprovalOutcome {
+    AllowedOnce,
+    Rejected,
+    Cancelled,
+    Unavailable,
+}
+
+impl ApprovalOutcome {
+    /// Wire literal for display/logging.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ApprovalOutcome::AllowedOnce => "allowed-once",
+            ApprovalOutcome::Rejected => "rejected",
+            ApprovalOutcome::Cancelled => "cancelled",
+            ApprovalOutcome::Unavailable => "unavailable",
+        }
+    }
+}
+
+/// A forwarded `approval/request` waterfall event. Only the identity keys are
+/// strongly typed; the full payload (tool/command/reason/workspace fields) is
+/// preserved raw because the field names are `[未验证]` (contract smoke locks
+/// them, AC-003-18 fallback otherwise).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ApprovalEvent {
+    pub client_id: String,
+    pub event_id: String,
+    pub raw: serde_json::Value,
+}
+
 // ---------- session list (session/list lightweight metadata, Notes/06 §1) ----------
 
 /// The TUI keeps only a lightweight structure (~500B/item); the rest of the

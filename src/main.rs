@@ -17,7 +17,7 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use dshtui::api::session;
-use dshtui::api::types::{SessionAddress, SessionId};
+use dshtui::api::types::{SessionAddress, SessionId, SessionSeq};
 use dshtui::api::workspace;
 use dshtui::api::{Backoff, ClientError, DshClient, Mux};
 use dshtui::app::{AppEvent, AppState, Cmd, Mode};
@@ -29,6 +29,13 @@ use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
 
 const LOG_ROTATE_BYTES: u64 = 5 * 1024 * 1024; // REQ §6: 5MB log rotation.
+
+/// `session/search` 截止时间（REQ-003 §6：unary 不得挂死帧循环）。
+const SEARCH_TIMEOUT: Duration = Duration::from_secs(15);
+/// 搜索防抖窗口（AC-003-14：连续输入只保留最新）。
+const SEARCH_DEBOUNCE: Duration = Duration::from_millis(300);
+/// `loadThrough` 单页条数（Notes/03 §4.4：200 条/页覆盖目标 seq）。
+const LOAD_THROUGH_PAGE_SIZE: usize = 200;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
@@ -377,6 +384,10 @@ async fn run_connected(eff: Effective, token: String, client: DshClient) -> Resu
                 Mode::Normal => InputMode::Normal,
                 Mode::Picker => InputMode::Picker,
                 Mode::Insert => InputMode::Insert,
+                // REQ-003 模式机扩展（app.mode 镜像）。
+                Mode::Search => InputMode::Search,
+                Mode::Visual => InputMode::Visual,
+                Mode::Approval => InputMode::Approval,
             };
             if let Some(command) = decoder.decode(mode, input) {
                 commands.extend(app.handle_command(command));
@@ -418,7 +429,7 @@ async fn execute_one(
             let Some(client) = client.as_ref() else {
                 return;
             };
-            let opened = match open_mux_stream(client, mux, mux_generation).await {
+            let opened = match open_mux_stream(client, mux, mux_generation, event_tx).await {
                 Ok(mux_ref) => workspace::open_follow(mux_ref).await,
                 Err(error) => Err(error),
             };
@@ -445,7 +456,7 @@ async fn execute_one(
                 return;
             };
             let address = SessionAddress::session(&session_id.0);
-            let opened = match open_mux_stream(client, mux, mux_generation).await {
+            let opened = match open_mux_stream(client, mux, mux_generation, event_tx).await {
                 Ok(mux_ref) => session::open_follow(mux_ref, &address, max_messages).await,
                 Err(error) => Err(error),
             };
@@ -548,6 +559,143 @@ async fn execute_one(
             };
             commands.extend(app.handle(event));
         }
+        // ---------- REQ-003：搜索 / control / 审批 / 打开 / 跳轮 / 剪贴板 ----------
+        Cmd::SearchSessions { query, generation } => {
+            let Some(client) = client.as_ref() else {
+                return;
+            };
+            let event =
+                match session::search(&client.http, &client.base, &query, SEARCH_TIMEOUT).await {
+                    Ok(result) => AppEvent::SearchResult {
+                        generation,
+                        items: result.items,
+                        has_more: result.has_more,
+                    },
+                    Err(error) => AppEvent::SearchError { generation, error },
+                };
+            commands.extend(app.handle(event));
+        }
+        Cmd::DebounceSearch { query, generation } => {
+            // 300ms 防抖计时（AC-003-14）：任务只投递事件，generation 校验
+            // 在 reducer（模式 15 in-flight 去重，只保留最新）。
+            let tx = event_tx.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(SEARCH_DEBOUNCE).await;
+                let _ = tx
+                    .send(AppEvent::SearchHistoryDebounced { query, generation })
+                    .await;
+            });
+        }
+        Cmd::OpenControl { session_id } => {
+            let Some(client) = client.as_ref() else {
+                return;
+            };
+            let address = SessionAddress::session(&session_id.0);
+            let opened = match open_mux_stream(client, mux, mux_generation, event_tx).await {
+                Ok(mux_ref) => session::open_control(mux_ref, &address).await,
+                Err(error) => Err(error),
+            };
+            match opened {
+                Ok(stream) => {
+                    let generation = mux_generation.load(Ordering::Relaxed);
+                    spawn_control_reader(
+                        stream,
+                        session_id,
+                        event_tx.clone(),
+                        mux_generation.clone(),
+                        generation,
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(%session_id, error = %error, "session/control 打开失败");
+                    commands.extend(app.handle(AppEvent::FollowError { session_id, error }));
+                }
+            }
+        }
+        Cmd::ReplyApproval { event, outcome } => {
+            let Some(client) = client.as_ref() else {
+                return;
+            };
+            let result = dshtui::api::approval::reply(
+                &client.http,
+                &client.base,
+                &event,
+                outcome,
+                dshtui::api::approval::REPLY_TIMEOUT,
+            )
+            .await;
+            let ev = match result {
+                Ok(()) => AppEvent::ApprovalReplied { outcome },
+                Err(error) => AppEvent::ApprovalReplyFailed { outcome, error },
+            };
+            commands.extend(app.handle(ev));
+        }
+        Cmd::OpenExternal { target } => {
+            // 仅用户显式触发才调用系统 open（REQ-003 §3 安全边界）。
+            match open::that(&target) {
+                Ok(()) => tracing::debug!(target = %target, "系统打开成功"),
+                Err(error) => {
+                    tracing::warn!(target = %target, error = %error, "系统打开失败");
+                    app.last_error = Some(format!("打开失败: {target}（{error}）"));
+                }
+            }
+        }
+        Cmd::LoadThrough { seq } => {
+            // AC-003-09：每次命令只拉一页（200 条/页口径，Notes/03 §4.4）；
+            // 落位判断与续页由 reducer（LoadThroughPage 事件）完成——逐页
+            // 之间照常渲染，不阻塞帧循环。分页上限在
+            // `AppState::LOAD_THROUGH_MAX_PAGES`。
+            let Some(client) = client.as_ref() else {
+                return;
+            };
+            let Some(session_id) = app.active_session.clone() else {
+                return;
+            };
+            let (through_seq, before_seq) = match app.sessions.get(&session_id.0) {
+                Some(w) => (
+                    w.cursor().map(|c| SessionSeq(c.0)).unwrap_or(SessionSeq(0)),
+                    w.head_seq(),
+                ),
+                None => {
+                    tracing::warn!(seq = %seq, "loadThrough 目标会话无窗口，中止");
+                    return;
+                }
+            };
+            match session::page(
+                &client.http,
+                &client.base,
+                &SessionAddress::session(&session_id.0),
+                through_seq,
+                before_seq,
+                LOAD_THROUGH_PAGE_SIZE,
+            )
+            .await
+            {
+                Ok(page) => {
+                    let has_more = page.has_more;
+                    commands.extend(app.handle(AppEvent::LoadThroughPage {
+                        session_id: session_id.clone(),
+                        records: page.records,
+                        has_more,
+                    }));
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error, "loadThrough 分页失败");
+                    app.last_error = Some(format!("跳轮加载失败: {error}"));
+                }
+            }
+        }
+        Cmd::CopyToClipboard { text } => {
+            // arboard 系统剪贴板 → OSC52 降级链（AC-003-08）；内容不落盘
+            // （Notes/06 §9），不进日志明文。
+            let outcome = tokio::task::spawn_blocking(move || clipboard_write(text))
+                .await
+                .unwrap_or((dshtui::model::YankBackend::Unavailable, false));
+            commands.extend(app.handle(AppEvent::CopyDone {
+                backend: outcome.0,
+                ok: outcome.1,
+            }));
+        }
         Cmd::Reconnect { .. } => {
             // Handled at the top of the run loop so the UI keeps painting.
             commands.push_front(command);
@@ -558,14 +706,24 @@ async fn execute_one(
 }
 
 /// Open a stream on the shared mux, creating the mux connection first if needed.
+/// On creation the server-push subscription is spawned (REQ-003 approval
+/// bypass): it dies with the mux, so a reconnect naturally re-subscribes.
 async fn open_mux_stream<'a>(
     client: &DshClient,
     mux: &'a mut Option<Mux>,
     mux_generation: &Arc<AtomicU64>,
+    event_tx: &mpsc::Sender<AppEvent>,
 ) -> Result<&'a Mux, ClientError> {
     if mux.is_none() {
-        *mux = Some(client.open_mux().await?);
-        mux_generation.fetch_add(1, Ordering::Relaxed);
+        let opened = client.open_mux().await?;
+        let generation = mux_generation.fetch_add(1, Ordering::Relaxed) + 1;
+        spawn_push_reader(
+            opened.subscribe_push(),
+            event_tx.clone(),
+            mux_generation.clone(),
+            generation,
+        );
+        *mux = Some(opened);
     }
     Ok(mux.as_ref().expect("mux initialized"))
 }
@@ -593,6 +751,129 @@ fn spawn_workspace_reader(
             }
         }
     });
+}
+
+/// mux 推帧旁路订阅（REQ-003：无 streamId 的 approval/request waterfall 事件）。
+/// 订阅随 mux 生命周期结束；generation 守卫丢弃旧 mux 的迟到帧（模式 15）。
+fn spawn_push_reader(
+    mut push: tokio::sync::broadcast::Receiver<serde_json::Value>,
+    event_tx: mpsc::Sender<AppEvent>,
+    mux_generation: Arc<AtomicU64>,
+    generation: u64,
+) {
+    tokio::spawn(async move {
+        loop {
+            match push.recv().await {
+                Ok(raw) => {
+                    if mux_generation.load(Ordering::Relaxed) != generation {
+                        break;
+                    }
+                    if let Some(event) = dshtui::api::approval::parse_event(&raw) {
+                        tracing::debug!(event_id = %event.event_id, "审批事件经推帧旁路到达");
+                        let _ = event_tx.send(AppEvent::ApprovalRequest { event }).await;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+}
+
+/// `session/control` 流 reader：baseline/替换帧解析在 api 层；流错误在
+/// generation 未变时统一走断线编排（与 follow 同口径）。
+fn spawn_control_reader(
+    mut stream: dshtui::api::StreamHandle,
+    session_id: SessionId,
+    event_tx: mpsc::Sender<AppEvent>,
+    mux_generation: Arc<AtomicU64>,
+    generation: u64,
+) {
+    tokio::spawn(async move {
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(value) => {
+                    if let Some(item) = session::parse_control_item(&value) {
+                        let _ = event_tx
+                            .send(AppEvent::ControlItem {
+                                session_id: session_id.clone(),
+                                item,
+                            })
+                            .await;
+                    }
+                }
+                Err(error) => {
+                    if mux_generation.load(Ordering::Relaxed) == generation {
+                        let _ = event_tx
+                            .send(AppEvent::Disconnected(error.to_string()))
+                            .await;
+                    }
+                    break;
+                }
+            }
+        }
+    });
+}
+
+/// 剪贴板写入降级链（AC-003-08）：arboard（系统剪贴板）→ OSC52（终端转义）
+/// → 失败提示。仅用户主动复制时输出转义序列（REQ-003 §7）；内容不落盘。
+fn clipboard_write(text: String) -> (dshtui::model::YankBackend, bool) {
+    // arboard（系统剪贴板）→ OSC52（终端转义）→ tmux buffer → 失败
+    // （AC-003-08 降级链，§5 字段表）。
+    if let Ok(mut clipboard) = arboard::Clipboard::new() {
+        if clipboard.set_text(text.clone()).is_ok() {
+            return (dshtui::model::YankBackend::System, true);
+        }
+    }
+    let escape = format!("\x1b]52;c;{}\x07", base64_encode(text.as_bytes()));
+    let mut out = io::stdout();
+    if writeln!(out, "{escape}").is_ok() && out.flush().is_ok() {
+        return (dshtui::model::YankBackend::Osc52, true);
+    }
+    match std::process::Command::new("tmux")
+        .args(["load-buffer", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            let mut stdin = child
+                .stdin
+                .take()
+                .ok_or(std::io::Error::other("no stdin"))?;
+            stdin.write_all(text.as_bytes())?;
+            drop(stdin);
+            child.wait().map(|status| status.success())
+        }) {
+        Ok(true) => (dshtui::model::YankBackend::Tmux, true),
+        _ => (dshtui::model::YankBackend::Unavailable, false),
+    }
+}
+
+/// RFC 4648 标准字母表 base64（OSC52 需要；不引入新依赖）。
+fn base64_encode(data: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(ALPHABET[(n >> 18) as usize & 63] as char);
+        out.push(ALPHABET[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
 }
 
 fn spawn_follow_reader(
@@ -687,6 +968,31 @@ impl Drop for TerminalSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn base64_encodes_rfc4648_for_osc52() {
+        // AC-003-08：OSC52 降级路径的标准 base64（含 padding）。
+        assert_eq!(base64_encode(b"Man"), "TWFu");
+        assert_eq!(base64_encode(b"Ma"), "TWE=");
+        assert_eq!(base64_encode(b"M"), "TQ==");
+        assert_eq!(base64_encode(b"dshtui"), "ZHNodHVp");
+        assert_eq!(base64_encode(b""), "");
+    }
+
+    #[test]
+    fn clipboard_write_never_panics_ac003_08() {
+        // 无显示服务器环境：arboard 失败 → OSC52 转义输出 → tmux buffer →
+        // Unavailable；任何环境组合都不崩溃（AC-003-08 应用不崩溃）。
+        let (backend, ok) = clipboard_write("test-yank".into());
+        assert!(!ok || backend != dshtui::model::YankBackend::Unavailable);
+        assert!(matches!(
+            backend,
+            dshtui::model::YankBackend::System
+                | dshtui::model::YankBackend::Osc52
+                | dshtui::model::YankBackend::Tmux
+                | dshtui::model::YankBackend::Unavailable
+        ));
+    }
 
     #[test]
     fn rotating_file_moves_oversized_log_to_old_and_resets_counter() {

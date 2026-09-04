@@ -2,10 +2,10 @@ use std::time::Duration;
 
 use dshtui::api::auth::authenticate;
 use dshtui::api::envelope::{remote_error, ClientRequest, ErrorClass, RpcError, ServerResponse};
-use dshtui::api::session::{cancel, prompt, AcceptedValue};
+use dshtui::api::session::{self, cancel, prompt, AcceptedValue};
 use dshtui::api::types::{
-    FollowFrame, PromptContentPart, PromptMode, PromptRequest, SessionId, SessionRequestId,
-    SessionSeq,
+    ControlItem, FollowFrame, PromptContentPart, PromptMode, PromptRequest, SessionId,
+    SessionRequestId, SessionSeq,
 };
 use dshtui::api::{ClientError, Mux};
 use futures_util::{SinkExt, StreamExt};
@@ -431,5 +431,223 @@ async fn accepted_false_receipt_is_a_typed_rejection_ac002_09() {
         ClientError::Protocol(msg) => assert!(msg.contains("accepted=false"), "msg={msg}"),
         other => panic!("预期 Protocol 错误，得到 {other:?}"),
     }
+    server.await.unwrap();
+}
+
+// ---------- REQ-003: session/search + session/control + approval bypass ----------
+
+#[tokio::test]
+async fn search_unary_posts_query_and_parses_session_level_hits() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let request = read_request(&mut socket).await;
+        let body: Value = serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        let rpc_id = body["rpcId"].as_str().unwrap().to_string();
+        assert_eq!(body["method"], "session/search");
+        assert_eq!(body["payload"]["args"]["query"], "deploy");
+        write_json_response(
+            &mut socket,
+            json!({
+                "type": "server-response",
+                "rpcId": rpc_id,
+                "result": {"ok": true, "value": {
+                    "items": [{"sessionId": "sess-9", "snippet": "deploy 排查 …"}],
+                    "hasMore": true
+                }},
+            }),
+        )
+        .await;
+    });
+
+    let http = reqwest::Client::new();
+    let result = session::search(
+        &http,
+        &format!("http://{addr}"),
+        "deploy",
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.items.len(), 1);
+    assert_eq!(result.items[0].session_id, SessionId("sess-9".into()));
+    assert_eq!(result.items[0].snippet, "deploy 排查 …");
+    assert!(result.has_more);
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn search_unary_surfaces_remote_error_code_not_retried() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let request = read_request(&mut socket).await;
+        let body: Value = serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        let rpc_id = body["rpcId"].as_str().unwrap().to_string();
+        write_json_response(
+            &mut socket,
+            json!({
+                "type": "server-response",
+                "rpcId": rpc_id,
+                "result": {"ok": false, "error": {"code": "PERMISSION_DENIED", "message": "无权限"}},
+            }),
+        )
+        .await;
+    });
+
+    let http = reqwest::Client::new();
+    let err = session::search(
+        &http,
+        &format!("http://{addr}"),
+        "q",
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.code(), "PERMISSION_DENIED");
+    assert_eq!(err.class(), ErrorClass::PermissionDenied);
+    server.await.unwrap();
+}
+
+#[test]
+fn control_item_parses_baseline_replacement_and_unknown() {
+    let baseline = session::parse_control_item(&json!({
+        "queues": [{"placement": "queued"}],
+        "jobs": {},
+        "projections": {"running": true}
+    }))
+    .expect("baseline parsed");
+    match baseline {
+        ControlItem::Baseline { projections, .. } => {
+            assert_eq!(projections["running"], true);
+        }
+        other => panic!("预期 Baseline，得到 {other:?}"),
+    }
+
+    let queue = session::parse_control_item(&json!({"queue": {"placement": "steering"}}))
+        .expect("queue replacement parsed");
+    assert!(matches!(queue, ControlItem::Queue { .. }));
+    let jobs = session::parse_control_item(&json!({"jobs": {"id": "j1"}})).unwrap();
+    assert!(matches!(jobs, ControlItem::Jobs { .. }));
+    let proj = session::parse_control_item(&json!({"projection": {"running": false}})).unwrap();
+    assert!(matches!(proj, ControlItem::Projection { .. }));
+
+    let unknown = session::parse_control_item(&json!({"type": "future-frame", "x": 1}))
+        .expect("unknown preserved");
+    match unknown {
+        ControlItem::Unknown { kind, raw } => {
+            assert_eq!(kind, "future-frame");
+            assert_eq!(raw["x"], 1);
+        }
+        other => panic!("预期 Unknown，得到 {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn mux_pushes_streamless_frames_to_bypass_and_routes_streams() {
+    // AC-003-07 前置：waterfall approval 帧（无 streamId）必须经旁路被订阅者
+    // 收到；同时既有带 streamId 的 item 路由不受影响。
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (opened_tx, opened_rx) = tokio::sync::oneshot::channel::<Value>();
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut ws = accept_async(socket).await.unwrap();
+        let first = ws.next().await.unwrap().unwrap();
+        let frame: Value = serde_json::from_str(first.to_text().unwrap()).unwrap();
+        opened_tx.send(frame.clone()).unwrap();
+        let stream_id = frame["streamId"].as_u64().unwrap();
+
+        ws.send(Message::Text(
+            json!({
+                "type": "approval/request",
+                "clientId": "c-1",
+                "eventId": "e-1",
+                "signal": "waterfall"
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+        ws.send(Message::Text(
+            json!({"type": "item", "streamId": stream_id, "value": {"answer": 42}}).to_string(),
+        ))
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    });
+
+    let mux = Mux::connect(&format!("ws://{addr}"), "dsh-auth-0=v1.sig")
+        .await
+        .unwrap();
+    let mut push = mux.subscribe_push();
+    let mut stream = mux.open_stream("session/control", json!({})).await.unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(1), opened_rx)
+        .await
+        .unwrap()
+        .unwrap();
+
+    // 推帧旁路先收到无 streamId 的完整原始帧。
+    let pushed = tokio::time::timeout(Duration::from_secs(1), push.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(pushed["type"], "approval/request");
+    assert_eq!(pushed["clientId"], "c-1");
+    assert_eq!(pushed["eventId"], "e-1");
+
+    // 带 streamId 的 item 仍走既有流路由。
+    let item = tokio::time::timeout(Duration::from_secs(1), stream.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(item, json!({"answer": 42}));
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn approval_reply_posts_identity_and_outcome_vocabulary() {
+    use dshtui::api::approval::{self, OUTCOME_METHOD};
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let request = read_request(&mut socket).await;
+        let body: Value = serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        let rpc_id = body["rpcId"].as_str().unwrap().to_string();
+        assert_eq!(body["method"], OUTCOME_METHOD);
+        assert_eq!(body["payload"]["args"]["clientId"], "c-1");
+        assert_eq!(body["payload"]["args"]["eventId"], "e-1");
+        assert_eq!(body["payload"]["args"]["outcome"]["value"], "allowed-once");
+        write_json_response(
+            &mut socket,
+            json!({
+                "type": "server-response",
+                "rpcId": rpc_id,
+                "result": {"ok": true, "value": {"accepted": true}},
+            }),
+        )
+        .await;
+    });
+
+    let event = dshtui::api::approval::parse_event(&json!({
+        "type": "approval/request",
+        "clientId": "c-1",
+        "eventId": "e-1"
+    }))
+    .unwrap();
+    let http = reqwest::Client::new();
+    approval::reply(
+        &http,
+        &format!("http://{addr}"),
+        &event,
+        dshtui::api::types::ApprovalOutcome::AllowedOnce,
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("outcome reply accepted");
     server.await.unwrap();
 }

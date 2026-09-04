@@ -20,19 +20,30 @@ use std::collections::HashSet;
 
 use crate::api::types::ChunkRow;
 use crate::api::types::{
-    ListItemRaw, PromptContentPart, PromptMode, PromptRequest, SessionHistoryRecord, SessionId,
-    SessionLogOffset, SessionRequestId, SessionSeq, SessionWireEvent,
+    ApprovalEvent, ApprovalOutcome, ControlItem, ListItemRaw, PromptContentPart, PromptMode,
+    PromptRequest, SearchHit, SessionHistoryRecord, SessionId, SessionLogOffset, SessionRequestId,
+    SessionSeq, SessionWireEvent,
 };
 use crate::api::{ClientError, ErrorClass};
-use crate::model::{ApplyEffect, Incoming, SessionStore, WorkspaceStore};
+use crate::model::{
+    block_plain_text, block_yank_target, selection_text, ApplyEffect, DraftRegistry, DraftState,
+    Incoming, InputHistory, SearchIndex, SearchKindFilter, SessionStore, VisualMode,
+    VisualSelection, WorkspaceStore, YankBackend, YankState,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Mode {
     #[default]
     Normal,
     Picker,
-    /// Reserved (REQ-002 composer extension point).
+    /// REQ-002 composer (V0.2 扩展：steer 标注 + 历史)。
     Insert,
+    /// `/` 结构化搜索 overlay（REQ-003）。
+    Search,
+    /// `v`/`V` 视觉选择（REQ-003）。
+    Visual,
+    /// 审批到达强制进入的模态（REQ-003，`y/n/q/Esc` 决策后回先前模式）。
+    Approval,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -88,16 +99,63 @@ pub struct ComposerState {
     /// Send target session; always set while visible — empty means not
     /// sendable (AC-002-12).
     pub active_session: Option<SessionId>,
+    /// Running session → steer 模式（REQ-003 AC-003-06，状态条 STEER）。
+    pub steer: bool,
 }
 
-/// Session-bound draft (memory only, REQ-002 §5/§7; never restored across
-/// sessions D-11, lost on process exit).
-#[derive(Debug, Clone, PartialEq)]
-pub struct DraftState {
-    pub text: String,
-    /// Cursor position (char offset; V0.1 is single-line plus newline chars).
+/// SEARCH overlay state（REQ-003 §5 `SearchState`；全内存）。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SearchState {
+    pub open: bool,
+    /// 原样输入（含 `/c` 前缀）。
+    pub query: String,
+    /// 窗口内即时命中（按窗口顺序）。
+    pub window_matches: Vec<usize>,
+    /// 当前匹配下标（`n`/`N` 巡览，0-based）。
     pub cursor: usize,
-    pub bound_session: SessionId,
+    /// 全历史 `session/search` 命中（会话级）。
+    pub history_hits: Vec<SearchHit>,
+    pub history_selection: usize,
+    pub history_loading: bool,
+    /// 防抖 generation：stale 结果/触发直接丢弃（模式 15 in-flight 去重）。
+    pub history_generation: u64,
+    pub history_error: Option<String>,
+    /// hasMore=true 的用户可见提示（细化关键词，无翻页 RPC）。
+    pub history_hint: Option<String>,
+    /// Enter 后进入结果巡览：n/N/y/j/k 为命令；未锁定时它们是输入字符
+    /// （AC-003-05 与「输入实时过滤」的模态内两段式）。
+    pub results_locked: bool,
+}
+
+impl SearchState {
+    /// 前缀过滤 + 有效查询词（`/c x` → (Code, "x")）。
+    pub fn terms(&self) -> (SearchKindFilter, String) {
+        let (filter, term) = SearchKindFilter::from_prefix(&self.query);
+        (filter, term.to_string())
+    }
+}
+
+/// APPROVAL 模态状态（REQ-003 §5 `ApprovalState`；仅内存）。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ApprovalState {
+    pub visible: bool,
+    pub event: Option<ApprovalEvent>,
+    pub last_outcome: Option<ApprovalOutcome>,
+    /// outcome 回复在途：同一弹窗只回复一次（幂等）。
+    pub reply_inflight: bool,
+    /// 进入审批前的模式（关闭后恢复，不丢运行状态）。
+    pub prev_mode: Mode,
+    /// 不可编程审批降级：状态条 `等待审批` + 指引官方 web（AC-003-18）。
+    pub waiting_hint: bool,
+    /// 一次性提示（toast）。
+    pub toast: Option<String>,
+}
+
+/// turnOutline 大纲列表（`O`；D-19 独立键，与 `o` 打开不冲突）。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct OutlineState {
+    pub open: bool,
+    pub selection: usize,
 }
 
 /// Local stop transition (REQ-002 §5): shows「停止中」while requested; ends
@@ -119,6 +177,48 @@ impl StopState {
 pub struct PageGuard {
     pub generation: u64,
     pub in_flight: bool,
+}
+
+/// `loadThrough(seq)` 分页上限（REQ-003 §6：防无界分页；200 条/页口径）。
+pub const LOAD_THROUGH_MAX_PAGES: usize = 20;
+
+/// 官方 projections 的「待审批」候选键（wire 字段 `[未验证]`，容忍布尔/
+/// 非空数组/状态字符串三种形状，AC-003-18 降级检测）。
+const APPROVAL_PENDING_KEYS: &[&str] = &[
+    "awaitingApproval",
+    "waitingApproval",
+    "pendingApproval",
+    "approvalPending",
+    "needsApproval",
+];
+
+/// 官方投影是否存在待审批信号（仅布尔 true/非空数组/状态字符串；缺失或
+/// false 均视为无待审批，不臆造）。
+pub fn projections_await_approval(projections: &serde_json::Value) -> bool {
+    for key in APPROVAL_PENDING_KEYS {
+        let Some(v) = projections.get(key) else {
+            continue;
+        };
+        match v {
+            serde_json::Value::Bool(b) => {
+                if *b {
+                    return true;
+                }
+            }
+            serde_json::Value::Array(a) => {
+                if !a.is_empty() {
+                    return true;
+                }
+            }
+            serde_json::Value::String(s)
+                if matches!(s.as_str(), "pending" | "awaiting" | "waiting") =>
+            {
+                return true;
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 /// Events entering AppState (from api tasks / the input layer / the frame
@@ -196,6 +296,49 @@ pub enum AppEvent {
         width: u16,
         height: u16,
     },
+    /// 搜索防抖计时到点（generation 校验后才会真正发 `session/search`）。
+    SearchHistoryDebounced {
+        query: String,
+        generation: u64,
+    },
+    /// `session/search` 结果（stale 直接丢弃，AC-003-14）。
+    SearchResult {
+        generation: u64,
+        items: Vec<SearchHit>,
+        has_more: bool,
+    },
+    SearchError {
+        generation: u64,
+        error: ClientError,
+    },
+    /// 转发的 `approval/request` waterfall 事件（AC-003-07）。
+    ApprovalRequest {
+        event: ApprovalEvent,
+    },
+    /// outcome 回复成功/失败（失败 fail-closed，AC-003-17）。
+    ApprovalReplied {
+        outcome: ApprovalOutcome,
+    },
+    ApprovalReplyFailed {
+        outcome: ApprovalOutcome,
+        error: ClientError,
+    },
+    /// `session/control` 流帧（baseline 的 projections.running 读入官方口径）。
+    ControlItem {
+        session_id: SessionId,
+        item: ControlItem,
+    },
+    /// `loadThrough(seq)` 的一页（按 REQ-001 seq 幂等合并进窗口）。
+    LoadThroughPage {
+        session_id: SessionId,
+        records: Vec<SessionHistoryRecord>,
+        has_more: Option<bool>,
+    },
+    /// 剪贴板写入结果（AC-003-08 降级链反馈）。
+    CopyDone {
+        backend: YankBackend,
+        ok: bool,
+    },
 }
 
 /// Orchestration commands emitted by the reducer (executed by the run loop).
@@ -228,6 +371,37 @@ pub enum Cmd {
     },
     RestoreTerminal,
     Exit,
+    /// 全历史 `session/search`（防抖后触发；generation 校验）。
+    SearchSessions {
+        query: String,
+        generation: u64,
+    },
+    /// 300ms 防抖计时命令（execute_one 异步等待后回投 Debounced 事件）。
+    DebounceSearch {
+        query: String,
+        generation: u64,
+    },
+    /// 打开 `session/control` 流。
+    OpenControl {
+        session_id: SessionId,
+    },
+    /// 审批 outcome 回复（unary）。
+    ReplyApproval {
+        event: ApprovalEvent,
+        outcome: ApprovalOutcome,
+    },
+    /// 系统打开链接（仅用户显式触发，REQ-003 §3）。
+    OpenExternal {
+        target: String,
+    },
+    /// 跳轮专用分页：拉到覆盖目标 seq。
+    LoadThrough {
+        seq: SessionSeq,
+    },
+    /// 写系统剪贴板（arboard → OSC52 降级链在 execute_one 执行）。
+    CopyToClipboard {
+        text: String,
+    },
 }
 
 #[derive(Debug)]
@@ -241,9 +415,24 @@ pub struct AppState {
     pub viewport: Viewport,
     pub picker: PickerState,
     pub composer: ComposerState,
-    /// Session-bound draft (memory only; restored on `i`, cleared on send,
-    /// replaced on session switch).
+    /// Active composer buffer (bound to a session; the registry keeps drafts
+    /// across session switches, D-20).
     pub draft: Option<DraftState>,
+    /// Cross-session draft registry (memory only, LRU 20).
+    pub drafts: DraftRegistry,
+    /// Global input history (↑/↓, ≤50, memory only).
+    pub history: InputHistory,
+    /// 搜索 overlay + 窗口索引（随窗口重建）。
+    pub search: SearchState,
+    pub search_index: SearchIndex,
+    /// 视觉选择/剪贴板。
+    pub yank: YankState,
+    /// 审批模态。
+    pub approval: ApprovalState,
+    /// turnOutline 大纲列表（`O`）。
+    pub outline: OutlineState,
+    /// 焦点块游标（窗口块下标；搜索跳转/视觉选择/上下文 yank 的锚）。
+    pub cursor_block: usize,
     /// Local stop transition (from `s` until the official projection flips).
     pub stop: StopState,
     pub help_open: bool,
@@ -261,6 +450,10 @@ pub struct AppState {
     pub window_cap: usize,
     page_guard: PageGuard,
     want_backfill: bool,
+    /// `loadThrough(seq)` 在途目标：每页合并后 reducer 判断是否已覆盖，
+    /// 未覆盖且仍有更多历史则继续发下一页（AC-003-09 按 seq 落位）。
+    load_through_target: Option<SessionSeq>,
+    load_through_pages: usize,
     running_sessions: HashSet<SessionId>,
     /// Workspaces collapsed via `h` (FR-001-03); `l` expands all.
     pub collapsed_workspaces: HashSet<crate::api::types::WorkspaceId>,
@@ -281,6 +474,14 @@ impl Default for AppState {
             picker: PickerState::default(),
             composer: ComposerState::default(),
             draft: None,
+            drafts: DraftRegistry::new(20),
+            history: InputHistory::new(50),
+            search: SearchState::default(),
+            search_index: SearchIndex::new(),
+            yank: YankState::default(),
+            approval: ApprovalState::default(),
+            outline: OutlineState::default(),
+            cursor_block: 0,
             stop: StopState::default(),
             help_open: false,
             quit_requested: false,
@@ -292,6 +493,8 @@ impl Default for AppState {
             window_cap: 200,
             page_guard: PageGuard::default(),
             want_backfill: false,
+            load_through_target: None,
+            load_through_pages: 0,
             running_sessions: HashSet::new(),
             collapsed_workspaces: HashSet::new(),
             list_cursor: None,
@@ -426,6 +629,14 @@ impl AppState {
                     .and_then(|p| p.get("running"))
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
+                // AC-003-18 检测：官方投影出现待审批信号且无弹窗事件 →
+                // 收缩为状态条 `等待审批`（不转发 approval/request 的
+                // 目标版本路径）。
+                if self.approval.event.is_none() {
+                    if let Some(p) = projections.as_ref() {
+                        self.approval.waiting_hint = projections_await_approval(p);
+                    }
+                }
                 if running {
                     self.running_sessions.insert(session_id.clone());
                 } else {
@@ -446,6 +657,7 @@ impl AppState {
                     })
                 };
                 self.adjust_viewport(&eff);
+                self.window_changed();
                 // Reconnect reconciliation: send the browsed gap after the
                 // refollow completes (AC-001-12).
                 if self.want_backfill {
@@ -462,6 +674,7 @@ impl AppState {
                 };
                 let eff = w.apply(Incoming::FollowEvent(event));
                 self.adjust_viewport(&eff);
+                self.window_changed();
                 vec![]
             }
             AppEvent::FollowChunks { session_id, row } => {
@@ -470,6 +683,7 @@ impl AppState {
                 };
                 let eff = w.apply(Incoming::Chunks(row));
                 self.adjust_viewport(&eff);
+                self.window_changed();
                 vec![]
             }
             AppEvent::FollowError { session_id, error } => {
@@ -503,6 +717,7 @@ impl AppState {
                     .map(|w| w.apply(Incoming::Page { records, has_more }));
                 if let Some(eff) = eff {
                     self.adjust_viewport(&eff);
+                    self.window_changed();
                 }
                 vec![]
             }
@@ -538,6 +753,28 @@ impl AppState {
                 let message = error.to_string();
                 if let Some(w) = self.sessions.get_mut(&session_id.0) {
                     w.fail_echo(&request_id, &code, &message);
+                }
+                // AC-003-16: steer 不被接受（轮次已结束/agent 非运行）→ 状态条
+                // 提示 + 草稿保留（回显文本放回注册表），应用不崩溃。
+                if code == "session/steer-unavailable" {
+                    let echo_text = self
+                        .sessions
+                        .get(&session_id.0)
+                        .and_then(|w| w.echo_text(&request_id))
+                        .map(str::to_string);
+                    if let Some(text) = echo_text {
+                        self.drafts.set(DraftState {
+                            text,
+                            cursor: 0,
+                            bound_session: session_id.clone(),
+                        });
+                    }
+                    self.last_error = Some(
+                        "steer 不可用（轮次已结束或 agent 未运行），草稿已保留，可改为排队发送"
+                            .to_string(),
+                    );
+                    tracing::warn!(%session_id, "session/steer-unavailable，草稿保留");
+                    return vec![];
                 }
                 // AC-002-08: the status bar always shows a hint for a failed
                 // send — including network-class errors (a dead follow stream
@@ -588,12 +825,15 @@ impl AppState {
             AppEvent::Reconnected => {
                 self.conn = ConnState::Ready;
                 // After recovery trigger refollow only once (no repeated
-                // repair).
+                // repair); REQ-003 重开 control 流（运行态/审批降级状态读取）。
                 match self.active_session.clone() {
-                    Some(sid) => vec![Cmd::OpenFollow {
-                        session_id: sid,
-                        max_messages: self.window_cap,
-                    }],
+                    Some(sid) => vec![
+                        Cmd::OpenFollow {
+                            session_id: sid.clone(),
+                            max_messages: self.window_cap,
+                        },
+                        Cmd::OpenControl { session_id: sid },
+                    ],
                     None => vec![Cmd::LoadSessionList { cursor: None }],
                 }
             }
@@ -609,6 +849,213 @@ impl AppState {
                 self.viewport.height = height.saturating_sub(2).max(1) as usize;
                 vec![]
             }
+            AppEvent::SearchHistoryDebounced { query, generation } => {
+                // 防抖到点 + generation 校验（模式 15：未收敛的异步信号丢弃
+                // stale 触发；AC-003-14 只保留最新）。
+                if generation != self.search.history_generation || query.trim().is_empty() {
+                    tracing::debug!(generation, "stale 搜索防抖触发丢弃");
+                    return vec![];
+                }
+                self.search.history_loading = true;
+                vec![Cmd::SearchSessions { query, generation }]
+            }
+            AppEvent::SearchResult {
+                generation,
+                items,
+                has_more,
+            } => {
+                if generation != self.search.history_generation {
+                    tracing::debug!(generation, "stale search 结果丢弃");
+                    return vec![];
+                }
+                self.search.history_loading = false;
+                self.search.history_error = None;
+                self.search.history_hint = None;
+                self.search.history_hits = items;
+                self.search.history_selection = 0;
+                if has_more {
+                    // 用户可见提示（§4：达上限 20 → 提示细化关键词，无翻页）。
+                    self.search.history_hint =
+                        Some("命中已达上限（20），请细化关键词（hasMore）".to_string());
+                    tracing::debug!("session/search hasMore=true（提示细化关键词，无翻页）");
+                }
+                vec![]
+            }
+            AppEvent::SearchError { generation, error } => {
+                if generation != self.search.history_generation {
+                    return vec![];
+                }
+                self.search.history_loading = false;
+                let msg = error.to_string();
+                // 权限错误不自动重试（Notes/03 §8）；窗口内即时搜索不受影响
+                // （AC-003-13）。
+                match error.class() {
+                    ErrorClass::PermissionDenied => {
+                        tracing::warn!(error = %msg, "session/search 权限拒绝");
+                        self.search.history_error = Some(format!("搜索权限不足: {msg}"));
+                    }
+                    _ => {
+                        tracing::warn!(error = %msg, "session/search 失败");
+                        self.search.history_error = Some(format!("全历史搜索失败: {msg}"));
+                    }
+                }
+                vec![]
+            }
+            AppEvent::ApprovalRequest { event } => {
+                // 同一事件重复投递（重连/重放）只保留一次（模式 15 去重）。
+                if self
+                    .approval
+                    .event
+                    .as_ref()
+                    .is_some_and(|cur| cur.event_id == event.event_id)
+                {
+                    tracing::debug!(event_id = %event.event_id, "重复审批事件忽略");
+                    return vec![];
+                }
+                if self.mode != Mode::Approval {
+                    self.approval.prev_mode = self.mode;
+                }
+                self.mode = Mode::Approval;
+                self.approval.event = Some(event);
+                self.approval.visible = true;
+                self.approval.reply_inflight = false;
+                self.approval.waiting_hint = false;
+                vec![]
+            }
+            AppEvent::ApprovalReplied { outcome } => {
+                self.approval.reply_inflight = false;
+                self.approval.last_outcome = Some(outcome);
+                self.approval.toast = Some(format!("审批已回复: {}", outcome.as_str()));
+                self.approval.event = None;
+                self.approval.visible = false;
+                self.mode = self.approval.prev_mode;
+                vec![]
+            }
+            AppEvent::ApprovalReplyFailed { outcome, error } => {
+                // fail closed：不授权；弹窗收缩为状态条 `等待审批` + 指引官方
+                // web（AC-003-17/18），运行状态不丢。
+                self.approval.reply_inflight = false;
+                self.approval.event = None;
+                self.approval.visible = false;
+                self.approval.waiting_hint = true;
+                self.mode = self.approval.prev_mode;
+                self.last_error = Some(format!(
+                    "审批回复失败（{}，不授权）: {error}；请在官方 web 完成审批",
+                    outcome.as_str()
+                ));
+                vec![]
+            }
+            AppEvent::ControlItem { session_id, item } => {
+                // 只消费官方 projection 的 running 事实（ADR-008）；其余
+                // queue/jobs 帧本版本不解释。
+                if let ControlItem::Baseline { projections, .. } = item {
+                    let running = projections
+                        .get("running")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    // AC-003-18 检测：官方投影出现待审批信号且无弹窗事件 →
+                    // 收缩为状态条 `等待审批`（不转发 approval/request 的
+                    // 目标版本路径）。
+                    if self.approval.event.is_none() {
+                        self.approval.waiting_hint = projections_await_approval(&projections);
+                    }
+                    if running {
+                        self.running_sessions.insert(session_id.clone());
+                    } else {
+                        self.running_sessions.remove(&session_id);
+                        if self.stop.is_requested_for(&session_id) {
+                            self.stop.requested_session = None;
+                        }
+                    }
+                }
+                vec![]
+            }
+            AppEvent::LoadThroughPage {
+                session_id,
+                records,
+                has_more,
+            } => {
+                // 与 follow/page 增量同漏斗：REQ-001 seq/requestId 去重
+                // （AC-003-15）。
+                let eff = self
+                    .sessions
+                    .get_mut(&session_id.0)
+                    .map(|w| w.apply(Incoming::Page { records, has_more }));
+                if let Some(eff) = eff {
+                    self.adjust_viewport(&eff);
+                    self.window_changed();
+                }
+                // AC-003-09 落位：目标 seq 已覆盖 → 落位并结束；未覆盖且
+                // 仍有更多历史 → 发下一页（每页一次命令，渲染不被阻塞）；
+                // 页数/历史耗尽 → 提示并结束。
+                let Some(target) = self.load_through_target else {
+                    return vec![];
+                };
+                if self.scroll_to_seq(target) {
+                    if let Some(idx) = self.active_window().and_then(|w| w.offset_of(target)) {
+                        self.cursor_block = idx;
+                    }
+                    self.load_through_target = None;
+                    self.load_through_pages = 0;
+                    return vec![];
+                }
+                if has_more == Some(true) {
+                    self.load_through_pages += 1;
+                    if self.load_through_pages >= LOAD_THROUGH_MAX_PAGES {
+                        tracing::warn!(seq = %target, "loadThrough 达到分页上限仍未覆盖目标轮");
+                        self.last_error = Some("目标轮不在可达历史范围内".to_string());
+                        self.load_through_target = None;
+                        self.load_through_pages = 0;
+                        return vec![];
+                    }
+                    return vec![Cmd::LoadThrough { seq: target }];
+                }
+                self.last_error = Some("目标轮不在已加载历史范围内".to_string());
+                self.load_through_target = None;
+                self.load_through_pages = 0;
+                vec![]
+            }
+            AppEvent::CopyDone { backend, ok } => {
+                self.yank.backend = backend;
+                if ok {
+                    self.yank.toast = Some("copied".to_string());
+                } else {
+                    self.yank.backend = YankBackend::Unavailable;
+                    self.yank.toast = None;
+                    self.last_error =
+                        Some("剪贴板不可用（系统剪贴板与 OSC52 均失败），内容未复制".to_string());
+                }
+                vec![]
+            }
+        }
+    }
+
+    /// 窗口内容变化后的统一维护：重建搜索索引、刷新打开的窗口搜索、钳制
+    /// 焦点块游标。
+    fn window_changed(&mut self) {
+        let blocks = self
+            .active_window()
+            .map(|w| w.block_snapshot())
+            .unwrap_or_default();
+        self.search_index.rebuild(&blocks);
+        if self.search.open {
+            self.recompute_window_matches();
+        }
+        let len = blocks.len();
+        if self.cursor_block >= len {
+            self.cursor_block = len.saturating_sub(1);
+        }
+    }
+
+    /// 用当前查询词重算窗口内即时命中（离线，无网络）。
+    fn recompute_window_matches(&mut self) {
+        let (filter, term) = self.search.terms();
+        let matches = self.search_index.query(&term, filter);
+        self.search.window_matches = matches.iter().map(|m| m.item_index).collect();
+        if self.search.window_matches.is_empty()
+            || self.search.cursor >= self.search.window_matches.len()
+        {
+            self.search.cursor = 0;
         }
     }
 
@@ -617,6 +1064,9 @@ impl AppState {
         // Void the in-flight page (generation is kept, guarding against stale
         // resurrection).
         self.page_guard.in_flight = false;
+        // 断线中止 loadThrough（恢复后可由跳轮重新发起，目标不被旧状态污染）。
+        self.load_through_target = None;
+        self.load_through_pages = 0;
         tracing::warn!(%reason, "连接断开 → reconnecting");
         vec![Cmd::Reconnect { delay_ms: 500 }]
     }
@@ -696,9 +1146,10 @@ impl AppState {
 
     // ---------- composer lifecycle (REQ-002 Step 2/3 entries) ----------
 
-    /// `i` entry (AC-002-12): without an active session stay NORMAL and show
-    /// the status hint; with one, enter INSERT and restore the same-session
-    /// draft (never restored across sessions, D-11).
+    /// `i` entry (AC-002-12 + REQ-003 D-20): without an active session stay
+    /// NORMAL with a hint; with one, restore the session draft from the
+    /// registry (cross-session retention, memory only) and mark steer when the
+    /// session is running (official projection, AC-003-06).
     fn open_composer(&mut self) -> Vec<Cmd> {
         if self.mode == Mode::Insert && self.composer.visible {
             return vec![];
@@ -709,27 +1160,36 @@ impl AppState {
             self.last_error = Some("无打开的会话（f/o 打开会话后再输入）".to_string());
             return vec![];
         };
-        let keep = self
-            .draft
-            .as_ref()
-            .filter(|d| d.bound_session == sid)
-            .map(|d| (d.text.clone(), d.cursor));
+        let restored = self
+            .drafts
+            .get(&sid)
+            .map(|d| (d.text.clone(), d.cursor))
+            .unwrap_or_default();
         self.draft = Some(DraftState {
-            text: keep.as_ref().map(|(t, _)| t.clone()).unwrap_or_default(),
-            cursor: keep.as_ref().map(|(_, c)| *c).unwrap_or(0),
+            text: restored.0,
+            cursor: restored.1,
             bound_session: sid.clone(),
         });
+        self.history.reset_nav();
         self.mode = Mode::Insert;
         self.composer.visible = true;
         self.composer.active_session = Some(sid);
+        // 运行态经官方 projections（active_running），不臆造（ADR-008）。
+        self.composer.steer = self.active_running();
         vec![]
     }
 
-    /// Esc: close the composer but keep the session-bound draft (AC-002-04).
+    /// Esc: close the composer but keep the session-bound draft (AC-002-04;
+    /// REQ-003 D-20 注册表持久到进程退出). `self.draft` 保留为会话内活草稿
+    /// （V0.1 行为不变），注册表同步副本供跨会话恢复。
     fn close_composer_keep_draft(&mut self) {
         self.mode = Mode::Normal;
         self.composer.visible = false;
         self.composer.active_session = None;
+        self.composer.steer = false;
+        if let Some(d) = self.draft.as_ref() {
+            self.drafts.set(d.clone());
+        }
     }
 
     /// Insert text at the cursor (single line + Ctrl/Alt+Enter newline chars).
@@ -799,7 +1259,12 @@ impl AppState {
         d.cursor = 0;
         self.mode = Mode::Normal;
         self.composer.visible = false;
+        self.composer.steer = false;
         self.composer.active_session = None;
+        // 发送后清空该会话草稿（AC-003-11）+ 记入输入历史（AC-003-10）。
+        self.drafts.clear(&sid);
+        self.history.push(&text);
+        self.history.reset_nav();
         let request_id = SessionRequestId(crate::api::types::mint_request_id());
         // Optimistic echo: visible within one frame, occupies no seq
         // (AC-002-02).
@@ -850,7 +1315,39 @@ impl AppState {
             | C::HalfPageDown
             | C::HalfPageUp
             | C::GotoBottom
-            | C::GotoTop => self.scroll(cmd),
+            | C::GotoTop => {
+                if self.mode == Mode::Visual {
+                    // VISUAL：j/k 扩展选择（V 行模式跨块；v 字符模式单块）。
+                    let len = self.active_window().map(|w| w.len()).unwrap_or(0);
+                    if let Some(sel) = self.yank.visual.as_mut() {
+                        if matches!(cmd, C::MoveDown) {
+                            sel.cursor = (sel.cursor + 1).min(len.saturating_sub(1));
+                        } else if matches!(cmd, C::MoveUp) {
+                            sel.cursor = sel.cursor.saturating_sub(1);
+                        }
+                    }
+                    vec![]
+                } else if self.outline.open {
+                    // 大纲列表：j/k 选择。
+                    let total = self
+                        .active_window()
+                        .map(|w| w.turn_outline().len())
+                        .unwrap_or(0);
+                    match cmd {
+                        C::MoveDown => {
+                            self.outline.selection =
+                                (self.outline.selection + 1).min(total.saturating_sub(1));
+                        }
+                        C::MoveUp => {
+                            self.outline.selection = self.outline.selection.saturating_sub(1);
+                        }
+                        _ => {}
+                    }
+                    vec![]
+                } else {
+                    self.scroll(cmd)
+                }
+            }
             C::OpenPicker => {
                 self.mode = Mode::Picker;
                 self.picker.open = true;
@@ -871,19 +1368,61 @@ impl AppState {
                     self.close_composer_keep_draft();
                     vec![]
                 }
-                _ => vec![],
+                Mode::Search => {
+                    self.close_search();
+                    vec![]
+                }
+                Mode::Visual => {
+                    // Esc/v/V 退出视觉选择（Notes/04 §3.1）。
+                    self.yank.visual = None;
+                    self.mode = Mode::Normal;
+                    vec![]
+                }
+                Mode::Approval => {
+                    // Esc 在审批弹窗 = cancelled 决策（不退出程序）。
+                    self.approval_decide(ApprovalOutcome::Cancelled)
+                }
+                Mode::Normal => {
+                    if self.outline.open {
+                        self.outline.open = false;
+                        self.outline.selection = 0;
+                    }
+                    vec![]
+                }
             },
             C::PickerDown => {
-                self.picker.selection += 1;
+                if self.mode == Mode::Search {
+                    if !self.search.results_locked {
+                        // 编辑段：j 是输入字符。
+                        return self.search_input("j");
+                    }
+                    let total = self.search.history_hits.len();
+                    if total > 0 {
+                        self.search.history_selection =
+                            (self.search.history_selection + 1).min(total - 1);
+                    }
+                } else {
+                    self.picker.selection += 1;
+                }
                 vec![]
             }
             C::PickerUp => {
-                self.picker.selection = self.picker.selection.saturating_sub(1);
+                if self.mode == Mode::Search {
+                    if !self.search.results_locked {
+                        // 编辑段：k 是输入字符。
+                        return self.search_input("k");
+                    }
+                    self.search.history_selection = self.search.history_selection.saturating_sub(1);
+                } else {
+                    self.picker.selection = self.picker.selection.saturating_sub(1);
+                }
                 vec![]
             }
             C::PickerInput(text) => {
                 if self.mode == Mode::Insert {
                     self.composer_input(&text)
+                } else if self.mode == Mode::Search {
+                    self.search_input(&text)
                 } else {
                     self.picker.query.push_str(&text);
                     self.picker.selection = 0;
@@ -893,6 +1432,8 @@ impl AppState {
             C::PickerBackspace => {
                 if self.mode == Mode::Insert {
                     self.composer_backspace()
+                } else if self.mode == Mode::Search {
+                    self.search_input_backspace()
                 } else {
                     self.picker.query.pop();
                     vec![]
@@ -900,15 +1441,83 @@ impl AppState {
             }
             C::SubmitInput => {
                 if self.mode == Mode::Insert {
-                    // V0.1 always mode:queue (D-10); steer is the
-                    // V0.2/REQ-003 extension slot.
-                    self.submit_input(PromptMode::Queue)
+                    // 运行中 → steer（mode 按官方 projection 判定，AC-003-06）。
+                    let prompt_mode = if self.active_running() {
+                        PromptMode::Steer
+                    } else {
+                        PromptMode::Queue
+                    };
+                    self.submit_input(prompt_mode)
                 } else {
-                    self.mode = Mode::Normal;
                     vec![]
                 }
             }
-            C::OpenSelected => self.open_session_from_selection(),
+            C::HistoryPrev => {
+                if self.mode == Mode::Insert {
+                    self.composer_history_prev()
+                } else {
+                    vec![]
+                }
+            }
+            C::HistoryNext => {
+                if self.mode == Mode::Insert {
+                    self.composer_history_next()
+                } else {
+                    vec![]
+                }
+            }
+            C::StartSearch => {
+                if self.mode == Mode::Normal {
+                    self.open_search();
+                }
+                vec![]
+            }
+            // SEARCH 两段式：编辑段（未锁定）n/N/y/j/k 是输入字符；Enter 后
+            // 结果巡览段（锁定）才是命令（AC-003-05 与「输入实时过滤」兼容）。
+            C::SearchNext => {
+                if self.mode == Mode::Search && !self.search.results_locked {
+                    self.search_input("n")
+                } else {
+                    self.search_next(1)
+                }
+            }
+            C::SearchPrev => {
+                if self.mode == Mode::Search && !self.search.results_locked {
+                    self.search_input("N")
+                } else {
+                    self.search_next(-1)
+                }
+            }
+            C::VisualStart { line } => {
+                if self.mode == Mode::Normal {
+                    self.start_visual(line);
+                }
+                vec![]
+            }
+            C::VisualYank => self.visual_yank(),
+            C::YankContext => match self.mode {
+                Mode::Visual => self.visual_yank(),
+                // SEARCH 中 `y` 复制当前命中（代码块 → 整块，AC-003-03）；
+                // 编辑段先作为输入字符。
+                Mode::Search if !self.search.results_locked => self.search_input("y"),
+                Mode::Search => self.search_yank(),
+                _ => self.context_yank(),
+            },
+            C::OpenOutline => {
+                if self.mode == Mode::Normal {
+                    self.outline.open = true;
+                    self.outline.selection = 0;
+                }
+                vec![]
+            }
+            C::NextTurn => self.jump_turn(1),
+            C::PrevTurn => self.jump_turn(-1),
+            C::OpenSelected => match self.focus {
+                Focus::Sidebar => self.open_session_from_selection(),
+                // Center 焦点：`o`/`Enter` 打开光标处链接；非链接 no-op 提示
+                // （D-19，AC-003-04/20）。
+                _ => self.open_external_at_cursor(),
+            },
             C::StopRunning => self.request_stop(),
             C::CollapseProject => {
                 for workspace in &self.workspaces.workspaces {
@@ -920,14 +1529,32 @@ impl AppState {
                 self.collapsed_workspaces.clear();
                 vec![]
             }
-            C::PickerConfirm => {
-                let chosen = self.picker_selected_session();
-                self.mode = Mode::Normal;
-                self.picker.open = false;
-                match chosen {
-                    Some(sid) => self.open_session(sid),
-                    None => vec![],
+            C::PickerConfirm => match self.mode {
+                Mode::Picker => {
+                    let chosen = self.picker_selected_session();
+                    self.mode = Mode::Normal;
+                    self.picker.open = false;
+                    match chosen {
+                        Some(sid) => self.open_session(sid),
+                        None => vec![],
+                    }
                 }
+                Mode::Search => self.search_confirm(),
+                // APPROVAL 仅 y/n/q/Esc/a（§3 键位边界；Enter 无语义，no-op）。
+                Mode::Normal if self.outline.open => self.outline_confirm(),
+                _ => vec![],
+            },
+            C::ApprovalAllow => self.approval_decide(ApprovalOutcome::AllowedOnce),
+            C::ApprovalReject => self.approval_decide(ApprovalOutcome::Rejected),
+            C::ApprovalCancel => self.approval_decide(ApprovalOutcome::Cancelled),
+            C::ApprovalAlways => {
+                // `a` 非 outcome 词表：TUI 不代远端切换 approval/policy=never
+                // （REQ-I04 V0.4），只显示指引（D-18）。
+                self.approval.toast = Some(
+                    "始终允许需在官方 web 策略设置中切换（approval/policy=never，V0.4）"
+                        .to_string(),
+                );
+                vec![]
             }
             C::OpenSession(sid) => self.open_session(sid),
             C::OpenHelp => {
@@ -947,7 +1574,15 @@ impl AppState {
                 vec![]
             }
             C::ToggleWorkspace => vec![],
-            C::Quit => self.quit(),
+            C::Quit => {
+                if self.mode == Mode::Approval {
+                    // APPROVAL 中 `q` = 中止当前审批（cancelled），不退出
+                    // （REQ-003 §3 `q` 键位边界）。
+                    self.approval_decide(ApprovalOutcome::Cancelled)
+                } else {
+                    self.quit()
+                }
+            }
             C::RetryProbe => {
                 self.conn = ConnState::Connecting;
                 self.startup_guidance = None;
@@ -955,6 +1590,316 @@ impl AppState {
             }
             C::Resize { width, height } => self.handle(AppEvent::Resize { width, height }),
         }
+    }
+
+    // ---------- REQ-003: search / visual / approval / outline helpers ----------
+
+    fn open_search(&mut self) {
+        self.mode = Mode::Search;
+        self.search.open = true;
+        self.search.query.clear();
+        self.search.window_matches.clear();
+        self.search.cursor = 0;
+        self.search.history_hits.clear();
+        self.search.history_selection = 0;
+        self.search.history_error = None;
+        self.search.history_hint = None;
+        self.search.results_locked = false;
+        // 打开即作废在途搜索（generation 递增 → 旧触发/结果全部丢弃）。
+        self.search.history_generation = self.search.history_generation.wrapping_add(1);
+    }
+
+    fn close_search(&mut self) {
+        self.mode = Mode::Normal;
+        self.search.open = false;
+        self.search.history_generation = self.search.history_generation.wrapping_add(1);
+        self.search.history_loading = false;
+        self.search.results_locked = false;
+    }
+
+    fn search_input(&mut self, text: &str) -> Vec<Cmd> {
+        self.search.query.push_str(text);
+        // 输入变更 → 回到编辑段（n/N/y/j/k 恢复为字符输入）。
+        self.search.results_locked = false;
+        self.recompute_window_matches();
+        self.schedule_history_search()
+    }
+
+    fn search_input_backspace(&mut self) -> Vec<Cmd> {
+        self.search.query.pop();
+        self.search.results_locked = false;
+        self.recompute_window_matches();
+        self.schedule_history_search()
+    }
+
+    /// 300ms 防抖 + generation 守卫（AC-003-14：快速连续输入只保留最新；
+    /// 空查询/纯前缀不发 `session/search`，AC-003-19）。
+    fn schedule_history_search(&mut self) -> Vec<Cmd> {
+        let (_, term) = self.search.terms();
+        let term = term.trim().to_string();
+        if term.is_empty() {
+            self.search.history_generation = self.search.history_generation.wrapping_add(1);
+            self.search.history_loading = false;
+            return vec![];
+        }
+        self.search.history_generation = self.search.history_generation.wrapping_add(1);
+        let generation = self.search.history_generation;
+        vec![Cmd::DebounceSearch {
+            query: term,
+            generation,
+        }]
+    }
+
+    fn search_next(&mut self, delta: i64) -> Vec<Cmd> {
+        if self.mode != Mode::Search || self.search.window_matches.is_empty() {
+            return vec![];
+        }
+        let total = self.search.window_matches.len() as i64;
+        let cur = self.search.cursor as i64;
+        self.search.cursor = ((cur + delta).rem_euclid(total)) as usize;
+        self.jump_to_current_match();
+        vec![]
+    }
+
+    /// 跳到当前窗口命中所在块（滚动视口 + 焦点块游标）。
+    fn jump_to_current_match(&mut self) {
+        let Some(item_index) = self.search.window_matches.get(self.search.cursor).copied() else {
+            return;
+        };
+        let Some(item) = self.search_index.items().get(item_index) else {
+            return;
+        };
+        let Some(idx) = self.active_window().and_then(|w| w.offset_of(item.seq)) else {
+            return;
+        };
+        self.viewport.follow_tail = false;
+        self.viewport.offset = idx;
+        self.cursor_block = idx;
+    }
+
+    /// Enter 语义（D-17/AC-003-03）：历史命中选中项优先 → 打开命中会话，
+    /// 并以 snippet 作为窗口内二次定位词（快照到达后 window_changed 自动
+    /// 重算命中并高亮）；否则跳到窗口首个匹配。Enter 同时锁定结果巡览段
+    /// （n/N/y/j/k 恢复为命令，AC-003-05）。
+    fn search_confirm(&mut self) -> Vec<Cmd> {
+        self.search.results_locked = true;
+        if let Some(hit) = self.search.history_hits.get(self.search.history_selection) {
+            let sid = hit.session_id.clone();
+            // snippet 截取为可检索词：去掉截断省略号与首尾空白（服务端
+            // ≤240 码点截断后缀 "…"，模糊匹配需按原文词面）。
+            let snippet = hit
+                .snippet
+                .trim()
+                .trim_matches(|c: char| c == '…' || c == '.')
+                .trim()
+                .to_string();
+            let cmds = self.open_session(sid);
+            // 重新打开窗口内搜索 overlay：snippet 二次定位（D-17 收缩）。
+            self.open_search();
+            self.search.query = snippet.clone();
+            self.recompute_window_matches();
+            // 全历史词仍按原查询保留（不重复触发 session/search）。
+            return cmds;
+        }
+        if let Some(item_index) = self.search.window_matches.first().copied() {
+            let item = &self.search_index.items()[item_index];
+            if let Some(idx) = self.active_window().and_then(|w| w.offset_of(item.seq)) {
+                self.viewport.follow_tail = false;
+                self.viewport.offset = idx;
+                self.cursor_block = idx;
+                self.search.cursor = 0;
+            }
+        }
+        vec![]
+    }
+
+    fn start_visual(&mut self, line: bool) {
+        let len = self.active_window().map(|w| w.len()).unwrap_or(0);
+        if len == 0 {
+            return;
+        }
+        self.cursor_block = self.cursor_block.min(len - 1);
+        self.yank.visual = Some(VisualSelection {
+            anchor: self.cursor_block,
+            cursor: self.cursor_block,
+            mode: if line {
+                VisualMode::Line
+            } else {
+                VisualMode::Char
+            },
+        });
+        self.mode = Mode::Visual;
+    }
+
+    /// VISUAL `y`：按选择复制并退出（AC-003-12）。
+    fn visual_yank(&mut self) -> Vec<Cmd> {
+        if self.mode != Mode::Visual {
+            return vec![];
+        }
+        let Some(sel) = self.yank.visual.clone() else {
+            return vec![];
+        };
+        let blocks = self
+            .active_window()
+            .map(|w| w.block_snapshot())
+            .unwrap_or_default();
+        let Some(text) = selection_text(&blocks, &sel) else {
+            self.yank.visual = None;
+            self.mode = Mode::Normal;
+            return vec![];
+        };
+        self.yank.visual = None;
+        self.mode = Mode::Normal;
+        self.copy_text(text)
+    }
+
+    /// NORMAL `y`：上下文 yank（代码块/链接/图片/工具结果/段落，Notes/04 §4.4）。
+    fn context_yank(&mut self) -> Vec<Cmd> {
+        let Some(block) = self
+            .active_window()
+            .and_then(|w| w.block(self.cursor_block))
+        else {
+            return vec![];
+        };
+        let Some(target) = block_yank_target(block) else {
+            self.last_error = Some("此处无可复制内容".to_string());
+            return vec![];
+        };
+        self.copy_text(target.content().to_string())
+    }
+
+    /// SEARCH 模式 `y`：复制当前窗口命中（代码块 → 整块，AC-003-03）。
+    fn search_yank(&mut self) -> Vec<Cmd> {
+        let Some(item_index) = self.search.window_matches.get(self.search.cursor).copied() else {
+            return vec![];
+        };
+        let Some(item) = self.search_index.items().get(item_index) else {
+            return vec![];
+        };
+        self.copy_text(item.text.clone())
+    }
+
+    fn copy_text(&mut self, text: String) -> Vec<Cmd> {
+        self.yank.last = Some(text.clone());
+        vec![Cmd::CopyToClipboard { text }]
+    }
+
+    /// `o`/`Enter`（Center 焦点）：光标块含 URL → 系统打开；否则 no-op 提示
+    /// （AC-003-04/20）。
+    fn open_external_at_cursor(&mut self) -> Vec<Cmd> {
+        let Some(block) = self
+            .active_window()
+            .and_then(|w| w.block(self.cursor_block))
+        else {
+            return vec![];
+        };
+        let text = block_plain_text(block);
+        if let Some((_, url)) = crate::model::search::extract_links(&text)
+            .into_iter()
+            .next()
+        {
+            return vec![Cmd::OpenExternal { target: url }];
+        }
+        self.last_error = Some("光标处没有链接（o 打开仅对链接生效）".to_string());
+        vec![]
+    }
+
+    /// 审批决策（y/n/q 共用；同一弹窗只回复一次 — 幂等，AC-003-17）。
+    fn approval_decide(&mut self, outcome: ApprovalOutcome) -> Vec<Cmd> {
+        if self.mode != Mode::Approval || self.approval.reply_inflight {
+            return vec![];
+        }
+        let Some(event) = self.approval.event.clone() else {
+            return vec![];
+        };
+        self.approval.reply_inflight = true;
+        vec![Cmd::ReplyApproval { event, outcome }]
+    }
+
+    fn outline_confirm(&mut self) -> Vec<Cmd> {
+        let Some(item) = self
+            .active_window()
+            .and_then(|w| w.turn_outline().get(self.outline.selection).cloned())
+        else {
+            return vec![];
+        };
+        let Some(seq) = item.seq else {
+            return vec![];
+        };
+        self.outline.open = false;
+        self.outline.selection = 0;
+        self.jump_to_seq(seq)
+    }
+
+    /// `]`/`[`：turnOutline 下一/上一轮（AC-003-09）。
+    fn jump_turn(&mut self, delta: i64) -> Vec<Cmd> {
+        let Some(outline) = self.active_window().map(|w| w.turn_outline().to_vec()) else {
+            return vec![];
+        };
+        if outline.is_empty() {
+            return vec![];
+        }
+        let focused_seq = self
+            .active_window()
+            .and_then(|w| w.block(self.cursor_block))
+            .map(|b| b.seq())
+            .unwrap_or(SessionSeq(0));
+        // 当前轮 = 最后一个 seq <= 焦点 seq 的条目。
+        let cur = outline
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.seq.is_some_and(|s| s <= focused_seq))
+            .map(|(i, _)| i)
+            .next_back()
+            .unwrap_or(0);
+        let total = outline.len() as i64;
+        let next = (cur as i64 + delta).clamp(0, total - 1) as usize;
+        match outline[next].seq {
+            Some(seq) => self.jump_to_seq(seq),
+            None => vec![],
+        }
+    }
+
+    /// 跳转目标 seq：窗口已含 → 直接落位；否则 loadThrough 逐页拉取，
+    /// 目标记录在 `load_through_target`（每页合并后 reducer 判断落位）。
+    fn jump_to_seq(&mut self, seq: SessionSeq) -> Vec<Cmd> {
+        if self.scroll_to_seq(seq) {
+            if let Some(idx) = self.active_window().and_then(|w| w.offset_of(seq)) {
+                self.cursor_block = idx;
+            }
+            vec![]
+        } else {
+            self.load_through_target = Some(seq);
+            self.load_through_pages = 0;
+            vec![Cmd::LoadThrough { seq }]
+        }
+    }
+
+    fn composer_history_prev(&mut self) -> Vec<Cmd> {
+        let current = self
+            .draft
+            .as_ref()
+            .map(|d| d.text.clone())
+            .unwrap_or_default();
+        if let Some(text) = self.history.prev(&current) {
+            let text = text.to_string();
+            if let Some(d) = self.draft.as_mut() {
+                d.text = text.clone();
+                d.cursor = text.chars().count();
+            }
+        }
+        vec![]
+    }
+
+    fn composer_history_next(&mut self) -> Vec<Cmd> {
+        if let Some(text) = self.history.next_entry() {
+            let text = text.to_string();
+            if let Some(d) = self.draft.as_mut() {
+                d.text = text.clone();
+                d.cursor = text.chars().count();
+            }
+        }
+        vec![]
     }
 
     fn scroll(&mut self, cmd: crate::input::Command) -> Vec<Cmd> {
@@ -993,6 +1938,8 @@ impl AppState {
             }
             _ => {}
         }
+        // 焦点块游标随视口移动（上下文 yank/视觉选择/跳轮的锚）。
+        self.cursor_block = self.viewport.offset.min(len.saturating_sub(1));
         cmds
     }
 
@@ -1016,16 +1963,32 @@ impl AppState {
     }
 
     fn open_session(&mut self, sid: SessionId) -> Vec<Cmd> {
+        // 会话切换：把编辑中的草稿存入注册表（D-20 跨会话保留，仅内存）。
+        if let Some(d) = self.draft.take() {
+            self.drafts.set(d);
+        }
         self.active_session = Some(sid.clone());
         self.viewport.follow_tail = true;
-        // Close the composer on session switch (the draft stays bound to its
-        // session, D-11).
+        self.cursor_block = 0;
         self.composer.visible = false;
+        self.composer.steer = false;
         self.composer.active_session = Some(sid.clone());
-        vec![Cmd::OpenFollow {
-            session_id: sid,
-            max_messages: self.window_cap,
-        }]
+        // 关掉内容 overlay（搜索/大纲），回到 NORMAL 内容浏览态。
+        if self.mode == Mode::Search {
+            self.close_search();
+        }
+        self.outline.open = false;
+        self.yank.visual = None;
+        self.search_index.rebuild(&[]);
+        self.search.window_matches.clear();
+        // REQ-003：打开会话同时订阅 control 流（运行/steer 瞬态投影）。
+        vec![
+            Cmd::OpenFollow {
+                session_id: sid.clone(),
+                max_messages: self.window_cap,
+            },
+            Cmd::OpenControl { session_id: sid },
+        ]
     }
 
     fn open_session_from_selection(&mut self) -> Vec<Cmd> {
@@ -1772,5 +2735,804 @@ mod tests {
             ]
         );
         assert!(s.exited);
+    }
+
+    // ---------- REQ-003：搜索 / 视觉 / 审批 / 大纲 / steer / 草稿（Step 4 Prototype PASS 条件） ----------
+
+    fn assistant_md(s: &mut AppState, sid: &str, seq: u64, md: &str) {
+        // 助手内容走 chunk 行到达（REQ-001 窗口模型：assistant 事件先建块，
+        // 文本经 FollowChunks 打包）。
+        let record = SessionHistoryRecord::Event {
+            event: SessionWireEvent {
+                event_type: "assistant/message".into(),
+                seq: Some(SessionSeq(seq)),
+                time: None,
+                request_id: None,
+                ignorable: None,
+                source_event_seqs: None,
+                surface_op: None,
+                data: Some(serde_json::json!({ "content": md })),
+            },
+        };
+        s.handle(AppEvent::FollowSnapshot {
+            session_id: SessionId(sid.into()),
+            cursor: Some(SessionLogOffset(seq)),
+            records: vec![record],
+            has_more: true,
+            projections: Some(serde_json::json!({"running": false})),
+        });
+        s.handle(AppEvent::FollowChunks {
+            session_id: SessionId(sid.into()),
+            row: ChunkRow::TextChunks(crate::api::types::ChunkData {
+                texts: vec![md.to_string()],
+                ..Default::default()
+            }),
+        });
+    }
+
+    #[test]
+    fn search_empty_query_never_sends_ac003_19() {
+        let mut s = AppState::default();
+        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        assistant_md(&mut s, "s1", 1, "hello world");
+        // 打开搜索：空查询不产生任何搜索命令（AC-003-19）。
+        s.handle_command(C::StartSearch);
+        assert!(s.search.query.is_empty());
+        let cmds = s.handle_command(C::PickerInput(" ".into()));
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Cmd::DebounceSearch { .. })),
+            "空/纯空白查询不发搜索: {cmds:?}"
+        );
+        // 输入真实词：恰好一个防抖命令。
+        let cmds = s.handle_command(C::PickerInput("hello".into()));
+        assert_eq!(
+            cmds.iter()
+                .filter(|c| matches!(c, Cmd::DebounceSearch { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn search_debounce_keeps_only_latest_generation_ac003_14() {
+        let mut s = AppState::default();
+        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        assistant_md(&mut s, "s1", 1, "alpha beta");
+        s.handle_command(C::StartSearch);
+        s.handle_command(C::PickerInput("a".into()));
+        s.handle_command(C::PickerInput("b".into()));
+        // 连续输入：generation 递增，stale 防抖触发被丢弃。
+        let stale = s.handle(AppEvent::SearchHistoryDebounced {
+            query: "a".into(),
+            generation: s.search.history_generation - 1,
+        });
+        assert!(stale.is_empty(), "stale 防抖触发丢弃");
+        // 最新 generation 才发出 session/search。
+        let fresh = s.handle(AppEvent::SearchHistoryDebounced {
+            query: "ab".into(),
+            generation: s.search.history_generation,
+        });
+        assert_eq!(
+            fresh
+                .iter()
+                .filter(|c| matches!(c, Cmd::SearchSessions { .. }))
+                .count(),
+            1,
+            "最新 generation 恰好一次搜索"
+        );
+        assert!(s.search.history_loading);
+        // 快速改词：旧结果到达时 generation 已变 → 丢弃，不覆盖。
+        s.handle_command(C::PickerInput("c".into()));
+        s.handle(AppEvent::SearchResult {
+            generation: s.search.history_generation - 1,
+            items: vec![],
+            has_more: false,
+        });
+        assert!(s.search.history_loading, "stale 结果不解除 loading");
+        // 最新结果正常落地。
+        s.handle(AppEvent::SearchResult {
+            generation: s.search.history_generation,
+            items: vec![],
+            has_more: false,
+        });
+        assert!(!s.search.history_loading);
+    }
+
+    #[test]
+    fn context_yank_code_block_copies_whole_block_ac003_03_12() {
+        let mut s = AppState::default();
+        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        assistant_md(&mut s, "s1", 1, "```rust\nfn main() {}\n```\n\n其它文本");
+        let cmds = s.handle_command(C::YankContext);
+        assert_eq!(cmds.len(), 1);
+        let Cmd::CopyToClipboard { text } = &cmds[0] else {
+            panic!("预期 CopyToClipboard，得到 {cmds:?}")
+        };
+        assert_eq!(text, "fn main() {}\n", "代码块整块复制");
+        assert_eq!(s.yank.last.as_deref(), Some("fn main() {}\n"));
+    }
+
+    #[test]
+    fn visual_selection_v_y_copies_blocks_ac003_12() {
+        let mut s = AppState::default();
+        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle(AppEvent::FollowSnapshot {
+            session_id: SessionId("s1".into()),
+            cursor: Some(SessionLogOffset(3)),
+            records: (1..=3)
+                .map(|n| SessionHistoryRecord::Event {
+                    event: SessionWireEvent {
+                        event_type: "user/message".into(),
+                        seq: Some(SessionSeq(n)),
+                        time: None,
+                        request_id: None,
+                        ignorable: None,
+                        source_event_seqs: None,
+                        surface_op: None,
+                        data: Some(serde_json::json!({"content": format!("行{n}")})),
+                    },
+                })
+                .collect(),
+            has_more: false,
+            projections: Some(serde_json::json!({"running": false})),
+        });
+        // v 进入 VISUAL（字符模式，锚=焦点块）。
+        s.handle_command(C::VisualStart { line: false });
+        assert_eq!(s.mode, Mode::Visual);
+        // j 扩展（行模式才跨块；字符模式单块）。
+        s.handle_command(C::MoveDown);
+        let cmds = s.handle_command(C::YankContext);
+        assert_eq!(s.mode, Mode::Normal, "复制后退出 VISUAL");
+        assert_eq!(cmds.len(), 1);
+        assert!(matches!(cmds[0], Cmd::CopyToClipboard { .. }));
+        assert!(s.yank.last.is_some());
+        // V 行模式跨块复制。
+        s.handle_command(C::VisualStart { line: true });
+        s.handle_command(C::MoveDown);
+        let cmds = s.handle_command(C::YankContext);
+        let Cmd::CopyToClipboard { text } = &cmds[0] else {
+            panic!()
+        };
+        assert!(text.contains('\n'), "行模式跨块: {text}");
+    }
+
+    #[test]
+    fn approval_arrives_forces_mode_replies_once_and_restores_ac003_07_17() {
+        let mut s = AppState::default();
+        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle(snapshot("s1", false));
+        let ev = ApprovalEvent {
+            client_id: "c-1".into(),
+            event_id: "e-1".into(),
+            raw: serde_json::json!({"type": "approval/request", "reason": "x"}),
+        };
+        // 审批到达：强制 APPROVAL。
+        assert!(s
+            .handle(AppEvent::ApprovalRequest { event: ev.clone() })
+            .is_empty());
+        assert_eq!(s.mode, Mode::Approval);
+        assert_eq!(s.approval.prev_mode, Mode::Normal);
+        // 重复投递同 event_id：幂等忽略（模式 15 去重）。
+        s.handle(AppEvent::ApprovalRequest { event: ev.clone() });
+        assert!(s.approval.visible);
+        // y → 恰好一次 ReplyApproval；回复中再按 n 不产生第二次。
+        let cmds = s.handle_command(C::ApprovalAllow);
+        assert_eq!(cmds.len(), 1);
+        assert!(
+            matches!(&cmds[0], Cmd::ReplyApproval { outcome, .. } if *outcome == ApprovalOutcome::AllowedOnce)
+        );
+        assert!(s.approval.reply_inflight);
+        assert!(
+            s.handle_command(C::ApprovalReject).is_empty(),
+            "in-flight 幂等"
+        );
+        // 回复成功：回先前模式，运行状态不丢。
+        s.handle(AppEvent::ApprovalReplied {
+            outcome: ApprovalOutcome::AllowedOnce,
+        });
+        assert_eq!(s.mode, Mode::Normal);
+        assert!(!s.approval.visible);
+        assert_eq!(s.approval.last_outcome, Some(ApprovalOutcome::AllowedOnce));
+        // 再次事件（新 event_id）可再次决策（恢复路径）。
+        let ev2 = ApprovalEvent {
+            client_id: "c-1".into(),
+            event_id: "e-2".into(),
+            raw: serde_json::json!({"type": "approval/request"}),
+        };
+        s.handle(AppEvent::ApprovalRequest { event: ev2 });
+        assert_eq!(s.mode, Mode::Approval);
+        assert_eq!(
+            s.handle_command(C::ApprovalReject).len(),
+            1,
+            "新事件可再次回复"
+        );
+    }
+
+    #[test]
+    fn approval_q_esc_are_cancel_not_quit_ac003_07() {
+        let mut s = AppState::default();
+        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle(snapshot("s1", true));
+        s.handle(AppEvent::ApprovalRequest {
+            event: ApprovalEvent {
+                client_id: "c".into(),
+                event_id: "e".into(),
+                raw: serde_json::json!({"type": "approval/request"}),
+            },
+        });
+        // q 在 APPROVAL = cancelled 决策（不退出）。
+        let cmds = s.handle_command(C::Quit);
+        assert_eq!(cmds.len(), 1);
+        assert!(
+            matches!(&cmds[0], Cmd::ReplyApproval { outcome, .. } if *outcome == ApprovalOutcome::Cancelled)
+        );
+        assert!(!s.exited, "q 不退出程序");
+    }
+
+    #[test]
+    fn approval_reply_failure_fails_closed_with_waiting_hint_ac003_17_18() {
+        let mut s = AppState::default();
+        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle(snapshot("s1", false));
+        s.handle(AppEvent::ApprovalRequest {
+            event: ApprovalEvent {
+                client_id: "c".into(),
+                event_id: "e".into(),
+                raw: serde_json::json!({"type": "approval/request"}),
+            },
+        });
+        s.handle_command(C::ApprovalAllow);
+        // 回复失败：不授权（fail closed），弹窗收缩为等待审批，回到先前模式。
+        s.handle(AppEvent::ApprovalReplyFailed {
+            outcome: ApprovalOutcome::AllowedOnce,
+            error: ClientError::Transport("eof".into()),
+        });
+        assert!(s.approval.waiting_hint);
+        assert!(!s.approval.visible);
+        assert_eq!(s.mode, Mode::Normal);
+        assert!(
+            s.last_error.as_deref().unwrap_or("").contains("官方 web"),
+            "指引官方 web 完成"
+        );
+        // 恢复路径：下一个新事件仍可正常决策（不被旧失败污染）。
+        s.handle(AppEvent::ApprovalRequest {
+            event: ApprovalEvent {
+                client_id: "c".into(),
+                event_id: "e2".into(),
+                raw: serde_json::json!({"type": "approval/request"}),
+            },
+        });
+        assert_eq!(s.mode, Mode::Approval);
+        assert!(!s.approval.waiting_hint);
+        assert_eq!(s.handle_command(C::ApprovalAllow).len(), 1);
+    }
+
+    #[test]
+    fn steer_mode_reads_official_running_projection_ac003_06() {
+        let mut s = AppState::default();
+        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle(snapshot("s1", true)); // 官方投影 running
+        s.handle_command(C::InsertMode);
+        assert!(s.composer.steer, "运行中 i → steer");
+        // 发送使用 mode:"steer"。
+        s.handle_command(C::PickerInput("追加".into()));
+        let cmds = s.handle_command(C::SubmitInput);
+        let Cmd::SendPrompt { request, .. } = &cmds[0] else {
+            panic!()
+        };
+        assert_eq!(request.mode, PromptMode::Steer);
+        // 未运行 → queue（REQ-002 原义）。
+        let mut s2 = AppState::default();
+        s2.handle_command(C::OpenSession(SessionId("s1".into())));
+        s2.handle(snapshot("s1", false));
+        s2.handle_command(C::InsertMode);
+        assert!(!s2.composer.steer);
+        s2.handle_command(C::PickerInput("排队".into()));
+        let cmds = s2.handle_command(C::SubmitInput);
+        let Cmd::SendPrompt { request, .. } = &cmds[0] else {
+            panic!()
+        };
+        assert_eq!(request.mode, PromptMode::Queue);
+    }
+
+    #[test]
+    fn steer_unavailable_keeps_draft_and_hints_ac003_16() {
+        let mut s = AppState::default();
+        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle(snapshot("s1", true));
+        s.handle_command(C::InsertMode);
+        s.handle_command(C::PickerInput("steer-me".into()));
+        let cmds = s.handle_command(C::SubmitInput);
+        let (sid, rid) = match &cmds[0] {
+            Cmd::SendPrompt {
+                session_id,
+                request,
+            } => (session_id.clone(), request.request_id.clone()),
+            _ => panic!(),
+        };
+        s.handle(AppEvent::PromptFailed {
+            session_id: sid.clone(),
+            request_id: rid,
+            error: ClientError::Remote {
+                code: "session/steer-unavailable".into(),
+                message: "轮次已结束".into(),
+                class: ErrorClass::UserFacing,
+            },
+        });
+        assert!(
+            s.last_error
+                .as_deref()
+                .unwrap_or("")
+                .contains("steer 不可用"),
+            "状态条错误"
+        );
+        // 草稿保留（注册表），可再次 i 编辑或改排队发送（恢复路径）。
+        assert_eq!(
+            s.drafts.get(&sid).map(|d| d.text.as_str()),
+            Some("steer-me")
+        );
+        s.handle_command(C::InsertMode);
+        assert_eq!(s.draft.as_ref().map(|d| d.text.as_str()), Some("steer-me"));
+    }
+
+    #[test]
+    fn draft_survives_session_switch_and_returns_ac003_11() {
+        let mut s = AppState::default();
+        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle(snapshot("s1", false));
+        s.handle_command(C::InsertMode);
+        s.handle_command(C::PickerInput("s1 草稿".into()));
+        s.handle_command(C::ClosePicker); // Esc 收起
+                                          // 切到 s2 再切回 s1：草稿随 bound_session 保留（D-20）。
+        s.handle_command(C::OpenSession(SessionId("s2".into())));
+        s.handle(snapshot("s2", false));
+        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle_command(C::InsertMode);
+        assert_eq!(
+            s.draft.as_ref().map(|d| d.text.as_str()),
+            Some("s1 草稿"),
+            "跨会话草稿恢复（仅内存）"
+        );
+        assert_eq!(
+            s.draft.as_ref().map(|d| d.bound_session.0.as_str()),
+            Some("s1")
+        );
+    }
+
+    #[test]
+    fn input_history_up_down_ac003_10() {
+        let mut s = AppState::default();
+        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle(snapshot("s1", false));
+        // 发送两条进入历史。
+        for text in ["第一条", "第二条"] {
+            s.handle_command(C::InsertMode);
+            s.handle_command(C::PickerInput(text.into()));
+            s.handle_command(C::SubmitInput);
+        }
+        s.handle_command(C::InsertMode);
+        s.handle_command(C::PickerInput("正在编辑".into()));
+        s.handle_command(C::HistoryPrev);
+        assert_eq!(s.draft.as_ref().map(|d| d.text.as_str()), Some("第二条"));
+        s.handle_command(C::HistoryPrev);
+        assert_eq!(s.draft.as_ref().map(|d| d.text.as_str()), Some("第一条"));
+        s.handle_command(C::HistoryNext);
+        assert_eq!(s.draft.as_ref().map(|d| d.text.as_str()), Some("第二条"));
+        s.handle_command(C::HistoryNext);
+        assert_eq!(
+            s.draft.as_ref().map(|d| d.text.as_str()),
+            Some("正在编辑"),
+            "越过最新恢复原草稿"
+        );
+    }
+
+    #[test]
+    fn open_external_at_cursor_only_for_links_ac003_04_20() {
+        let mut s = AppState::default();
+        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        assistant_md(&mut s, "s1", 1, "见 [文档](https://example.com/x) 部署");
+        s.focus = Focus::Center;
+        let cmds = s.handle_command(C::OpenSelected);
+        assert_eq!(
+            cmds,
+            vec![Cmd::OpenExternal {
+                target: "https://example.com/x".into()
+            }]
+        );
+        // 光标块不含链接 → no-op 提示（不误触发系统打开）。
+        s.handle_command(C::OpenSession(SessionId("s2".into())));
+        assistant_md(&mut s, "s2", 1, "没有链接的段落");
+        s.focus = Focus::Center;
+        let cmds = s.handle_command(C::OpenSelected);
+        assert!(cmds.is_empty());
+        assert!(
+            s.last_error.as_deref().unwrap_or("").contains("没有链接"),
+            "状态条 no-op 提示"
+        );
+    }
+
+    #[test]
+    fn search_confirm_history_hit_opens_session_ac003_03() {
+        let mut s = AppState::default();
+        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        assistant_md(&mut s, "s1", 1, "hello");
+        s.handle_command(C::StartSearch);
+        // 全历史命中另一会话 → Enter 打开该会话（D-17 收缩）。
+        s.search.history_hits = vec![SearchHit {
+            session_id: SessionId("sess-9".into()),
+            snippet: "deploy 排查 …".into(),
+        }];
+        let cmds = s.handle_command(C::PickerConfirm);
+        assert_eq!(
+            cmds.iter()
+                .filter(|c| matches!(c, Cmd::OpenFollow { .. }))
+                .count(),
+            1,
+            "打开命中会话"
+        );
+        assert_eq!(s.active_session.as_ref(), Some(&SessionId("sess-9".into())));
+        // snippet 二次窗口内定位：搜索 overlay 保持打开且 query = snippet
+        // （截断省略号已去掉）。
+        assert!(s.search.open, "搜索 overlay 保持打开（二次定位）");
+        assert_eq!(s.search.query, "deploy 排查");
+        // 窗口快照到达（含命中内容）→ 窗口内即时命中自动重算并高亮。
+        assistant_md(&mut s, "sess-9", 10, "deploy 排查 的结论在这里");
+        assert!(
+            !s.search.window_matches.is_empty(),
+            "snippet 在窗口内二次定位命中"
+        );
+        assert_eq!(s.search.cursor, 0);
+        // Esc 关闭搜索，会话保持打开。
+        s.handle_command(C::ClosePicker);
+        assert!(!s.search.open);
+        assert_eq!(s.active_session.as_ref(), Some(&SessionId("sess-9".into())));
+    }
+
+    #[test]
+    fn outline_jump_turn_uses_load_through_when_not_loaded_ac003_09() {
+        let mut s = AppState::default();
+        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle(AppEvent::FollowSnapshot {
+            session_id: SessionId("s1".into()),
+            cursor: Some(SessionLogOffset(50)),
+            records: (41..=50)
+                .map(|n| SessionHistoryRecord::Event {
+                    event: SessionWireEvent {
+                        event_type: "assistant/message".into(),
+                        seq: Some(SessionSeq(n)),
+                        time: None,
+                        request_id: None,
+                        ignorable: None,
+                        source_event_seqs: None,
+                        surface_op: None,
+                        data: Some(serde_json::json!({"content": format!("轮{n}")})),
+                    },
+                })
+                .collect(),
+            has_more: true,
+            projections: Some(serde_json::json!({
+                "running": false,
+                "turnOutline": [
+                    {"turn": 1, "seq": 5, "prompt": "早轮"},
+                    {"turn": 2, "seq": 45, "prompt": "近轮"}
+                ]
+            })),
+        });
+        // 窗口已含 seq 45 → ] 跳转直接落位。
+        let cmds = s.handle_command(C::NextTurn);
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Cmd::LoadThrough { .. })),
+            "已加载轮直接落位: {cmds:?}"
+        );
+        assert_eq!(
+            s.cursor_block,
+            s.active_window()
+                .and_then(|w| w.offset_of(SessionSeq(45)))
+                .unwrap()
+        );
+        // 目标 seq 5 未加载 → loadThrough 分页。
+        let cmds = s.handle_command(C::PrevTurn);
+        assert_eq!(cmds, vec![Cmd::LoadThrough { seq: SessionSeq(5) }]);
+        // LoadThroughPage 合并后（seq 去重，REQ-001）窗口无重复无空洞。
+        let before = s.active_window().unwrap().len();
+        s.handle(AppEvent::LoadThroughPage {
+            session_id: SessionId("s1".into()),
+            records: (1..=40)
+                .map(|n| SessionHistoryRecord::Event {
+                    event: SessionWireEvent {
+                        event_type: "assistant/message".into(),
+                        seq: Some(SessionSeq(n)),
+                        time: None,
+                        request_id: None,
+                        ignorable: None,
+                        source_event_seqs: None,
+                        surface_op: None,
+                        data: Some(serde_json::json!({"content": format!("轮{n}")})),
+                    },
+                })
+                .collect(),
+            has_more: Some(false),
+        });
+        let after = s.active_window().unwrap().len();
+        assert_eq!(after, before + 40, "seq 去重合并无重复: {before}→{after}");
+        // 落位：目标 seq 5 已在窗口内 → 游标落位、loadThrough 结束。
+        assert_eq!(
+            s.cursor_block,
+            s.active_window()
+                .and_then(|w| w.offset_of(SessionSeq(5)))
+                .unwrap(),
+            "loadThrough 完成后按 seq 落位（AC-003-09）"
+        );
+        assert!(s.load_through_target.is_none());
+    }
+
+    #[test]
+    fn load_through_requeues_until_target_covered_ac003_09() {
+        let mut s = AppState::default();
+        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle(AppEvent::FollowSnapshot {
+            session_id: SessionId("s1".into()),
+            cursor: Some(SessionLogOffset(100)),
+            records: (81..=100)
+                .map(|n| SessionHistoryRecord::Event {
+                    event: SessionWireEvent {
+                        event_type: "user/message".into(),
+                        seq: Some(SessionSeq(n)),
+                        time: None,
+                        request_id: None,
+                        ignorable: None,
+                        source_event_seqs: None,
+                        surface_op: None,
+                        data: Some(serde_json::json!({"content": format!("轮{n}")})),
+                    },
+                })
+                .collect(),
+            has_more: true,
+            projections: Some(serde_json::json!({
+                "turnOutline": [{"turn": 1, "seq": 10, "prompt": "很早就轮"}]
+            })),
+        });
+        let cmds = s.handle_command(C::NextTurn);
+        assert_eq!(
+            cmds,
+            vec![Cmd::LoadThrough {
+                seq: SessionSeq(10)
+            }]
+        );
+        // 第一页（seq 41..=80）未覆盖目标 10 且有更多历史 → reducer 续页。
+        let cmds = s.handle(AppEvent::LoadThroughPage {
+            session_id: SessionId("s1".into()),
+            records: (41..=80)
+                .map(|n| SessionHistoryRecord::Event {
+                    event: SessionWireEvent {
+                        event_type: "user/message".into(),
+                        seq: Some(SessionSeq(n)),
+                        time: None,
+                        request_id: None,
+                        ignorable: None,
+                        source_event_seqs: None,
+                        surface_op: None,
+                        data: Some(serde_json::json!({"content": format!("轮{n}")})),
+                    },
+                })
+                .collect(),
+            has_more: Some(true),
+        });
+        assert_eq!(
+            cmds,
+            vec![Cmd::LoadThrough {
+                seq: SessionSeq(10)
+            }],
+            "未覆盖且有更多历史 → 续页（逐页命令，不阻塞渲染）"
+        );
+        assert_eq!(s.load_through_pages, 1);
+        // 第二页覆盖目标 → 落位并结束。
+        let cmds = s.handle(AppEvent::LoadThroughPage {
+            session_id: SessionId("s1".into()),
+            records: (1..=40)
+                .map(|n| SessionHistoryRecord::Event {
+                    event: SessionWireEvent {
+                        event_type: "user/message".into(),
+                        seq: Some(SessionSeq(n)),
+                        time: None,
+                        request_id: None,
+                        ignorable: None,
+                        source_event_seqs: None,
+                        surface_op: None,
+                        data: Some(serde_json::json!({"content": format!("轮{n}")})),
+                    },
+                })
+                .collect(),
+            has_more: Some(false),
+        });
+        assert!(cmds.is_empty(), "覆盖后结束: {cmds:?}");
+        assert_eq!(
+            s.cursor_block,
+            s.active_window()
+                .and_then(|w| w.offset_of(SessionSeq(10)))
+                .unwrap()
+        );
+        assert!(s.load_through_target.is_none());
+    }
+
+    #[test]
+    fn approval_pending_projection_shows_waiting_hint_ac003_18() {
+        // 目标版本不转发 approval/request：官方投影出现待审批信号 → 状态条
+        // 等待审批（弹窗不出现、不阻塞）。
+        let mut s = AppState::default();
+        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle(AppEvent::FollowSnapshot {
+            session_id: SessionId("s1".into()),
+            cursor: Some(SessionLogOffset(0)),
+            records: vec![],
+            has_more: false,
+            projections: Some(serde_json::json!({"running": true, "awaitingApproval": true})),
+        });
+        assert!(s.approval.waiting_hint, "投影待审批信号 → 状态条等待审批");
+        assert!(!s.approval.visible);
+        // 投影清除 → hint 消失；弹窗事件路径不受影响。
+        s.handle(AppEvent::FollowSnapshot {
+            session_id: SessionId("s1".into()),
+            cursor: Some(SessionLogOffset(0)),
+            records: vec![],
+            has_more: false,
+            projections: Some(serde_json::json!({"running": false, "awaitingApproval": false})),
+        });
+        assert!(!s.approval.waiting_hint);
+        // 弹窗事件到达 → 正常审批模态（hint 关闭）。
+        s.handle(AppEvent::ApprovalRequest {
+            event: ApprovalEvent {
+                client_id: "c".into(),
+                event_id: "e".into(),
+                raw: serde_json::json!({"type": "approval/request"}),
+            },
+        });
+        assert!(s.approval.visible);
+        assert!(!s.approval.waiting_hint);
+        // 判定函数形状容忍：字符串/数组也识别；缺失/false 不识别。
+        assert!(projections_await_approval(
+            &serde_json::json!({"pendingApproval": "awaiting"})
+        ));
+        assert!(projections_await_approval(
+            &serde_json::json!({"approvalPending": [1]})
+        ));
+        assert!(!projections_await_approval(
+            &serde_json::json!({"running": true})
+        ));
+    }
+
+    #[test]
+    fn search_permission_error_does_not_retry_window_search_unaffected_ac003_13() {
+        let mut s = AppState::default();
+        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        assistant_md(&mut s, "s1", 1, "deploy the operator");
+        s.handle_command(C::StartSearch);
+        s.handle_command(C::PickerInput("deploy".into()));
+        let gen = s.search.history_generation;
+        s.handle(AppEvent::SearchError {
+            generation: gen,
+            error: ClientError::Remote {
+                code: "PERMISSION_DENIED".into(),
+                message: "无权限".into(),
+                class: ErrorClass::PermissionDenied,
+            },
+        });
+        assert!(
+            s.search
+                .history_error
+                .as_deref()
+                .unwrap_or("")
+                .contains("权限"),
+            "权限错误提示"
+        );
+        assert!(!s.is_reconnecting(), "权限错误不触发重连");
+        // 窗口内即时搜索离线可用。
+        assert!(!s.search.window_matches.is_empty(), "窗口命中不受影响");
+        // 恢复路径：改词后可再次发起全历史搜索。
+        s.handle_command(C::PickerInput("x".into()));
+        let cmds = s.handle_command(C::PickerInput("y".into()));
+        assert_eq!(
+            cmds.iter()
+                .filter(|c| matches!(c, Cmd::DebounceSearch { .. }))
+                .count(),
+            1,
+            "恢复后可再次搜索"
+        );
+    }
+
+    #[test]
+    fn copy_done_feedback_and_unavailable_fallback_ac003_08() {
+        let mut s = AppState::default();
+        s.handle(AppEvent::CopyDone {
+            backend: YankBackend::System,
+            ok: true,
+        });
+        assert_eq!(s.yank.backend, YankBackend::System);
+        assert_eq!(s.yank.toast.as_deref(), Some("copied"));
+        // 降级失败 → Unavailable + 失败提示（不崩溃）。
+        s.handle(AppEvent::CopyDone {
+            backend: YankBackend::Osc52,
+            ok: false,
+        });
+        assert_eq!(s.yank.backend, YankBackend::Unavailable);
+        assert!(s.yank.toast.is_none());
+        assert!(
+            s.last_error
+                .as_deref()
+                .unwrap_or("")
+                .contains("剪贴板不可用"),
+            "失败提示"
+        );
+    }
+
+    #[test]
+    fn search_n_and_shift_n_cycle_matches_ac003_05() {
+        let mut s = AppState::default();
+        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle(AppEvent::FollowSnapshot {
+            session_id: SessionId("s1".into()),
+            cursor: Some(SessionLogOffset(3)),
+            records: (1..=3)
+                .map(|n| SessionHistoryRecord::Event {
+                    event: SessionWireEvent {
+                        event_type: "user/message".into(),
+                        seq: Some(SessionSeq(n)),
+                        time: None,
+                        request_id: None,
+                        ignorable: None,
+                        source_event_seqs: None,
+                        surface_op: None,
+                        data: Some(serde_json::json!({"content": format!("deploy {n}")})),
+                    },
+                })
+                .collect(),
+            has_more: false,
+            projections: Some(serde_json::json!({"running": false})),
+        });
+        s.handle_command(C::StartSearch);
+        s.handle_command(C::PickerInput("deploy".into()));
+        assert_eq!(s.search.window_matches.len(), 3, "三个窗口命中");
+        assert_eq!(s.search.cursor, 0);
+        // 编辑段：n/N 是输入字符（查询可含这些字母，AC-003-14 无吞字）。
+        assert!(!s.search.results_locked);
+        s.handle_command(C::SearchNext);
+        assert_eq!(s.search.query, "deployn", "编辑段 n 为输入字符");
+        s.handle_command(C::PickerBackspace);
+        assert_eq!(s.search.query, "deploy");
+        // Enter → 结果巡览段（锁定）：n/N 才是巡览命令（AC-003-05）。
+        s.handle_command(C::PickerConfirm);
+        assert!(s.search.results_locked);
+        s.handle_command(C::SearchNext);
+        assert_eq!(s.search.cursor, 1, "n 前进");
+        s.handle_command(C::SearchPrev);
+        assert_eq!(s.search.cursor, 0, "N 后退");
+        s.handle_command(C::SearchPrev);
+        assert_eq!(s.search.cursor, 2, "N 环绕到末尾");
+        s.handle_command(C::SearchNext);
+        assert_eq!(s.search.cursor, 0, "n 环绕回开头");
+        // 当前匹配高亮锚定：焦点块游标跳到命中块（窗口块下标，0-based）。
+        let expected_idx = s
+            .active_window()
+            .and_then(|w| w.offset_of(s.search_index.items()[s.search.window_matches[0]].seq))
+            .expect("命中块在窗口中");
+        assert_eq!(s.cursor_block, expected_idx, "游标落位命中块");
+    }
+
+    #[test]
+    fn search_yank_copies_current_match_text_ac003_03() {
+        let mut s = AppState::default();
+        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        assistant_md(&mut s, "s1", 1, "```json\n{\"k\": \"v\"}\n```\n\n说明");
+        s.handle_command(C::StartSearch);
+        s.handle_command(C::PickerInput("k".into()));
+        // Enter 锁定结果巡览段（当前命中是 code 块：索引文本 = 代码内容）。
+        s.handle_command(C::PickerConfirm);
+        assert!(s.search.results_locked);
+        let cmds = s.handle_command(C::YankContext);
+        assert_eq!(cmds.len(), 1);
+        let Cmd::CopyToClipboard { text } = &cmds[0] else {
+            panic!("预期复制, 得到 {cmds:?}")
+        };
+        assert_eq!(text, "{\"k\": \"v\"}\n", "SEARCH y 复制整块代码");
     }
 }

@@ -225,6 +225,18 @@ impl TranscriptWindow {
         self.blocks.iter()
     }
 
+    /// Index-addressable block access (REQ-003 focused-block cursor, visual
+    /// selection and context yank).
+    pub fn block(&self, index: usize) -> Option<&Block> {
+        self.blocks.get(index)
+    }
+
+    /// Copy of the window blocks (search-index rebuild input; the window is
+    /// ≤200 blocks, this is bounded).
+    pub fn block_snapshot(&self) -> Vec<Block> {
+        self.blocks.iter().cloned().collect()
+    }
+
     pub fn len(&self) -> usize {
         self.blocks.len()
     }
@@ -300,6 +312,15 @@ impl TranscriptWindow {
                 message: message.to_string(),
             };
         }
+    }
+
+    /// Echoed text of a pending send (steer-unavailable recovery puts it back
+    /// into the draft, AC-003-16).
+    pub fn echo_text(&self, request_id: &SessionRequestId) -> Option<&str> {
+        self.pending
+            .iter()
+            .find(|e| e.request_id == *request_id)
+            .map(|e| e.text.as_str())
     }
 
     /// requestId reconciliation funnel: a durable hit retires the matching

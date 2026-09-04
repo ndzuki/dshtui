@@ -38,12 +38,94 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         Style::default().fg(color).add_modifier(Modifier::BOLD),
     )];
 
-    // 模式指示（REQ-002）：INSERT 高亮；NORMAL 为默认态不重复标注。
-    if app.mode == crate::app::Mode::Insert {
+    // 模式指示（REQ-002/003）：INSERT/SEARCH/VISUAL/APPROVAL 高亮；
+    // NORMAL 为默认态不重复标注。
+    match app.mode {
+        crate::app::Mode::Insert => {
+            spans.push(Span::styled(
+                " INSERT ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            // REQ-003 AC-003-06：运行中 composer 为 steer，状态条显示 STEER。
+            if app.composer.steer {
+                spans.push(Span::styled(
+                    " STEER ",
+                    Style::default()
+                        .fg(Color::Magenta)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+        }
+        crate::app::Mode::Search => {
+            spans.push(Span::styled(
+                " SEARCH ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        crate::app::Mode::Visual => {
+            spans.push(Span::styled(
+                " VISUAL ",
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            // §4：VISUAL 选择区反色 + `selected N lines` 计数。
+            if let Some(sel) = &app.yank.visual {
+                let (start, end) = sel.range();
+                spans.push(Span::styled(
+                    format!(
+                        " selected {} lines",
+                        end.saturating_sub(start).saturating_add(1)
+                    ),
+                    Style::default().fg(Color::Magenta),
+                ));
+            }
+        }
+        crate::app::Mode::Approval => {
+            spans.push(Span::styled(
+                " APPROVAL ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        _ => {}
+    }
+    // AC-003-18：不可编程审批降级 → 状态条 `等待审批` 高亮（不弹窗）。
+    if app.approval.waiting_hint {
         spans.push(Span::styled(
-            " INSERT ",
+            " 等待审批（官方 web 完成） ",
             Style::default()
-                .fg(Color::Cyan)
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    // AC-003-05：搜索打开时状态条计数 `3/17 matches`。
+    if app.search.open {
+        let text = match app.search.window_matches.len() {
+            0 => "0 matches".to_string(),
+            total => format!(
+                "{}/{} matches",
+                app.search.cursor.saturating_add(1).min(total),
+                total
+            ),
+        };
+        spans.push(Span::styled(
+            format!("  {text}"),
+            Style::default().fg(Color::Cyan),
+        ));
+    }
+    // 复制成功 toast（AC-003-08；`copied`）。
+    if let Some(toast) = &app.yank.toast {
+        spans.push(Span::styled(
+            format!("  {toast} "),
+            Style::default()
+                .fg(Color::Green)
                 .add_modifier(Modifier::BOLD),
         ));
     }
@@ -405,6 +487,29 @@ mod tests {
         assert!(
             rendered.contains("停止中"),
             "本地停止中转场, text={rendered}"
+        );
+    }
+
+    #[test]
+    fn visual_mode_shows_selected_line_count_ac003_12() {
+        let mut app = AppState::default();
+        app.conn = ConnState::Ready;
+        app.mode = crate::app::Mode::Visual;
+        app.yank.visual = Some(crate::model::VisualSelection {
+            anchor: 2,
+            cursor: 4,
+            mode: crate::model::VisualMode::Line,
+        });
+        let backend = TestBackend::new(120, 2);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render(frame, Rect::new(0, 0, 120, 2), &app))
+            .unwrap();
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains("VISUAL"), "text={rendered}");
+        assert!(
+            rendered.contains("selected 3 lines"),
+            "§4 selected N lines 计数, text={rendered}"
         );
     }
 

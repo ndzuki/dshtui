@@ -1,9 +1,13 @@
 //! Ratatui view composition for the dshtui application.
 
+pub mod approval;
 pub mod chat;
 pub mod composer;
 pub mod layout;
+pub mod markdown;
+pub mod outline;
 pub mod picker;
+pub mod search;
 pub mod sidebar;
 pub mod status;
 
@@ -52,6 +56,10 @@ pub fn render(frame: &mut Frame<'_>, app: &AppState) {
     // composer overlay 覆盖 body 底部、状态条上方（仅 INSERT 可见，REQ-002）。
     composer::render(frame, areas.center, app);
     picker::render(frame, frame.area(), app);
+    // REQ-003 overlays：大纲 → 搜索 → 审批（后渲染者在上）。
+    outline::render(frame, areas.center, app);
+    search::render(frame, areas.center, app);
+    approval::render(frame, areas.center, app);
     // FR-001-07：帮助 overlay 最后渲染，位于 picker 之上。
     render_help(frame, frame.area(), app);
 }
@@ -68,15 +76,22 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         ("Ctrl+d / Ctrl+u", "半页滚动"),
         ("G / gg", "跳到末尾 / 开头"),
         ("f", "会话 picker（Enter 打开，Esc 关闭）"),
-        ("o", "打开选中会话"),
+        ("o", "打开选中会话 / 光标处链接"),
         ("i", "呼出 composer（无会话时提示）"),
         ("Enter", "发送并收起（空输入不发）"),
         ("Ctrl+Enter / Alt+Enter", "换行"),
         ("Esc", "收起 composer（保留草稿）"),
         ("s", "停止运行中的会话"),
+        ("/", "搜索（/c /l /i /t 前缀过滤）"),
+        ("n / N", "搜索命中间巡览"),
+        ("v / V", "视觉选择（字符 / 行）+ y 复制"),
+        ("y", "上下文复制（代码块/链接/工具结果）"),
+        ("O", "turnOutline 大纲列表"),
+        ("] / [", "跳下一 / 上一轮"),
+        ("↑ / ↓", "输入历史（INSERT）"),
         ("h / l", "折叠 / 展开项目"),
         ("?", "帮助"),
-        ("q / Ctrl+c", "退出（运行中先 stop）"),
+        ("q / Ctrl+c", "退出（运行中先 stop；审批中 q=中止）"),
         ("r", "启动失败时重试探测"),
     ];
     let lines = keys
@@ -98,7 +113,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
     frame.render_widget(panel, overlay);
 }
 
-fn centered_rect(area: Rect, width_percent: u16, height_percent: u16) -> Rect {
+pub(crate) fn centered_rect(area: Rect, width_percent: u16, height_percent: u16) -> Rect {
     let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
