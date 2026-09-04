@@ -20,7 +20,8 @@ use std::collections::HashSet;
 
 use crate::api::types::ChunkRow;
 use crate::api::types::{
-    ListItemRaw, SessionHistoryRecord, SessionId, SessionLogOffset, SessionSeq, SessionWireEvent,
+    ListItemRaw, PromptContentPart, PromptMode, PromptRequest, SessionHistoryRecord, SessionId,
+    SessionLogOffset, SessionRequestId, SessionSeq, SessionWireEvent,
 };
 use crate::api::{ClientError, ErrorClass};
 use crate::model::{ApplyEffect, Incoming, SessionStore, WorkspaceStore};
@@ -80,6 +81,40 @@ pub struct PickerState {
     pub selection: usize,
 }
 
+/// Modal composer state (REQ-002 §5): visible only in INSERT.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ComposerState {
+    pub visible: bool,
+    /// Send target session; always set while visible — empty means not
+    /// sendable (AC-002-12).
+    pub active_session: Option<SessionId>,
+}
+
+/// Session-bound draft (memory only, REQ-002 §5/§7; never restored across
+/// sessions D-11, lost on process exit).
+#[derive(Debug, Clone, PartialEq)]
+pub struct DraftState {
+    pub text: String,
+    /// Cursor position (char offset; V0.1 is single-line plus newline chars).
+    pub cursor: usize,
+    pub bound_session: SessionId,
+}
+
+/// Local stop transition (REQ-002 §5): shows「停止中」while requested; ends
+/// only when the official projection flips running=false (ADR-008, never
+/// self-computed).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct StopState {
+    pub requested_session: Option<SessionId>,
+}
+
+impl StopState {
+    /// Whether a stop transition is in flight for the given session.
+    pub fn is_requested_for(&self, sid: &SessionId) -> bool {
+        self.requested_session.as_ref() == Some(sid)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PageGuard {
     pub generation: u64,
@@ -116,6 +151,29 @@ pub enum AppEvent {
         row: ChunkRow,
     },
     FollowError {
+        session_id: SessionId,
+        error: ClientError,
+    },
+    /// `session/prompt` accepted receipt (ends this command's state only;
+    /// durable follow is the sole reconciliation source, REQ-002 Step 3).
+    PromptAccepted {
+        session_id: SessionId,
+        request_id: SessionRequestId,
+    },
+    /// `session/prompt` failure (marks pending error + status hint, never
+    /// auto-resent).
+    PromptFailed {
+        session_id: SessionId,
+        request_id: SessionRequestId,
+        error: ClientError,
+    },
+    /// `session/cancel` accepted (stop transition held until the official
+    /// projection flips).
+    CancelAccepted {
+        session_id: SessionId,
+    },
+    /// `session/cancel` failure (visible hint, no crash, retryable).
+    CancelFailed {
         session_id: SessionId,
         error: ClientError,
     },
@@ -162,6 +220,12 @@ pub enum Cmd {
         delay_ms: u64,
     },
     CancelSession(SessionId),
+    /// REQ-002 single send command (produced by submit_input; take-once
+    /// guards against double Enter).
+    SendPrompt {
+        session_id: SessionId,
+        request: PromptRequest,
+    },
     RestoreTerminal,
     Exit,
 }
@@ -176,6 +240,12 @@ pub struct AppState {
     pub workspaces: WorkspaceStore,
     pub viewport: Viewport,
     pub picker: PickerState,
+    pub composer: ComposerState,
+    /// Session-bound draft (memory only; restored on `i`, cleared on send,
+    /// replaced on session switch).
+    pub draft: Option<DraftState>,
+    /// Local stop transition (from `s` until the official projection flips).
+    pub stop: StopState,
     pub help_open: bool,
     pub quit_requested: bool,
     pub exited: bool,
@@ -209,6 +279,9 @@ impl Default for AppState {
             workspaces: WorkspaceStore::new(),
             viewport: Viewport::default(),
             picker: PickerState::default(),
+            composer: ComposerState::default(),
+            draft: None,
+            stop: StopState::default(),
             help_open: false,
             quit_requested: false,
             exited: false,
@@ -357,6 +430,11 @@ impl AppState {
                     self.running_sessions.insert(session_id.clone());
                 } else {
                     self.running_sessions.remove(&session_id);
+                    // Official projection flips running=false → stop
+                    // transition ends (ADR-008, projections only).
+                    if self.stop.is_requested_for(&session_id) {
+                        self.stop.requested_session = None;
+                    }
                 }
                 let eff = {
                     let w = self.sessions.touch(&session_id.0, self.window_cap);
@@ -439,6 +517,71 @@ impl AppState {
                 self.page_guard.in_flight = false;
                 self.record_error(error, "历史加载失败");
                 let _ = session_id;
+                vec![]
+            }
+            AppEvent::PromptAccepted {
+                session_id,
+                request_id,
+            } => {
+                // The success receipt only ends this command's state; the
+                // pending echo is retired solely by durable follow events
+                // (official source of truth, AC-002-06).
+                tracing::debug!(%session_id, %request_id, "session/prompt accepted");
+                vec![]
+            }
+            AppEvent::PromptFailed {
+                session_id,
+                request_id,
+                error,
+            } => {
+                let code = error.code();
+                let message = error.to_string();
+                if let Some(w) = self.sessions.get_mut(&session_id.0) {
+                    w.fail_echo(&request_id, &code, &message);
+                }
+                // AC-002-08: the status bar always shows a hint for a failed
+                // send — including network-class errors (a dead follow stream
+                // additionally shows reconnecting).
+                match error.class() {
+                    ErrorClass::Retryable => {
+                        tracing::warn!(error = %message, "发送失败（网络，不自动重发）");
+                        self.last_error = Some(format!("发送失败（网络）: {message}"));
+                    }
+                    _ => {
+                        tracing::error!(error = %message, "发送失败（不自动重发）");
+                        self.last_error = Some(format!("发送失败: {message}"));
+                    }
+                }
+                vec![] // never auto-resent (AC-002-08)
+            }
+            AppEvent::CancelAccepted { session_id } => {
+                // Accepted keeps the local stopping transition until the
+                // official projection flips (AC-002-05/10; results for
+                // non-requested sessions are silently ignored).
+                if self.stop.is_requested_for(&session_id) {
+                    tracing::debug!(%session_id, "session/cancel accepted（等待官方投影翻转）");
+                }
+                vec![]
+            }
+            AppEvent::CancelFailed { session_id, error } => {
+                // Visible hint, no crash, transition released for retry
+                // (AC-002-09); stale failures for other sessions are ignored.
+                if self.stop.is_requested_for(&session_id) {
+                    self.stop.requested_session = None;
+                    let message = error.to_string();
+                    match error.class() {
+                        ErrorClass::Retryable => {
+                            tracing::warn!(error = %message, "停止失败（网络）");
+                            self.last_error = Some(format!("停止失败（网络）: {message}"));
+                        }
+                        _ => {
+                            tracing::error!(error = %message, "停止失败");
+                            self.last_error = Some(format!("停止失败: {message}"));
+                        }
+                    }
+                } else {
+                    tracing::debug!(%session_id, "stale cancel 失败忽略");
+                }
                 vec![]
             }
             AppEvent::Disconnected(reason) => self.handle_disconnected(reason),
@@ -528,7 +671,12 @@ impl AppState {
     }
 
     fn scroll_to_bottom(&mut self) {
-        let len = self.active_window().map(|w| w.len()).unwrap_or(0);
+        // Visible lines = durable blocks + local echo lines (pending renders
+        // at the tail).
+        let len = self
+            .active_window()
+            .map(|w| w.len() + w.pending().count())
+            .unwrap_or(0);
         let height = self.viewport.height.max(1);
         self.viewport.offset = len.saturating_sub(height);
     }
@@ -544,6 +692,148 @@ impl AppState {
                 self.last_error = Some(msg);
             }
         }
+    }
+
+    // ---------- composer lifecycle (REQ-002 Step 2/3 entries) ----------
+
+    /// `i` entry (AC-002-12): without an active session stay NORMAL and show
+    /// the status hint; with one, enter INSERT and restore the same-session
+    /// draft (never restored across sessions, D-11).
+    fn open_composer(&mut self) -> Vec<Cmd> {
+        if self.mode == Mode::Insert && self.composer.visible {
+            return vec![];
+        }
+        let Some(sid) = self.active_session.clone() else {
+            self.composer.visible = false;
+            self.composer.active_session = None;
+            self.last_error = Some("无打开的会话（f/o 打开会话后再输入）".to_string());
+            return vec![];
+        };
+        let keep = self
+            .draft
+            .as_ref()
+            .filter(|d| d.bound_session == sid)
+            .map(|d| (d.text.clone(), d.cursor));
+        self.draft = Some(DraftState {
+            text: keep.as_ref().map(|(t, _)| t.clone()).unwrap_or_default(),
+            cursor: keep.as_ref().map(|(_, c)| *c).unwrap_or(0),
+            bound_session: sid.clone(),
+        });
+        self.mode = Mode::Insert;
+        self.composer.visible = true;
+        self.composer.active_session = Some(sid);
+        vec![]
+    }
+
+    /// Esc: close the composer but keep the session-bound draft (AC-002-04).
+    fn close_composer_keep_draft(&mut self) {
+        self.mode = Mode::Normal;
+        self.composer.visible = false;
+        self.composer.active_session = None;
+    }
+
+    /// Insert text at the cursor (single line + Ctrl/Alt+Enter newline chars).
+    fn composer_input(&mut self, text: &str) -> Vec<Cmd> {
+        let Some(d) = self.draft.as_mut() else {
+            return vec![];
+        };
+        if d.cursor > d.text.chars().count() {
+            d.cursor = d.text.chars().count();
+        }
+        let mut out = String::with_capacity(d.text.len() + text.len());
+        for (i, ch) in d.text.chars().enumerate() {
+            if i == d.cursor {
+                out.push_str(text);
+            }
+            out.push(ch);
+        }
+        if d.cursor >= d.text.chars().count() {
+            out.push_str(text);
+        }
+        d.text = out;
+        d.cursor += text.chars().count();
+        vec![]
+    }
+
+    fn composer_backspace(&mut self) -> Vec<Cmd> {
+        let Some(d) = self.draft.as_mut() else {
+            return vec![];
+        };
+        if d.cursor == 0 {
+            return vec![];
+        }
+        let idx = d.cursor - 1;
+        let mut out = String::with_capacity(d.text.len());
+        for (i, ch) in d.text.chars().enumerate() {
+            if i != idx {
+                out.push(ch);
+            }
+        }
+        d.text = out;
+        d.cursor = idx;
+        vec![]
+    }
+
+    /// The single send entry: non-empty draft is taken, a requestId is
+    /// minted, the optimistic echo lands immediately, INSERT exits and
+    /// exactly one `Cmd::SendPrompt` is produced; empty input (whitespace
+    /// included) stays in INSERT and sends nothing (AC-002-02/03/13).
+    pub fn submit_input(&mut self, mode: PromptMode) -> Vec<Cmd> {
+        if self.mode != Mode::Insert || !self.composer.visible {
+            return vec![];
+        }
+        let Some(sid) = self.composer.active_session.clone() else {
+            return vec![];
+        };
+        let Some(d) = self.draft.as_mut() else {
+            return vec![];
+        };
+        if d.text.trim().is_empty() {
+            // Empty input: send nothing, stay in INSERT (AC-002-03).
+            return vec![];
+        }
+        // take-once + single command queue = minimal in-flight guard
+        // (pattern 15 lesson: unconverged async signals need in-flight
+        // dedup; AC-002-13 blocks double-Enter).
+        let text = std::mem::take(&mut d.text);
+        d.cursor = 0;
+        self.mode = Mode::Normal;
+        self.composer.visible = false;
+        self.composer.active_session = None;
+        let request_id = SessionRequestId(crate::api::types::mint_request_id());
+        // Optimistic echo: visible within one frame, occupies no seq
+        // (AC-002-02).
+        self.sessions
+            .touch(&sid.0, self.window_cap)
+            .echo(request_id.clone(), &text);
+        let request = PromptRequest {
+            request_id: request_id.clone(),
+            session_id: sid.clone(),
+            mode,
+            content: vec![PromptContentPart::Text { text }],
+            client_time_zone: None,
+        };
+        vec![Cmd::SendPrompt {
+            session_id: sid,
+            request,
+        }]
+    }
+
+    /// `s` entry (AC-002-05/10): first press sends exactly one cancel; the
+    /// local stopping transition holds until the official projection flips;
+    /// a repeated `s` for the same session is idempotent; not running → noop.
+    pub fn request_stop(&mut self) -> Vec<Cmd> {
+        let Some(sid) = self.active_session.clone() else {
+            return vec![];
+        };
+        if self.stop.is_requested_for(&sid) {
+            return vec![]; // Same session already stopping: idempotent.
+        }
+        if !self.running_sessions.contains(&sid) {
+            return vec![]; // Official projection says not running: noop.
+        }
+        self.stop.requested_session = Some(sid.clone());
+        vec![Cmd::CancelSession(sid)]
     }
 
     // ---------- input commands (Step 5 keymap maps here) ----------
@@ -568,15 +858,21 @@ impl AppState {
                 self.picker.selection = 0;
                 vec![]
             }
-            C::InsertMode => {
-                self.mode = Mode::Insert;
-                vec![]
-            }
-            C::ClosePicker => {
-                self.mode = Mode::Normal;
-                self.picker.open = false;
-                vec![]
-            }
+            C::InsertMode => self.open_composer(),
+            C::ClosePicker => match self.mode {
+                Mode::Picker => {
+                    self.mode = Mode::Normal;
+                    self.picker.open = false;
+                    vec![]
+                }
+                // Esc closes the composer but keeps the session draft
+                // (AC-002-04).
+                Mode::Insert => {
+                    self.close_composer_keep_draft();
+                    vec![]
+                }
+                _ => vec![],
+            },
             C::PickerDown => {
                 self.picker.selection += 1;
                 vec![]
@@ -586,25 +882,34 @@ impl AppState {
                 vec![]
             }
             C::PickerInput(text) => {
-                self.picker.query.push_str(&text);
-                self.picker.selection = 0;
-                vec![]
+                if self.mode == Mode::Insert {
+                    self.composer_input(&text)
+                } else {
+                    self.picker.query.push_str(&text);
+                    self.picker.selection = 0;
+                    vec![]
+                }
             }
             C::PickerBackspace => {
-                self.picker.query.pop();
-                vec![]
+                if self.mode == Mode::Insert {
+                    self.composer_backspace()
+                } else {
+                    self.picker.query.pop();
+                    vec![]
+                }
             }
             C::SubmitInput => {
-                self.mode = Mode::Normal;
-                vec![]
+                if self.mode == Mode::Insert {
+                    // V0.1 always mode:queue (D-10); steer is the
+                    // V0.2/REQ-003 extension slot.
+                    self.submit_input(PromptMode::Queue)
+                } else {
+                    self.mode = Mode::Normal;
+                    vec![]
+                }
             }
             C::OpenSelected => self.open_session_from_selection(),
-            C::StopRunning => self
-                .active_session
-                .clone()
-                .filter(|sid| self.running_sessions.contains(sid))
-                .map(|sid| vec![Cmd::CancelSession(sid)])
-                .unwrap_or_default(),
+            C::StopRunning => self.request_stop(),
             C::CollapseProject => {
                 for workspace in &self.workspaces.workspaces {
                     self.collapsed_workspaces.insert(workspace.id.clone());
@@ -713,6 +1018,10 @@ impl AppState {
     fn open_session(&mut self, sid: SessionId) -> Vec<Cmd> {
         self.active_session = Some(sid.clone());
         self.viewport.follow_tail = true;
+        // Close the composer on session switch (the draft stays bound to its
+        // session, D-11).
+        self.composer.visible = false;
+        self.composer.active_session = Some(sid.clone());
         vec![Cmd::OpenFollow {
             session_id: sid,
             max_messages: self.window_cap,
@@ -750,7 +1059,9 @@ impl AppState {
         self.quit_requested = true;
         let mut cmds = Vec::new();
         if let Some(sid) = self.active_session.clone() {
-            if self.running_sessions.contains(&sid) {
+            let stopping = self.stop.is_requested_for(&sid);
+            // Running or stopping (local transition): best-effort stop first.
+            if self.running_sessions.contains(&sid) || stopping {
                 cmds.push(Cmd::CancelSession(sid));
             }
         }
@@ -1022,5 +1333,444 @@ mod tests {
         });
         assert_eq!((s.width, s.height), (120, 40));
         assert_eq!(s.viewport.height, 38);
+    }
+
+    // ---------- REQ-002 composer 生命周期（Step 2） ----------
+
+    #[test]
+    fn insert_requires_active_session_ac002_12() {
+        let mut s = AppState::default();
+        s.handle(AppEvent::Startup);
+        s.handle(AppEvent::SessionListPage {
+            items: vec![],
+            next_cursor: None,
+        });
+        let cmds = s.handle_command(C::InsertMode);
+        assert!(cmds.is_empty());
+        assert_eq!(s.mode, Mode::Normal, "无活动会话不进入 INSERT");
+        assert!(!s.composer.visible);
+        assert!(
+            s.last_error
+                .as_deref()
+                .unwrap_or("")
+                .contains("无打开的会话"),
+            "AC-002-12 状态条提示"
+        );
+    }
+
+    #[test]
+    fn esc_keeps_draft_per_session_and_switch_does_not_restore_ac002_04() {
+        let mut s = AppState::default();
+        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle(snapshot("s1", false));
+        s.handle_command(C::InsertMode);
+        assert_eq!(s.mode, Mode::Insert);
+        assert!(s.composer.visible);
+        s.handle_command(C::PickerInput("你好".into()));
+        // Esc 收起但保留草稿（会话内）。
+        s.handle_command(C::ClosePicker);
+        assert_eq!(s.mode, Mode::Normal);
+        assert!(!s.composer.visible);
+        assert_eq!(s.draft.as_ref().map(|d| d.text.as_str()), Some("你好"));
+        // 同一会话再次 i：草稿还在。
+        s.handle_command(C::InsertMode);
+        assert!(s.composer.visible);
+        assert_eq!(s.draft.as_ref().map(|d| d.text.as_str()), Some("你好"));
+        // 切换会话：新会话草稿为空（跨会话不恢复，D-11）。
+        s.handle_command(C::ClosePicker);
+        s.handle_command(C::OpenSession(SessionId("s2".into())));
+        s.handle(snapshot("s2", false));
+        s.handle_command(C::InsertMode);
+        assert_eq!(
+            s.draft.as_ref().map(|d| d.text.as_str()),
+            Some(""),
+            "跨会话不恢复草稿"
+        );
+        assert_eq!(
+            s.draft.as_ref().map(|d| d.bound_session.0.as_str()),
+            Some("s2")
+        );
+    }
+
+    #[test]
+    fn empty_enter_stays_insert_and_sends_nothing_ac002_03() {
+        let mut s = AppState::default();
+        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle(snapshot("s1", false));
+        s.handle_command(C::InsertMode);
+        let cmds = s.handle_command(C::SubmitInput);
+        assert!(cmds.is_empty(), "空输入不发");
+        assert_eq!(s.mode, Mode::Insert, "空输入保持 INSERT");
+        assert!(s.composer.visible);
+        // 纯空白同样视为空输入。
+        s.handle_command(C::PickerInput("   ".into()));
+        let cmds = s.handle_command(C::SubmitInput);
+        assert!(cmds.is_empty(), "纯空白不发");
+        assert_eq!(s.mode, Mode::Insert);
+    }
+
+    #[test]
+    fn nonempty_enter_closes_composer_back_to_normal_ac002_01() {
+        let mut s = AppState::default();
+        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle(snapshot("s1", false));
+        s.handle_command(C::InsertMode);
+        s.handle_command(C::PickerInput("hi".into()));
+        let cmds = s.handle_command(C::SubmitInput);
+        assert_eq!(s.mode, Mode::Normal, "Enter 后自动收起");
+        assert!(!s.composer.visible);
+        assert_eq!(
+            s.draft.as_ref().map(|d| d.text.as_str()),
+            Some(""),
+            "发送后草稿清空"
+        );
+        assert_eq!(cmds.len(), 1, "非空 Enter 恰好一个发送命令");
+        assert!(matches!(cmds[0], Cmd::SendPrompt { .. }));
+    }
+
+    // ---------- REQ-002 发送入口、乐观回显与 requestId 对账（Step 3） ----------
+
+    /// 空记录快照（不含 seed 记录，便于断言 pending/durable 计数）。
+    fn empty_snapshot(sid: &str) -> AppEvent {
+        AppEvent::FollowSnapshot {
+            session_id: SessionId(sid.into()),
+            cursor: Some(SessionLogOffset(0)),
+            records: vec![],
+            has_more: true,
+            projections: Some(serde_json::json!({"running": false})),
+        }
+    }
+
+    fn submit_flow(s: &mut AppState, sid: &str, text: &str) -> Vec<Cmd> {
+        s.handle_command(C::OpenSession(SessionId(sid.into())));
+        s.handle(empty_snapshot(sid));
+        s.handle_command(C::InsertMode);
+        s.handle_command(C::PickerInput(text.into()));
+        s.handle_command(C::SubmitInput)
+    }
+
+    #[test]
+    fn submit_emits_exactly_one_send_prompt_with_echo_ac002_02() {
+        let mut s = AppState::default();
+        let cmds = submit_flow(&mut s, "s1", "你好");
+        assert_eq!(cmds.len(), 1, "同一 Enter 只产生一次 session/prompt");
+        let cmd = &cmds[0];
+        let Cmd::SendPrompt {
+            session_id,
+            request,
+        } = cmd
+        else {
+            panic!("预期 SendPrompt，得到 {cmd:?}")
+        };
+        assert_eq!(session_id, &SessionId("s1".into()));
+        assert_eq!(request.mode, PromptMode::Queue, "V0.1 恒 queue（D-10）");
+        assert_eq!(request.session_id, SessionId("s1".into()));
+        assert_eq!(request.content.len(), 1);
+        let crate::api::types::PromptContentPart::Text { text } = &request.content[0] else {
+            panic!("V0.1 仅文本内容")
+        };
+        assert_eq!(text, "你好");
+        assert!(request.client_time_zone.is_none(), "V0.1 不上送时区");
+        // 本地立即回显（1 帧内可见，不占 seq）。
+        let w = s.sessions.get("s1").unwrap();
+        assert_eq!(w.pending().count(), 1);
+        assert_eq!(w.pending().next().unwrap().text, "你好");
+        assert_eq!(w.len(), 0, "pending 不占 durable blocks");
+        assert_eq!(s.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn rapid_double_enter_single_send_ac002_13() {
+        let mut s = AppState::default();
+        let cmds = submit_flow(&mut s, "s1", "quick");
+        assert_eq!(cmds.len(), 1);
+        let rid = match &cmds[0] {
+            Cmd::SendPrompt { request, .. } => request.request_id.0.clone(),
+            _ => panic!(),
+        };
+        // Enter 已触发、composer 已收起：再次提交不产生第二次调用。
+        let cmds2 = s.handle_command(C::SubmitInput);
+        assert!(cmds2.is_empty());
+        // 快速连按（同一帧内第二条 SubmitInput 命令）→ 入口幂等。
+        let cmds3 = s.submit_input(PromptMode::Queue);
+        assert!(cmds3.is_empty(), "submit 入口幂等");
+        let w = s.sessions.get("s1").unwrap();
+        assert_eq!(w.pending().count(), 1, "同一 requestId 只回显一次");
+        assert_eq!(w.pending().next().unwrap().request_id.0, rid);
+    }
+
+    #[test]
+    fn prompt_failed_marks_echo_error_and_no_auto_resend_ac002_08() {
+        let mut s = AppState::default();
+        let cmds = submit_flow(&mut s, "s1", "bad");
+        let (session_id, request_id) = match &cmds[0] {
+            Cmd::SendPrompt {
+                session_id,
+                request,
+            } => (session_id.clone(), request.request_id.clone()),
+            _ => panic!(),
+        };
+        let out = s.handle(AppEvent::PromptFailed {
+            session_id: session_id.clone(),
+            request_id: request_id.clone(),
+            error: ClientError::Remote {
+                code: "gateway/bad-request".into(),
+                message: "非法请求".into(),
+                class: ErrorClass::UserFacing,
+            },
+        });
+        assert!(out.is_empty(), "失败不自动重发");
+        let w = s.sessions.get("s1").unwrap();
+        let echo = w.pending().next().unwrap();
+        assert!(matches!(
+            &echo.status,
+            crate::model::PendingEchoStatus::Failed { code, .. }
+                if code == "gateway/bad-request"
+        ));
+        assert!(
+            s.last_error.as_deref().unwrap_or("").contains("发送失败"),
+            "状态条错误提示"
+        );
+        // 恢复路径：失败后重新输入可再次手动发送（新 requestId、新回显）。
+        let cmds2 = submit_flow(&mut s, "s1", "retry");
+        assert_eq!(cmds2.len(), 1, "恢复后可再次手动发送");
+        let request_id2 = match &cmds2[0] {
+            Cmd::SendPrompt { request, .. } => request.request_id.clone(),
+            _ => panic!(),
+        };
+        assert_ne!(request_id2, request_id, "新请求使用新 requestId");
+    }
+
+    #[test]
+    fn prompt_permission_denied_no_retry_no_reconnect_ac002_08() {
+        let mut s = AppState::default();
+        let cmds = submit_flow(&mut s, "s1", "perm");
+        let (session_id, request_id) = match &cmds[0] {
+            Cmd::SendPrompt {
+                session_id,
+                request,
+            } => (session_id.clone(), request.request_id.clone()),
+            _ => panic!(),
+        };
+        let out = s.handle(AppEvent::PromptFailed {
+            session_id,
+            request_id,
+            error: ClientError::Remote {
+                code: "PERMISSION_DENIED".into(),
+                message: "无权限".into(),
+                class: ErrorClass::PermissionDenied,
+            },
+        });
+        assert!(out.is_empty(), "权限错误不自动重试");
+        assert!(!s.is_reconnecting(), "权限错误不触发重连");
+        let w = s.sessions.get("s1").unwrap();
+        let echo = w.pending().next().unwrap();
+        assert!(matches!(
+            &echo.status,
+            crate::model::PendingEchoStatus::Failed { code, .. } if code == "PERMISSION_DENIED"
+        ));
+        let msg = s.last_error.as_deref().unwrap_or("");
+        assert!(msg.contains("发送失败"), "状态条错误提示, msg={msg}");
+        assert!(msg.contains("PERMISSION_DENIED"), "错误码可见, msg={msg}");
+    }
+
+    #[test]
+    fn blank_or_unowned_session_can_send_ac002_11() {
+        // 空白/未归属会话发送：目标 = 当前活动会话，发送路径不依赖归属/
+        // workspace 元数据（首个 turn 正常入队，状态以官方投影为准）。
+        let mut s = AppState::default();
+        // 无 workspace/session meta（未归属）且窗口为空（空白）。
+        let cmds = submit_flow(&mut s, "blank-1", "首个 turn");
+        assert_eq!(cmds.len(), 1);
+        let Cmd::SendPrompt {
+            session_id,
+            request,
+        } = &cmds[0]
+        else {
+            panic!("预期 SendPrompt，得到 {cmds:?}")
+        };
+        assert_eq!(session_id, &SessionId("blank-1".into()));
+        assert_eq!(request.mode, PromptMode::Queue);
+        let w = s.sessions.get("blank-1").unwrap();
+        assert_eq!(w.pending().count(), 1, "本地立即回显");
+        assert_eq!(w.pending().next().unwrap().text, "首个 turn");
+        assert_eq!(w.len(), 0, "空白会话无历史");
+    }
+
+    #[test]
+    fn prompt_accepted_waits_for_durable_reconciliation_ac002_06() {
+        let mut s = AppState::default();
+        let cmds = submit_flow(&mut s, "s1", "hi");
+        let (session_id, request_id) = match &cmds[0] {
+            Cmd::SendPrompt {
+                session_id,
+                request,
+            } => (session_id.clone(), request.request_id.clone()),
+            _ => panic!(),
+        };
+        // accepted 只结束本次命令状态：pending 仍等 durable（follow 是唯一权威）。
+        let out = s.handle(AppEvent::PromptAccepted {
+            session_id: session_id.clone(),
+            request_id: request_id.clone(),
+        });
+        assert!(out.is_empty());
+        assert_eq!(s.sessions.get("s1").unwrap().pending().count(), 1);
+        // durable 事件到达 → 对账合并为一条，不再重复显示。
+        s.handle(AppEvent::FollowEvent {
+            session_id: session_id.clone(),
+            event: SessionWireEvent {
+                event_type: "user/message".into(),
+                seq: Some(SessionSeq(11)),
+                time: None,
+                request_id: Some(request_id.0.clone()),
+                ignorable: None,
+                source_event_seqs: None,
+                surface_op: None,
+                data: Some(serde_json::json!({"content": "hi"})),
+            },
+        });
+        let w = s.sessions.get("s1").unwrap();
+        assert_eq!(w.pending().count(), 0, "durable 对账 retire pending");
+        assert_eq!(w.len(), 1, "只保留一个 durable 块");
+    }
+
+    // ---------- REQ-002 停止转场与 cancel 竞态（Step 4） ----------
+
+    #[test]
+    fn stop_first_press_single_cancel_and_idempotent_ac002_05_10() {
+        let mut s = AppState::default();
+        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle(snapshot("s1", true)); // 官方投影 running
+        let cmds = s.handle_command(C::StopRunning);
+        assert_eq!(
+            cmds,
+            vec![Cmd::CancelSession(SessionId("s1".into()))],
+            "首次 s 只发一次 cancel"
+        );
+        assert_eq!(s.stop.requested_session, Some(SessionId("s1".into())));
+        // 重复 s（同一会话）：幂等，不重复触发、不报错（AC-002-10）。
+        assert!(s.handle_command(C::StopRunning).is_empty());
+        assert_eq!(s.stop.requested_session, Some(SessionId("s1".into())));
+        // 未运行会话：s 无操作。
+        let mut s2 = AppState::default();
+        s2.handle_command(C::OpenSession(SessionId("s2".into())));
+        s2.handle(snapshot("s2", false));
+        assert!(s2.handle_command(C::StopRunning).is_empty());
+        assert_eq!(s2.stop.requested_session, None);
+        // 另一运行中会话不受前一会话的停止转场阻断（per-session 语义）。
+        let mut s3 = AppState::default();
+        s3.handle_command(C::OpenSession(SessionId("sA".into())));
+        s3.handle(snapshot("sA", true));
+        s3.handle_command(C::OpenSession(SessionId("sB".into())));
+        s3.handle(snapshot("sB", true));
+        s3.handle_command(C::OpenSession(SessionId("sA".into())));
+        s3.handle_command(C::StopRunning);
+        assert_eq!(s3.stop.requested_session, Some(SessionId("sA".into())));
+        s3.handle_command(C::OpenSession(SessionId("sB".into())));
+        assert_eq!(
+            s3.handle_command(C::StopRunning),
+            vec![Cmd::CancelSession(SessionId("sB".into()))],
+            "B 会话停止不被 A 的转场阻断"
+        );
+    }
+
+    #[test]
+    fn cancel_accepted_keeps_stopping_until_projection_flips() {
+        let mut s = AppState::default();
+        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle(snapshot("s1", true));
+        s.handle_command(C::StopRunning);
+        // accepted：本地「停止中」保持，官方 running 不动（ADR-008）。
+        let out = s.handle(AppEvent::CancelAccepted {
+            session_id: SessionId("s1".into()),
+        });
+        assert!(out.is_empty());
+        assert_eq!(s.stop.requested_session, Some(SessionId("s1".into())));
+        assert!(s.active_running(), "官方投影仍 running");
+        // 官方投影翻转 running=false → 转场结束（显示已停止）。
+        s.handle(snapshot("s1", false));
+        assert_eq!(s.stop.requested_session, None);
+        assert!(!s.active_running());
+    }
+
+    #[test]
+    fn cancel_failed_shows_hint_no_crash_and_retry_works_ac002_09() {
+        let mut s = AppState::default();
+        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle(snapshot("s1", true));
+        s.handle_command(C::StopRunning);
+        let out = s.handle(AppEvent::CancelFailed {
+            session_id: SessionId("s1".into()),
+            error: ClientError::Remote {
+                code: "session/agent-busy".into(),
+                message: "忙".into(),
+                class: ErrorClass::UserFacing,
+            },
+        });
+        assert!(out.is_empty(), "失败不崩溃、不触发额外命令");
+        assert!(
+            s.last_error.as_deref().unwrap_or("").contains("停止失败"),
+            "状态条 cancel 失败提示"
+        );
+        assert_eq!(s.stop.requested_session, None, "失败释放转场（可重试）");
+        assert!(s.active_running(), "官方投影口径不变（不臆造）");
+        // 恢复路径：失败后再次 s 必须能重新发起（不被旧失败状态污染）。
+        assert_eq!(
+            s.handle_command(C::StopRunning),
+            vec![Cmd::CancelSession(SessionId("s1".into()))],
+            "失败后可再次手动停止"
+        );
+        s.handle(snapshot("s1", false));
+        assert_eq!(s.stop.requested_session, None);
+    }
+
+    #[test]
+    fn stale_cancel_results_do_not_disturb_current_transition() {
+        let mut s = AppState::default();
+        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle(snapshot("s1", true));
+        s.handle_command(C::StopRunning);
+        // 陈旧/非在途会话的结果：不 panic、不影响当前转场。
+        s.handle(AppEvent::CancelAccepted {
+            session_id: SessionId("s-other".into()),
+        });
+        s.handle(AppEvent::CancelFailed {
+            session_id: SessionId("s-other".into()),
+            error: ClientError::Transport("eof".into()),
+        });
+        assert_eq!(s.stop.requested_session, Some(SessionId("s1".into())));
+        assert!(s.last_error.is_none(), "非在途失败不覆盖状态条");
+        // 在途会话失败后重试仍可用。
+        s.handle(AppEvent::CancelFailed {
+            session_id: SessionId("s1".into()),
+            error: ClientError::Transport("eof".into()),
+        });
+        assert_eq!(s.stop.requested_session, None);
+        assert_eq!(
+            s.handle_command(C::StopRunning),
+            vec![Cmd::CancelSession(SessionId("s1".into()))]
+        );
+    }
+
+    #[test]
+    fn quit_while_stopping_keeps_first_stop_semantics_ac002_07() {
+        // 运行中 + 已请求停止：Ctrl+c 首次仍只确认，二次 cancel→restore→exit。
+        let mut s = AppState::default();
+        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle(snapshot("s1", true));
+        s.handle_command(C::StopRunning);
+        let cmds = s.handle_command(C::Quit);
+        assert!(cmds.is_empty(), "首次 Ctrl+c 仅确认");
+        assert!(s.quit_requested && !s.exited);
+        let cmds = s.handle_command(C::Quit);
+        assert_eq!(
+            cmds,
+            vec![
+                Cmd::CancelSession(SessionId("s1".into())),
+                Cmd::RestoreTerminal,
+                Cmd::Exit,
+            ]
+        );
+        assert!(s.exited);
     }
 }

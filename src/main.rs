@@ -505,10 +505,48 @@ async fn execute_one(
             commands.extend(app.handle(event));
         }
         Cmd::CancelSession(session_id) => {
-            // Best-effort stop before exit (AC-001-08); never blocks exit.
-            if let Some(client) = client.as_ref() {
-                let _ = session::cancel(&client.http, &client.base, &session_id.0).await;
-            }
+            // Best-effort stop (AC-001-08 exit semantics); the result is
+            // routed back so the interactive stop path can judge accepted /
+            // failure (REQ-002 Step 4).
+            let Some(client) = client.as_ref() else {
+                return;
+            };
+            let event = match session::cancel(&client.http, &client.base, &session_id.0).await {
+                Ok(accepted) => {
+                    tracing::debug!(%session_id, ?accepted, "session/cancel accepted");
+                    AppEvent::CancelAccepted {
+                        session_id: session_id.clone(),
+                    }
+                }
+                Err(error) => AppEvent::CancelFailed {
+                    session_id: session_id.clone(),
+                    error,
+                },
+            };
+            commands.extend(app.handle(event));
+        }
+        Cmd::SendPrompt {
+            session_id,
+            request,
+        } => {
+            let Some(client) = client.as_ref() else {
+                return;
+            };
+            let event = match session::prompt(&client.http, &client.base, &request).await {
+                Ok(accepted) => {
+                    tracing::debug!(%session_id, ?accepted, "session/prompt accepted");
+                    AppEvent::PromptAccepted {
+                        session_id,
+                        request_id: request.request_id.clone(),
+                    }
+                }
+                Err(error) => AppEvent::PromptFailed {
+                    session_id,
+                    request_id: request.request_id.clone(),
+                    error,
+                },
+            };
+            commands.extend(app.handle(event));
         }
         Cmd::Reconnect { .. } => {
             // Handled at the top of the run loop so the UI keeps painting.

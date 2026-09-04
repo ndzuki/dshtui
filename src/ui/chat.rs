@@ -8,7 +8,7 @@ use ratatui::Frame;
 
 use crate::api::types::ChunkRow;
 use crate::app::AppState;
-use crate::model::{Block, PackedChunks, TranscriptWindow};
+use crate::model::{Block, PackedChunks, PendingEcho, PendingEchoStatus, TranscriptWindow};
 
 use super::format_hhmm;
 
@@ -38,11 +38,16 @@ pub fn render_window(
     follow_tail: bool,
 ) {
     let len = window.len();
-    let lines: Vec<Line<'static>> = window
+    let mut lines: Vec<Line<'static>> = window
         .blocks()
         .enumerate()
         .map(|(i, block)| block_line(block, i + 1 == len))
         .collect();
+    // 乐观回显（REQ-002）：durable 之外追加 pending/error 行；durable
+    // 同 requestId 到达后 pending 被对账 retire，绝不重复显示。
+    for echo in window.pending() {
+        lines.push(echo_line(echo));
+    }
     let title = if follow_tail {
         " Chat • live "
     } else {
@@ -53,6 +58,46 @@ pub fn render_window(
         .wrap(Wrap { trim: false })
         .scroll(((offset.min(u16::MAX as usize)) as u16, 0));
     frame.render_widget(paragraph, area);
+}
+
+/// 乐观回显行：Pending → `…`（黄色）；Failed → `!`（红色）+ 稳定错误码。
+fn echo_line(echo: &PendingEcho) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    match &echo.status {
+        PendingEchoStatus::Pending => {
+            spans.push(Span::styled(
+                "… ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::styled(
+                "U echo ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::raw(single_line(&echo.text)));
+        }
+        PendingEchoStatus::Failed { code, .. } => {
+            spans.push(Span::styled(
+                "! ",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::styled(
+                "U echo ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::styled(
+                format!("(发送失败 {code}) "),
+                Style::default().fg(Color::Red),
+            ));
+            spans.push(Span::raw(single_line(&echo.text)));
+        }
+    }
+    Line::from(spans)
 }
 
 /// FR-001-04 §4：携带 time 的 Block 渲染 HH:MM 前缀（UTC，纯展示）；
@@ -248,7 +293,7 @@ fn single_line(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::types::{SessionHistoryRecord, SessionSeq, SessionWireEvent};
+    use crate::api::types::{SessionHistoryRecord, SessionRequestId, SessionSeq, SessionWireEvent};
     use crate::model::{Incoming, TranscriptWindow};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
@@ -406,5 +451,69 @@ mod tests {
             "chunks 到达后不再 running, text={rendered}"
         );
         assert!(rendered.contains("!"), "error 标记保留, text={rendered}");
+    }
+
+    #[test]
+    fn optimistic_echo_renders_once_and_reconciles_without_duplicate_ac002_06() {
+        let mut window = TranscriptWindow::new(20);
+        window.apply(Incoming::Snapshot {
+            cursor: None,
+            records: vec![event(1, "user/message", Some("old"))],
+            has_more: false,
+            projections: None,
+        });
+        window.echo(SessionRequestId("req-echo".into()), "optimistic-msg");
+        window.echo(SessionRequestId("req-fail".into()), "failed-msg");
+        window.fail_echo(
+            &SessionRequestId("req-fail".into()),
+            "gateway/bad-request",
+            "非法请求",
+        );
+        let backend = TestBackend::new(80, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_window(frame, frame.area(), &window, 0, true))
+            .unwrap();
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains("…"), "pending 回显标记, text={rendered}");
+        assert!(rendered.contains("optimistic-msg"), "text={rendered}");
+        assert!(
+            rendered.contains("发送失败"),
+            "失败回显错误标记, text={rendered}"
+        );
+        assert!(rendered.contains("gateway/bad-request"), "text={rendered}");
+        assert_eq!(
+            rendered.matches("optimistic-msg").count(),
+            1,
+            "pending 只渲染一条: {rendered}"
+        );
+        // durable 同 requestId 到达 → 对账 retire，内容只来自 durable 一条。
+        window.apply(Incoming::FollowEvent(SessionWireEvent {
+            event_type: "user/message".into(),
+            seq: Some(SessionSeq(9)),
+            time: None,
+            request_id: Some("req-echo".into()),
+            ignorable: None,
+            source_event_seqs: None,
+            surface_op: None,
+            data: Some(serde_json::json!({"content": "optimistic-msg"})),
+        }));
+        terminal
+            .draw(|frame| render_window(frame, frame.area(), &window, 0, true))
+            .unwrap();
+        let rendered = rendered_text(&terminal);
+        assert_eq!(
+            rendered.matches("optimistic-msg").count(),
+            1,
+            "对账后不重复显示: {rendered}"
+        );
+        // 失败回显仍在（未被 durable 覆盖）。
+        assert!(rendered.contains("发送失败"), "text={rendered}");
+        // 尾部 durable user 块的「等待回复」标记不重复渲染 echo 内容。
+        assert_eq!(
+            rendered.matches("req-echo").count(),
+            0,
+            "requestId 不出现在正文: {rendered}"
+        );
     }
 }

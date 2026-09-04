@@ -1,4 +1,6 @@
-use dshtui::api::types::{SessionHistoryRecord, SessionLogOffset, SessionSeq, SessionWireEvent};
+use dshtui::api::types::{
+    SessionHistoryRecord, SessionLogOffset, SessionRequestId, SessionSeq, SessionWireEvent,
+};
 use dshtui::model::{ApplyEffect, Incoming, TranscriptWindow};
 
 fn event(seq: u64, event_type: &str, request_id: Option<&str>) -> SessionWireEvent {
@@ -139,4 +141,48 @@ fn snapshot_rebuild_replaces_sequence_and_request_indexes() {
         }
     );
     assert_eq!(seqs(&window), vec![2, 9]);
+}
+
+#[test]
+fn optimistic_echo_reconciles_against_durable_event_and_snapshot_ac002_06() {
+    // 集成 seam：echo 后 durable 事件与重连快照都能对账，不重复显示。
+    let mut window = TranscriptWindow::new(20);
+    window.echo(SessionRequestId("req-x".into()), "echoed");
+    assert_eq!(window.pending().count(), 1);
+    assert_eq!(window.len(), 0, "pending 不占 blocks");
+
+    assert_eq!(
+        window.apply(Incoming::FollowEvent(event(
+            5,
+            "user/message",
+            Some("req-x"),
+        ))),
+        ApplyEffect::TailAppended {
+            appended: 1,
+            anchor_stable: true,
+        }
+    );
+    assert_eq!(window.pending().count(), 0, "durable 对账 retire");
+    assert_eq!(seqs(&window), vec![5]);
+
+    // 重连快照重放同 requestId：重建后仍只有一条。
+    window.echo(SessionRequestId("req-y".into()), "again");
+    window.apply(Incoming::Snapshot {
+        cursor: Some(SessionLogOffset(6)),
+        records: vec![record(6, "user/message", Some("req-y"))],
+        has_more: false,
+        projections: None,
+    });
+    assert_eq!(window.pending().count(), 0, "快照对账 retire");
+    assert_eq!(seqs(&window), vec![6]);
+    assert_eq!(
+        window.apply(Incoming::Snapshot {
+            cursor: Some(SessionLogOffset(6)),
+            records: vec![record(6, "user/message", Some("req-y"))],
+            has_more: false,
+            projections: None,
+        }),
+        ApplyEffect::Rebuilt
+    );
+    assert_eq!(seqs(&window), vec![6], "快照重放不重复");
 }

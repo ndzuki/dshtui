@@ -15,6 +15,20 @@ const HINT_LINE: &str = "[i]输入 [/]搜索 [f]切换 [?]帮助 [q]退出";
 /// 窄终端省略快捷键提示行（FR-001-05）。
 const MIN_WIDTH_FOR_HINT: u16 = 50;
 
+/// 官方 running 投影（与第一行 ●run 同源，ADR-008 不自算）。
+fn official_running(app: &AppState) -> bool {
+    let Some(window) = app.active_window() else {
+        return false;
+    };
+    let projections = ProjectionSnapshot::new(window.projections().clone());
+    projections.running().unwrap_or_else(|| {
+        app.active_session
+            .as_ref()
+            .and_then(|sid| app.workspaces.sessions.get(sid))
+            .is_some_and(|m| m.running)
+    })
+}
+
 /// Render the two-line status bar: official projection fields + shortcut hints.
 pub fn render(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
     let depth = color_depth();
@@ -23,6 +37,16 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         format!(" {label} "),
         Style::default().fg(color).add_modifier(Modifier::BOLD),
     )];
+
+    // 模式指示（REQ-002）：INSERT 高亮；NORMAL 为默认态不重复标注。
+    if app.mode == crate::app::Mode::Insert {
+        spans.push(Span::styled(
+            " INSERT ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
 
     if let Some(window) = app.active_window() {
         let projections = ProjectionSnapshot::new(window.projections().clone());
@@ -54,6 +78,16 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
             if running { " ●run" } else { " ○idle" },
             Style::default().fg(if running { Color::Green } else { Color::Gray }),
         ));
+        // 本地停止转场（AC-002-05）：requested 且官方投影仍 running →
+        // 「停止中」；投影翻转即结束（FollowSnapshot 清空 requested）。
+        if running && app.stop.requested_session.as_ref() == app.active_session.as_ref() {
+            spans.push(Span::styled(
+                " 停止中…",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
         if let Some(model) = projections
             .model_selection()
             .last_used
@@ -118,16 +152,21 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
     };
     frame.render_widget(Paragraph::new(Line::from(spans)), content_area);
 
-    // 第二行：快捷键提示（窄终端省略，FR-001-05）。
+    // 第二行：快捷键提示（窄终端省略，FR-001-05）；官方投影运行中追加
+    // [s]停止（REQ-002 AC-002-05）。
     if area.width >= MIN_WIDTH_FOR_HINT {
         let hint_area = Rect {
             y: area.y.saturating_add(1),
             height: 1,
             ..area
         };
+        let mut hint = HINT_LINE.to_string();
+        if official_running(app) {
+            hint.push_str(" [s]停止");
+        }
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                HINT_LINE,
+                hint,
                 Style::default().fg(Color::DarkGray),
             ))),
             hint_area,
@@ -335,5 +374,76 @@ mod tests {
         assert_eq!(color, Color::Rgb(0, 200, 83));
         let (_, color) = connection_label(ConnState::StartupFailed, ColorDepth::Basic);
         assert_eq!(color, Color::Red);
+    }
+
+    #[test]
+    fn insert_mode_and_local_stopping_render_in_status_ac002_05() {
+        let mut app = AppState::default();
+        app.active_session = Some(SessionId("s1".into()));
+        app.conn = ConnState::Ready;
+        app.mode = crate::app::Mode::Insert;
+        app.stop = crate::app::StopState {
+            requested_session: Some(SessionId("s1".into())),
+        };
+        // 官方投影仍 running：本地「停止中」转场。
+        app.sessions.touch("s1", 20).apply(Incoming::Snapshot {
+            cursor: None,
+            records: vec![],
+            has_more: false,
+            projections: Some(serde_json::json!({"running": true})),
+        });
+        let backend = TestBackend::new(120, 2);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render(frame, Rect::new(0, 0, 120, 2), &app))
+            .unwrap();
+        let rendered = rendered_text(&terminal);
+        assert!(
+            rendered.contains("INSERT"),
+            "INSERT 模式指示, text={rendered}"
+        );
+        assert!(
+            rendered.contains("停止中"),
+            "本地停止中转场, text={rendered}"
+        );
+    }
+
+    #[test]
+    fn stop_hint_only_when_official_projection_running() {
+        let mut app = AppState::default();
+        app.active_session = Some(SessionId("s1".into()));
+        app.conn = ConnState::Ready;
+        app.sessions.touch("s1", 20).apply(Incoming::Snapshot {
+            cursor: None,
+            records: vec![],
+            has_more: false,
+            projections: Some(serde_json::json!({"running": true})),
+        });
+        let backend = TestBackend::new(120, 2);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render(frame, Rect::new(0, 0, 120, 2), &app))
+            .unwrap();
+        let rendered = rendered_text(&terminal);
+        assert!(
+            rendered.contains("[s]停止"),
+            "运行中显示停止提示, text={rendered}"
+        );
+
+        // 投影 idle：不显示 [s]停止。
+        app.sessions.touch("s1", 20).apply(Incoming::Snapshot {
+            cursor: None,
+            records: vec![],
+            has_more: false,
+            projections: Some(serde_json::json!({"running": false})),
+        });
+        terminal
+            .draw(|frame| render(frame, Rect::new(0, 0, 120, 2), &app))
+            .unwrap();
+        let rendered = rendered_text(&terminal);
+        assert!(
+            !rendered.contains("[s]停止"),
+            "idle 不显示停止提示, text={rendered}"
+        );
     }
 }

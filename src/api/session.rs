@@ -1,19 +1,41 @@
-//! session/* endpoint wrappers (V0.1 subset: list / follow / page / cancel,
-//! Notes/03 §3/§4).
+//! session/* endpoint wrappers (V0.1 subset: list / follow / page / cancel /
+//! prompt, Notes/03 §3/§4).
 //!
 //! - `session/list`: cursor pagination (unary);
 //! - `session/follow`: snapshot + incremental events (stream);
 //! - `session/page`: older history prepend (unary);
-//! - `session/cancel`: minimal wrapper to stop the running session before
-//!   exit (AC-001-08);
-//! - `session/prompt` belongs to REQ-002 and is not implemented in this layer.
+//! - `session/cancel`: typed stop request (REQ-002: accepted receipt);
+//! - `session/prompt`: typed send request (REQ-002: queue only in V0.1).
 
+use serde::Deserialize;
 use serde_json::Value;
 
 use super::envelope::ClientError;
 use super::mux::{Mux, StreamHandle};
-use super::types::{PageResult, SessionAddress, SessionSeq};
+use super::types::{PageResult, PromptRequest, SessionAddress, SessionSeq};
 use super::unary;
+
+/// `{accepted:true}` receipt shared by `session/prompt` / `session/cancel`
+/// (official value shape read 2026-09-04).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcceptedValue {
+    pub accepted: bool,
+}
+
+/// Parse the accepted receipt and fail-fast on an `accepted=false` rejection
+/// (AC-002-09: a server-side refusal surfaces as a typed error, never as a
+/// silently accepted result).
+fn accepted_receipt(method: &str, value: Value) -> Result<AcceptedValue, ClientError> {
+    let accepted: AcceptedValue = serde_json::from_value(value)
+        .map_err(|e| ClientError::Protocol(format!("{method} 响应形状异常: {e}")))?;
+    if !accepted.accepted {
+        return Err(ClientError::Protocol(format!(
+            "{method} 返回 accepted=false（服务端拒绝）"
+        )));
+    }
+    Ok(accepted)
+}
 
 /// One `session/list` page (tolerant of missing items/nextCursor fields).
 #[derive(Debug, Clone, Default)]
@@ -87,17 +109,31 @@ pub async fn page(
         .map_err(|e| ClientError::Protocol(format!("session/page 响应形状异常: {e}")))
 }
 
-/// `session/cancel`: stop the running session (minimal wrapper for the
-/// AC-001-08 exit semantics).
-/// The shape is not recorded field-by-field in Notes/03; follow the official
-/// registry `{sessionId}` convention — a failure never breaks the exit flow.
+/// `session/prompt` typed unary (REQ-002 §3): posts the official camelCase
+/// args and returns the `{accepted:true}` receipt. Errors keep
+/// `code/message/details` via the shared envelope classification.
+pub async fn prompt(
+    http: &reqwest::Client,
+    base: &str,
+    request: &PromptRequest,
+) -> Result<AcceptedValue, ClientError> {
+    let args = serde_json::to_value(request)
+        .map_err(|e| ClientError::Protocol(format!("session/prompt 参数序列化失败: {e}")))?;
+    let value = unary(http, base, "session/prompt", args).await?;
+    accepted_receipt("session/prompt", value)
+}
+
+/// `session/cancel` typed unary (REQ-002 §3): returns the `{accepted:true}`
+/// receipt so the interactive stop path can judge the outcome; the quit path
+/// stays best-effort.
 pub async fn cancel(
     http: &reqwest::Client,
     base: &str,
     session_id: &str,
-) -> Result<Value, ClientError> {
+) -> Result<AcceptedValue, ClientError> {
     let args = serde_json::json!({ "sessionId": session_id });
-    unary(http, base, "session/cancel", args).await
+    let value = unary(http, base, "session/cancel", args).await?;
+    accepted_receipt("session/cancel", value)
 }
 
 /// One parsed item from the `session/follow` stream. Parsing of the follow

@@ -50,6 +50,23 @@ newtype!(
     String,
     "Request idempotency key (D-4: repeated delivery applies idempotently)"
 );
+newtype!(
+    SessionRequestId,
+    String,
+    "Client-minted prompt identity (brand `session-request-id`; persisted on the accepted user message source)"
+);
+
+/// Mint a new session request idempotency key: same pid+counter style as the
+/// api-layer rpcId (no UUID crate added).
+pub fn mint_request_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(1);
+    format!(
+        "dshtui-req-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    )
+}
 
 // Numeric newtypes allow Copy (the window reducer copies them heavily; avoids
 // move noise).
@@ -82,6 +99,52 @@ impl SessionAddress {
             mode: None,
         }
     }
+}
+
+// ---------- session/prompt request types (REQ-002 §3; official fields read
+// 2026-09-04 from @deepseek-ai/dsh-api-session-controller@0.1.2-alpha.5) ----------
+
+/// `session/prompt` mode: V0.1 only constructs `Queue` (including sending
+/// while running); `Steer` is the V0.2/REQ-003 extension slot (D-10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PromptMode {
+    Queue,
+    Steer,
+}
+
+/// Prompt content part (official shape `{type:"text",text}`; the `image` part
+/// belongs to V0.4 and is only tolerated on the wire here, never constructed
+/// in V0.1).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum PromptContentPart {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "image")]
+    Image {
+        #[serde(rename = "mediaType")]
+        media_type: String,
+        data: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
+}
+
+/// `session/prompt` request args (= envelope `payload.args`).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptRequest {
+    /// Client-minted idempotency key persisted on the accepted user message
+    /// source (`user-rpc.rpcId`); reconciles optimistic echo with durable
+    /// events (AC-002-06).
+    pub request_id: SessionRequestId,
+    pub session_id: SessionId,
+    pub mode: PromptMode,
+    pub content: Vec<PromptContentPart>,
+    /// Optional IANA tz; never sent in V0.1 (omitted when None).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_time_zone: Option<String>,
 }
 
 // ---------- SessionHistoryRecord (Notes/03 §4.3, two variants) ----------
@@ -120,6 +183,28 @@ pub struct SessionWireEvent {
     /// never dropped.
     #[serde(default)]
     pub data: Option<serde_json::Value>,
+}
+
+impl SessionWireEvent {
+    /// Reconciliation requestId of a durable event: prefer the top-level
+    /// `requestId` (existing envelope field); fall back to the official user
+    /// event source (`user-rpc.rpcId`, MessageSourceMap read 2026-09-04).
+    /// Protocol shape knowledge lives here in the api layer.
+    pub fn reconcile_id(&self) -> Option<&str> {
+        if let Some(rid) = self.request_id.as_deref() {
+            return Some(rid);
+        }
+        if self.event_type.starts_with("user/") {
+            return self
+                .data
+                .as_ref()
+                .and_then(|d| d.get("source"))
+                .and_then(|s| s.get("user-rpc"))
+                .and_then(|u| u.get("rpcId"))
+                .and_then(|v| v.as_str());
+        }
+        None
+    }
 }
 
 /// packed chunk row (stored as-is, not expanded into per-delta items — key to
