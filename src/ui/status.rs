@@ -12,6 +12,9 @@ use crate::ui::layout::{color_depth, ColorDepth};
 
 /// 快捷键提示行（FR-001-05，README 键位口径；[/] 搜索为 REQ-002 预留但仍展示）。
 const HINT_LINE: &str = "[i]输入 [/]搜索 [f]切换 [?]帮助 [q]退出";
+/// IMAGEVIEW 模式提示行（REQ-004 D-14/05 §10：`o` 系统查看器 `y` 复制路径
+/// `q` 关闭）。
+const IMAGE_HINT_LINE: &str = "[o]系统查看器 [y]复制路径 [q]关闭";
 /// 窄终端省略快捷键提示行（FR-001-05）。
 const MIN_WIDTH_FOR_HINT: u16 = 50;
 
@@ -213,6 +216,12 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
             Style::default().fg(Color::Red),
         ));
     }
+    if let Some(notice) = &app.notice {
+        spans.push(Span::styled(
+            format!("  {notice}"),
+            Style::default().fg(Color::Green),
+        ));
+    }
     if app.conn == ConnState::StartupFailed {
         spans.push(Span::styled(
             "  dsh web unavailable; press r to retry or q to quit",
@@ -232,7 +241,19 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         height: 1,
         ..area
     };
-    frame.render_widget(Paragraph::new(Line::from(spans)), content_area);
+    let mut mode_spans = Vec::new();
+    if app.mode == crate::app::Mode::ImageView {
+        // REQ-004：IMAGEVIEW 模式徽标（Notes/05 §10 状态栏 `IMAGE`）。
+        mode_spans.push(Span::styled(
+            " IMAGE ",
+            Style::default()
+                .fg(Color::LightMagenta)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    let mut all_spans = mode_spans;
+    all_spans.extend(spans);
+    frame.render_widget(Paragraph::new(Line::from(all_spans)), content_area);
 
     // 第二行：快捷键提示（窄终端省略，FR-001-05）；官方投影运行中追加
     // [s]停止（REQ-002 AC-002-05）。
@@ -242,8 +263,12 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
             height: 1,
             ..area
         };
-        let mut hint = HINT_LINE.to_string();
-        if official_running(app) {
+        let mut hint = if app.mode == crate::app::Mode::ImageView {
+            IMAGE_HINT_LINE.to_string()
+        } else {
+            HINT_LINE.to_string()
+        };
+        if app.mode != crate::app::Mode::ImageView && official_running(app) {
             hint.push_str(" [s]停止");
         }
         frame.render_widget(

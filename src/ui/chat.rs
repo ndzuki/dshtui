@@ -1,13 +1,16 @@
 //! Transcript/chat rendering.
 
+use std::collections::HashMap;
+
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block as TuiBlock, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 
+use crate::api::types::AttachmentId;
 use crate::app::{AppState, Mode};
-use crate::model::{Block, PendingEcho, PendingEchoStatus, TranscriptWindow};
+use crate::model::{AttachmentRef, Block, PendingEcho, PendingEchoStatus, TranscriptWindow};
 
 use super::format_hhmm;
 use super::markdown;
@@ -26,7 +29,13 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         frame.render_widget(body, area);
         return;
     };
-    let mut lines = window_lines_with_width(window, area.width as usize);
+    let mut lines = window_lines_with_width(
+        window,
+        area.width as usize,
+        &app.image_meta,
+        &app.image_errors,
+        app.kitty_capable,
+    );
     apply_highlights(&mut lines, app);
     draw_lines(
         frame,
@@ -39,14 +48,26 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
 
 /// Render a transcript window without requiring mutable model access.
 /// （无高亮：视觉选择/搜索命中样式走 `render` + `apply_highlights`。）
+/// `image_meta`/`image_errors` 为 REQ-004 拉取后回填/错误占位标注源；
+/// `kitty_capable` 控制非 Kitty 的「系统查看器」提示（AC-004-03/07）。
+#[allow(clippy::too_many_arguments)]
 pub fn render_window(
     frame: &mut Frame<'_>,
     area: Rect,
     window: &TranscriptWindow,
     offset: usize,
     follow_tail: bool,
+    image_meta: &HashMap<AttachmentId, AttachmentRef>,
+    image_errors: &HashMap<AttachmentId, String>,
+    kitty_capable: bool,
 ) {
-    let lines = window_lines_with_width(window, area.width as usize);
+    let lines = window_lines_with_width(
+        window,
+        area.width as usize,
+        image_meta,
+        image_errors,
+        kitty_capable,
+    );
     draw_lines(frame, area, lines, offset, follow_tail);
 }
 
@@ -74,15 +95,29 @@ fn draw_lines(
 /// （无上下文渲染）；`render`/`render_window` 用真实宽度走
 /// `window_lines_with_width`。
 pub fn window_lines(window: &TranscriptWindow) -> Vec<ChatLine> {
-    window_lines_with_width(window, 80)
+    window_lines_with_width(window, 80, &HashMap::new(), &HashMap::new(), true)
 }
 
 /// 窗口全部行（指定宽度：markdown 换行与渲染缓存 key 都依赖它）。
-pub fn window_lines_with_width(window: &TranscriptWindow, width: usize) -> Vec<ChatLine> {
+/// `image_meta`/`image_errors`/`kitty_capable`：REQ-004 图片占位标注源。
+pub fn window_lines_with_width(
+    window: &TranscriptWindow,
+    width: usize,
+    image_meta: &HashMap<AttachmentId, AttachmentRef>,
+    image_errors: &HashMap<AttachmentId, String>,
+    kitty_capable: bool,
+) -> Vec<ChatLine> {
     let len = window.len();
     let mut out = Vec::new();
     for (i, block) in window.blocks().enumerate() {
-        for line in block_lines(block, i + 1 == len, width) {
+        for line in block_lines(
+            block,
+            i + 1 == len,
+            width,
+            image_meta,
+            image_errors,
+            kitty_capable,
+        ) {
             out.push(ChatLine {
                 block_index: Some(i),
                 line,
@@ -173,7 +208,16 @@ fn echo_line(echo: &PendingEcho) -> Line<'static> {
 /// FR-001-04 §4：携带 time 的 Block 渲染 HH:MM 前缀（UTC，纯展示）；
 /// 状态标记：running（空 chunks 的 assistant）●、pending（末尾 user 等待回复）…、
 /// error（tool result isError）!。助手块经 markdown 渲染（REQ-003），可多行。
-fn block_lines(block: &Block, is_last: bool, width: usize) -> Vec<Line<'static>> {
+/// `image_meta`/`image_errors`/`kitty_capable` 为 REQ-004 图片占位标注源。
+#[allow(clippy::too_many_arguments)]
+fn block_lines(
+    block: &Block,
+    is_last: bool,
+    width: usize,
+    image_meta: &HashMap<AttachmentId, AttachmentRef>,
+    image_errors: &HashMap<AttachmentId, String>,
+    kitty_capable: bool,
+) -> Vec<Line<'static>> {
     let mut spans: Vec<Span<'static>> = Vec::new();
     match block {
         Block::UserMessage { seq, content, time } => {
@@ -321,15 +365,46 @@ fn block_lines(block: &Block, is_last: bool, width: usize) -> Vec<Line<'static>>
                     .fg(Color::LightMagenta)
                     .add_modifier(Modifier::BOLD),
             ));
-            spans.push(Span::raw(format!(
-                "{}{}{}",
-                name.as_deref().unwrap_or("image"),
-                dims.as_deref().map(|d| format!(" {d}")).unwrap_or_default(),
-                attachment_id
-                    .as_deref()
-                    .map(|id| format!(" [{id}]"))
-                    .unwrap_or_default()
-            )));
+            // AC-004-01：恒占位 `名称 · 宽×高`；拉取成功后以 AttachmentRef
+            // 回填刷新标注（占位位置不变）；失败 → 错误占位 + 可读提示。
+            let meta = attachment_id
+                .as_deref()
+                .and_then(|id| image_meta.get(&AttachmentId(id.to_string())));
+            let error = attachment_id
+                .as_deref()
+                .and_then(|id| image_errors.get(&AttachmentId(id.to_string())));
+            let display_name = meta
+                .and_then(|m| m.name.as_deref())
+                .or(name.as_deref())
+                .unwrap_or("image");
+            let display_dims = match meta {
+                Some(m) if m.width > 0 && m.height > 0 => {
+                    format!("{}x{}", m.width, m.height)
+                }
+                _ => dims.clone().unwrap_or_else(|| "?".into()),
+            };
+            if let Some(err) = error {
+                spans.push(Span::raw(format!("{display_name} · ")));
+                spans.push(Span::styled(
+                    format!("{display_dims} ✗ {err}"),
+                    Style::default().fg(Color::Red),
+                ));
+            } else {
+                spans.push(Span::raw(format!("{display_name} · {display_dims}")));
+            }
+            if error.is_none() && !kitty_capable {
+                // AC-004-03/07: show a visible fallback box/path hint in the transcript.
+                spans.push(Span::styled(
+                    " [image placeholder] [o]system viewer",
+                    Style::default().fg(Color::DarkGray),
+                ));
+                if let Some(id) = attachment_id {
+                    spans.push(Span::styled(
+                        format!(" path:{id}"),
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                }
+            }
             vec![Line::from(spans)]
         }
         Block::Unknown {
@@ -448,7 +523,18 @@ mod tests {
         let backend = TestBackend::new(50, 8);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| render_window(frame, frame.area(), &window, 0, true))
+            .draw(|frame| {
+                render_window(
+                    frame,
+                    frame.area(),
+                    &window,
+                    0,
+                    true,
+                    &HashMap::new(),
+                    &HashMap::new(),
+                    true,
+                )
+            })
             .unwrap();
         let rendered = rendered_text(&terminal);
         assert!(rendered.contains("hello"));
@@ -480,7 +566,18 @@ mod tests {
         let backend = TestBackend::new(50, 8);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| render_window(frame, frame.area(), &window, 0, true))
+            .draw(|frame| {
+                render_window(
+                    frame,
+                    frame.area(),
+                    &window,
+                    0,
+                    true,
+                    &HashMap::new(),
+                    &HashMap::new(),
+                    true,
+                )
+            })
             .unwrap();
         let rendered = rendered_text(&terminal);
         assert!(
@@ -512,7 +609,18 @@ mod tests {
         let backend = TestBackend::new(50, 8);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| render_window(frame, frame.area(), &window, 0, true))
+            .draw(|frame| {
+                render_window(
+                    frame,
+                    frame.area(),
+                    &window,
+                    0,
+                    true,
+                    &HashMap::new(),
+                    &HashMap::new(),
+                    true,
+                )
+            })
             .unwrap();
         let rendered = rendered_text(&terminal);
         assert!(rendered.contains("…"), "pending 标记, text={rendered}");
@@ -543,7 +651,18 @@ mod tests {
         let backend = TestBackend::new(80, 6);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| render_window(frame, frame.area(), &window, 0, true))
+            .draw(|frame| {
+                render_window(
+                    frame,
+                    frame.area(),
+                    &window,
+                    0,
+                    true,
+                    &HashMap::new(),
+                    &HashMap::new(),
+                    true,
+                )
+            })
             .unwrap();
         let rendered = rendered_text(&terminal);
         assert!(rendered.contains("…"), "pending 回显标记, text={rendered}");
@@ -570,7 +689,18 @@ mod tests {
             data: Some(serde_json::json!({"content": "optimistic-msg"})),
         }));
         terminal
-            .draw(|frame| render_window(frame, frame.area(), &window, 0, true))
+            .draw(|frame| {
+                render_window(
+                    frame,
+                    frame.area(),
+                    &window,
+                    0,
+                    true,
+                    &HashMap::new(),
+                    &HashMap::new(),
+                    true,
+                )
+            })
             .unwrap();
         let rendered = rendered_text(&terminal);
         assert_eq!(

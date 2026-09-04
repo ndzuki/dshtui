@@ -85,7 +85,8 @@ const DEFAULT_WINDOW_MESSAGES: usize = 200;
 const DEFAULT_PAGE_SIZE: usize = 50;
 const DEFAULT_TICK_MS: u64 = 33;
 const DEFAULT_SIDEBAR_WIDTH: u16 = 32;
-const DEFAULT_CACHE_BYTES: u64 = 32 * 1024 * 1024;
+/// 图片缓存预算默认 32MB（REQ-004 §3；pub 供 AppState 默认缓存构造）。
+pub const DEFAULT_CACHE_BYTES: u64 = 32 * 1024 * 1024;
 const DEFAULT_RSS_TARGET_MB: u64 = 80;
 
 impl Default for ServerConfig {

@@ -3,6 +3,8 @@
 pub mod approval;
 pub mod chat;
 pub mod composer;
+pub mod image;
+pub mod image_view;
 pub mod layout;
 pub mod markdown;
 pub mod outline;
@@ -45,6 +47,14 @@ pub fn render(frame: &mut Frame<'_>, app: &AppState) {
                 .title(" Reconnecting "),
         );
         frame.render_widget(body, areas.center);
+    } else if app.mode == crate::app::Mode::ImageView {
+        // REQ-004：IMAGEVIEW 模式中心区渲染 ImageView（仅 Kitty 出现）。
+        image_view::render(
+            frame,
+            areas.center,
+            &app.image_view,
+            app.image_frame.as_ref(),
+        );
     } else {
         chat::render(frame, areas.center, app);
     }

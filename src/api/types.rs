@@ -55,6 +55,16 @@ newtype!(
     String,
     "Client-minted prompt identity (brand `session-request-id`; persisted on the accepted user message source)"
 );
+newtype!(
+    AttachmentId,
+    String,
+    "Attachment identifier (opaque id — never a filesystem path or URL, REQ-004 §7)"
+);
+newtype!(
+    MediaType,
+    String,
+    "Attachment media type (image/png | image/jpeg | image/webp | image/gif whitelist)"
+);
 
 /// Mint a new session request idempotency key: same pid+counter style as the
 /// api-layer rpcId (no UUID crate added).

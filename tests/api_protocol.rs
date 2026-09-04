@@ -1,11 +1,13 @@
 use std::time::Duration;
 
+use base64::Engine as _;
+use dshtui::api::attachment;
 use dshtui::api::auth::authenticate;
 use dshtui::api::envelope::{remote_error, ClientRequest, ErrorClass, RpcError, ServerResponse};
 use dshtui::api::session::{self, cancel, prompt, AcceptedValue};
 use dshtui::api::types::{
-    ControlItem, FollowFrame, PromptContentPart, PromptMode, PromptRequest, SessionId,
-    SessionRequestId, SessionSeq,
+    AttachmentId, ControlItem, FollowFrame, PromptContentPart, PromptMode, PromptRequest,
+    SessionId, SessionRequestId, SessionSeq,
 };
 use dshtui::api::{ClientError, Mux};
 use futures_util::{SinkExt, StreamExt};
@@ -57,6 +59,41 @@ fn queue_prompt_request() -> PromptRequest {
         }],
         client_time_zone: None,
     }
+}
+
+/// Read one full HTTP/1.1 request (headers + Content-Length body).
+async fn read_http_request(socket: &mut tokio::net::TcpStream) -> (String, Vec<u8>) {
+    let mut raw = Vec::new();
+    let mut buf = [0_u8; 4096];
+    loop {
+        let n = socket.read(&mut buf).await.unwrap();
+        if n == 0 {
+            break;
+        }
+        raw.extend_from_slice(&buf[..n]);
+        let Some(hdr_end) = raw.windows(4).position(|w| w == b"\r\n\r\n") else {
+            continue;
+        };
+        let headers = String::from_utf8_lossy(&raw[..hdr_end]).to_string();
+        let content_len = headers
+            .lines()
+            .find_map(|l| {
+                let (name, value) = l.split_once(':')?;
+                if name.trim().eq_ignore_ascii_case("content-length") {
+                    value.trim().parse::<usize>().ok()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0);
+        if raw.len() >= hdr_end + 4 + content_len {
+            return (
+                headers,
+                raw[hdr_end + 4..hdr_end + 4 + content_len].to_vec(),
+            );
+        }
+    }
+    (String::new(), raw)
 }
 
 #[test]
@@ -649,5 +686,134 @@ async fn approval_reply_posts_identity_and_outcome_vocabulary() {
     )
     .await
     .expect("outcome reply accepted");
+    server.await.unwrap();
+}
+
+/// 回复一个 unary HTTP 响应（echo 请求的 rpcId；Content-Length 必须准确）。
+async fn write_http_json(socket: &mut tokio::net::TcpStream, status: &str, body: &Value) {
+    let body = body.to_string();
+    socket
+        .write_all(
+            format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn attachment_fetch_sends_envelope_and_decodes_base64_data() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let (headers, body) = read_http_request(&mut socket).await;
+        assert!(
+            headers.starts_with("POST /api/session/attachment HTTP/1.1"),
+            "{headers}"
+        );
+
+        let request: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(request["type"], "client-request");
+        assert_eq!(request["method"], "session/attachment");
+        assert_eq!(request["payload"]["args"]["sessionId"], "sess-1");
+        assert_eq!(request["payload"]["args"]["attachmentId"], "att-9");
+        let rpc_id = request["rpcId"].as_str().unwrap();
+
+        let png: Vec<u8> = vec![0x89, b'P', b'N', b'G', 1, 2, 3, 4];
+        // 用 base64 crate 独立编码（不依赖被测模块的编解码路径）。
+        let data = base64::engine::general_purpose::STANDARD.encode(&png);
+        write_http_json(
+            &mut socket,
+            "200 OK",
+            &json!({
+                "type": "server-response",
+                "rpcId": rpc_id,
+                "result": {
+                    "ok": true,
+                    "value": {
+                        "attachment": {
+                            "attachmentId": "att-9",
+                            "mediaType": "image/png",
+                            "bytes": 8,
+                            "width": 640,
+                            "height": 480,
+                            "name": "design.png",
+                            "originalDimensions": {"width": 1280, "height": 960}
+                        },
+                        "data": data
+                    }
+                }
+            }),
+        )
+        .await;
+    });
+
+    let http = reqwest::Client::builder().build().unwrap();
+    let base = format!("http://{addr}");
+    let got = attachment::fetch(
+        &http,
+        &base,
+        &SessionId("sess-1".into()),
+        &AttachmentId("att-9".into()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(got.attachment_id.0, "att-9");
+    assert_eq!(got.media_type.0, "image/png");
+    assert_eq!(got.bytes, 8);
+    assert_eq!(got.width, 640);
+    assert_eq!(got.height, 480);
+    assert_eq!(got.name.as_deref(), Some("design.png"));
+    let od = got.original_dimensions.as_ref().unwrap();
+    assert_eq!((od.width, od.height), (1280, 960));
+    assert_eq!(got.image_bytes, vec![0x89, b'P', b'N', b'G', 1, 2, 3, 4]);
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn attachment_fetch_error_envelope_classifies_by_code() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let (_, body) = read_http_request(&mut socket).await;
+        let request: Value = serde_json::from_slice(&body).unwrap();
+        let rpc_id = request["rpcId"].as_str().unwrap();
+        write_http_json(
+            &mut socket,
+            "200 OK",
+            &json!({
+                "type": "server-response",
+                "rpcId": rpc_id,
+                "result": {
+                    "ok": false,
+                    "error": {"code": "PERMISSION_DENIED", "message": "需审批"}
+                }
+            }),
+        )
+        .await;
+    });
+
+    let http = reqwest::Client::builder().build().unwrap();
+    let err = attachment::fetch(
+        &http,
+        &format!("http://{addr}"),
+        &SessionId("sess-1".into()),
+        &AttachmentId("att-9".into()),
+    )
+    .await
+    .unwrap_err();
+    match &err {
+        dshtui::api::ClientError::Remote { code, class, .. } => {
+            assert_eq!(code, "PERMISSION_DENIED");
+            assert_eq!(*class, ErrorClass::PermissionDenied, "权限类不自动重试");
+        }
+        other => panic!("expected Remote error, got {other:?}"),
+    }
+    assert_eq!(err.class(), ErrorClass::PermissionDenied);
     server.await.unwrap();
 }

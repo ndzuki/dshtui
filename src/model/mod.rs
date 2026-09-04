@@ -6,6 +6,7 @@
 //! capacity/anchor (Step 3 is the correctness seam).
 
 pub mod draft;
+pub mod image;
 pub mod projections;
 pub mod search;
 pub mod session;
@@ -13,6 +14,10 @@ pub mod workspace;
 pub mod yank;
 
 pub use draft::{DraftRegistry, DraftState, InputHistory};
+pub use image::{
+    image_block_of, is_supported_image, AttachmentRef, ImageBlockRef, ImageCacheEntry,
+    ImageViewError, ImageViewPhase, ImageViewState, OriginalDimensions, SUPPORTED_IMAGE_TYPES,
+};
 pub use projections::ProjectionSnapshot;
 pub use search::{SearchIndex, SearchItem, SearchKind, SearchKindFilter, SearchMatch};
 pub use session::{

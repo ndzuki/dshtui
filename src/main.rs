@@ -312,6 +312,9 @@ async fn run_startup_guidance(
 async fn run_connected(eff: Effective, token: String, client: DshClient) -> Result<(), String> {
     let mut terminal = TerminalSession::enter().map_err(|e| e.to_string())?;
     let mut app = AppState::new(eff.perf.window_messages);
+    // REQ-004：启动检测一次 Kitty 能力（06 §6）+ 注入图片缓存预算。
+    app.kitty_capable = dshtui::ui::image::kitty_supported();
+    app.set_cache_budget(eff.perf.cache_bytes);
     let mut decoder = KeyDecoder::new();
     let mut client = Some(client);
     let mut mux: Option<Mux> = None;
@@ -388,6 +391,7 @@ async fn run_connected(eff: Effective, token: String, client: DshClient) -> Resu
                 Mode::Search => InputMode::Search,
                 Mode::Visual => InputMode::Visual,
                 Mode::Approval => InputMode::Approval,
+                Mode::ImageView => InputMode::ImageView,
             };
             if let Some(command) = decoder.decode(mode, input) {
                 commands.extend(app.handle_command(command));
@@ -397,6 +401,8 @@ async fn run_connected(eff: Effective, token: String, client: DshClient) -> Resu
             commands.extend(app.handle(event));
         }
     }
+    // REQ-004 退出清理：未入缓存的临时文件（缓存目录由 ImageCache Drop 清理）。
+    app.cleanup_transient_files();
     Ok(())
 }
 
@@ -696,6 +702,271 @@ async fn execute_one(
                 ok: outcome.1,
             }));
         }
+        Cmd::FetchAttachment {
+            session_id,
+            attachment_id,
+            block_seq,
+            for_viewer,
+        } => {
+            // Keep the frame loop responsive while the remote unary request is in flight.
+            let Some(client) = client.as_ref() else {
+                // 未连接：清掉在途标记并走既有重连（AC-004-06/08 恢复路径），
+                // 否则该图会永久“在途”导致重连后无法重开。
+                let event = AppEvent::AttachmentFailed {
+                    session_id,
+                    attachment_id,
+                    block_seq,
+                    code: "network".into(),
+                    message: "附件拉取时连接未就绪".into(),
+                    retryable: true,
+                    for_viewer,
+                };
+                commands.extend(app.handle(event));
+                return;
+            };
+            let http = client.http.clone();
+            let base = client.base.clone();
+            let cache = std::sync::Arc::clone(&app.image_cache);
+            let kitty = app.kitty_capable && !for_viewer;
+            let font_size = dshtui::ui::image::terminal_font_size();
+            let area = encode_area(app);
+            let frame_id = app.next_kitty_frame_id();
+            let event_tx = event_tx.clone();
+            tokio::spawn(async move {
+                let fetched =
+                    dshtui::api::attachment::fetch(&http, &base, &session_id, &attachment_id).await;
+                // Decode/downsample/Kitty encoding runs off the async executor.
+                let _ = tokio::task::spawn_blocking::<_, ()>(move || {
+                    let event = match fetched {
+                        Ok(data) => {
+                            let media = data.media_type.clone();
+                            let meta = dshtui::model::AttachmentRef::from(&data);
+                            match dshtui::ui::image::decode_image(&data.image_bytes, &media) {
+                                Ok(decoded) => {
+                                    let temp_file = match cache
+                                        .write_temp_file(&media, data.image_bytes.clone())
+                                    {
+                                        Ok(p) => p,
+                                        Err(e) => {
+                                            tracing::error!(error = %e, "附件临时文件写入失败");
+                                            let _ = event_tx.blocking_send(AppEvent::AttachmentFailed {
+                                                session_id,
+                                                attachment_id,
+                                                block_seq,
+                                                code: "io".into(),
+                                                message: format!("临时文件写入失败: {e}"),
+                                                retryable: false,
+                                                for_viewer,
+                                            });
+                                            return;
+                                        }
+                                    };
+                                    let entry = dshtui::model::ImageCacheEntry {
+                                        attachment_id: attachment_id.clone(),
+                                        media_type: media.clone(),
+                                        bytes: data.image_bytes.len() as u64,
+                                        width: decoded.width as u64,
+                                        height: decoded.height as u64,
+                                        temp_file: temp_file.clone(),
+                                        last_used: 0,
+                                    };
+                                    if !kitty {
+                                        let _ = event_tx.blocking_send(AppEvent::AttachmentReady {
+                                            session_id,
+                                            attachment_id,
+                                            block_seq,
+                                            meta,
+                                            frame: None,
+                                            entry,
+                                            cached: false,
+                                            for_viewer,
+                                        });
+                                        return;
+                                    }
+                                    match dshtui::ui::image::kitty_frame(
+                                        image::DynamicImage::ImageRgba8(decoded.rgba),
+                                        font_size,
+                                        area,
+                                        frame_id,
+                                    ) {
+                                        Ok(f) => event_tx.blocking_send(AppEvent::AttachmentReady {
+                                            session_id,
+                                            attachment_id,
+                                            block_seq,
+                                            meta,
+                                            frame: Some(dshtui::app::KittyFrame(f)),
+                                            entry,
+                                            cached: false,
+                                            for_viewer,
+                                        }),
+                                        Err(e) => {
+                                            let _ = std::fs::remove_file(&temp_file);
+                                            tracing::error!(code = %e.code, error = %e.message, "Kitty 图片帧编码失败");
+                                            event_tx.blocking_send(AppEvent::AttachmentFailed {
+                                                session_id,
+                                                attachment_id,
+                                                block_seq,
+                                                code: e.code,
+                                                message: e.message,
+                                                retryable: false,
+                                                for_viewer,
+                                            })
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::error!(code = %e.code, error = %e.message, "附件图片解码失败");
+                                    event_tx.blocking_send(AppEvent::AttachmentFailed {
+                                        session_id,
+                                        attachment_id,
+                                        block_seq,
+                                        code: e.code,
+                                        message: e.message,
+                                        retryable: false,
+                                        for_viewer,
+                                    })
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, "附件远程拉取失败");
+                            let retryable = e.class() == dshtui::api::ErrorClass::Retryable;
+                            let code = match &e {
+                                dshtui::api::ClientError::Remote { code, .. } => code.clone(),
+                                _ if retryable => "network".into(),
+                                _ => "attachment".into(),
+                            };
+                            event_tx.blocking_send(AppEvent::AttachmentFailed {
+                                session_id,
+                                attachment_id,
+                                block_seq,
+                                code,
+                                message: e.to_string(),
+                                retryable,
+                                for_viewer,
+                            })
+                        }
+                    };
+                    let _ = event;
+                })
+                .await;
+            });
+        }
+        Cmd::RenderCachedImage {
+            session_id,
+            attachment_id,
+            block_seq,
+            temp_file,
+            media_type,
+        } => {
+            // REQ-004 缓存命中：从临时文件重解码 + kitty 编码（不重复拉取）。
+            let meta = app.image_meta.get(&attachment_id).cloned();
+            let font_size = dshtui::ui::image::terminal_font_size();
+            let area = encode_area(app);
+            let frame_id = app.next_kitty_frame_id();
+            let cache = std::sync::Arc::clone(&app.image_cache);
+            let event_tx = event_tx.clone();
+            tokio::task::spawn_blocking::<_, ()>(move || {
+                let event = match std::fs::read(&temp_file) {
+                    Ok(bytes) => match dshtui::ui::image::decode_image(&bytes, &media_type) {
+                        Ok(decoded) => {
+                            let meta = meta.unwrap_or_else(|| dshtui::model::AttachmentRef {
+                                attachment_id: attachment_id.clone(),
+                                media_type: media_type.clone(),
+                                bytes: bytes.len() as u64,
+                                width: decoded.width as u64,
+                                height: decoded.height as u64,
+                                name: None,
+                                original_dimensions: None,
+                            });
+                            let entry = match cache.get(&attachment_id) {
+                                Some(e) => e,
+                                None => dshtui::model::ImageCacheEntry {
+                                    attachment_id: attachment_id.clone(),
+                                    media_type: media_type.clone(),
+                                    bytes: bytes.len() as u64,
+                                    width: decoded.width as u64,
+                                    height: decoded.height as u64,
+                                    temp_file: temp_file.clone(),
+                                    last_used: 0,
+                                },
+                            };
+                            match dshtui::ui::image::kitty_frame(
+                                image::DynamicImage::ImageRgba8(decoded.rgba),
+                                font_size,
+                                area,
+                                frame_id,
+                            ) {
+                                Ok(f) => AppEvent::AttachmentReady {
+                                    session_id,
+                                    attachment_id,
+                                    block_seq,
+                                    meta,
+                                    frame: Some(dshtui::app::KittyFrame(f)),
+                                    entry,
+                                    cached: true,
+                                    for_viewer: false,
+                                },
+                                Err(e) => AppEvent::AttachmentFailed {
+                                    session_id,
+                                    attachment_id,
+                                    block_seq,
+                                    code: e.code,
+                                    message: e.message,
+                                    retryable: false,
+                                    for_viewer: false,
+                                },
+                            }
+                        }
+                        Err(e) => AppEvent::AttachmentFailed {
+                            session_id,
+                            attachment_id,
+                            block_seq,
+                            code: e.code,
+                            message: e.message,
+                            retryable: false,
+                            for_viewer: false,
+                        },
+                    },
+                    Err(e) => AppEvent::AttachmentFailed {
+                        session_id,
+                        attachment_id,
+                        block_seq,
+                        code: "io".into(),
+                        message: format!("缓存文件读取失败: {e}"),
+                        retryable: false,
+                        for_viewer: false,
+                    },
+                };
+                let _ = event_tx.blocking_send(event);
+            });
+        }
+        Cmd::OpenSystemViewer { path } => {
+            // AC-004-05/07：`open`/`xdg-open` 子进程不阻塞（spawn 不 wait）。
+            if !path.exists() {
+                app.last_error = Some("图片文件不存在，无法打开".into());
+                return;
+            }
+            let spawned = if cfg!(target_os = "macos") {
+                std::process::Command::new("open").arg(&path).spawn()
+            } else {
+                std::process::Command::new("xdg-open").arg(&path).spawn()
+            };
+            if let Err(e) = spawned {
+                app.last_error = Some(format!("系统查看器打开失败: {e}"));
+            }
+        }
+        Cmd::CopyImageText { text } => {
+            // AC-004-05 `y`：复用 REQ-003 降级链（arboard → OSC52 → tmux
+            // buffer，§4 复制口径），结果走 reducer 事件（单一状态变更 seam）。
+            let outcome = tokio::task::spawn_blocking(move || clipboard_write(text))
+                .await
+                .unwrap_or((dshtui::model::YankBackend::Unavailable, false));
+            commands.extend(app.handle(AppEvent::CopyDone {
+                backend: outcome.0,
+                ok: outcome.1,
+            }));
+        }
         Cmd::Reconnect { .. } => {
             // Handled at the top of the run loop so the UI keeps painting.
             commands.push_front(command);
@@ -703,6 +974,12 @@ async fn execute_one(
         Cmd::RestoreTerminal => {}
         Cmd::Exit => app.exited = true,
     }
+}
+
+/// 编码时的视口区域（与 `ui::split` 同一 seam：ImageView 中心区尺寸）。
+fn encode_area(app: &AppState) -> ratatui::layout::Rect {
+    let full = ratatui::layout::Rect::new(0, 0, app.width, app.height);
+    dshtui::ui::split(full, app.focus == dshtui::app::Focus::Details).center
 }
 
 /// Open a stream on the shared mux, creating the mux connection first if needed.

@@ -25,7 +25,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use serde_json::Value;
 
 use crate::api::types::{
-    ChunkRow, SessionHistoryRecord, SessionLogOffset, SessionRequestId, SessionSeq,
+    ChunkData, ChunkRow, SessionHistoryRecord, SessionLogOffset, SessionRequestId, SessionSeq,
     SessionWireEvent,
 };
 
@@ -407,23 +407,29 @@ impl TranscriptWindow {
             self.seen_request.insert(rid.to_string());
         }
         let head_before = self.head_seq();
-        let block = block_from_event(ev, seq);
+        let blocks = blocks_from_event(ev, seq);
+        let appended = blocks.len();
         // Fast-path tail append / slow-path binary-search insert (repair
-        // events arriving out of order stay ascending).
+        // events arriving out of order stay ascending). Multiple blocks from
+        // one event (AC-004-01) keep their wire order.
         if self
             .blocks
             .back()
             .map(|b| b.seq())
             .map_or(true, |tail| seq > tail)
         {
-            self.blocks.push_back(block);
+            for block in blocks {
+                self.blocks.push_back(block);
+            }
         } else {
             let idx = self.blocks.partition_point(|b| b.seq() < seq);
-            self.blocks.insert(idx, block);
+            for (offset, block) in blocks.into_iter().enumerate() {
+                self.blocks.insert(idx + offset, block);
+            }
         }
         self.evict();
         ApplyEffect::TailAppended {
-            appended: 1,
+            appended,
             // anchor_stable: the tail append did not move the window head
             // (scroll anchor stable, no UI jitter).
             anchor_stable: head_before.is_none() || self.head_seq() == head_before,
@@ -477,7 +483,7 @@ impl TranscriptWindow {
                     }
                 }
             }
-            if self.ingest_record(rec) {
+            if self.ingest_record(rec) > 0 {
                 inserted += 1;
             }
         }
@@ -496,28 +502,33 @@ impl TranscriptWindow {
         }
     }
 
-    /// Insert one record in sequence order. Returns whether a visible block was inserted.
-    fn ingest_record(&mut self, rec: SessionHistoryRecord) -> bool {
+    /// Insert one record in sequence order. Returns the number of visible
+    /// blocks inserted (one event may expand to host + image blocks,
+    /// AC-004-01).
+    fn ingest_record(&mut self, rec: SessionHistoryRecord) -> usize {
         match &rec {
             SessionHistoryRecord::Event { event } => {
                 let Some(seq) = event.seq else {
                     tracing::warn!(event_type = %event.event_type, "event missing seq; skipped");
-                    return false;
+                    return 0;
                 };
                 if self.seen_seq.contains(&seq.0) {
-                    return false;
+                    return 0;
                 }
                 if let Some(rid) = event.request_id.as_deref() {
                     if self.seen_request.contains(rid) {
-                        return false;
+                        return 0;
                     }
                     self.seen_request.insert(rid.to_string());
                 }
                 self.seen_seq.insert(seq.0);
-                let block = block_from_event(event, seq);
+                let blocks = blocks_from_event(event, seq);
+                let inserted = blocks.len();
                 let idx = self.blocks.partition_point(|b| b.seq() < seq);
-                self.blocks.insert(idx, block);
-                true
+                for (offset, block) in blocks.into_iter().enumerate() {
+                    self.blocks.insert(idx + offset, block);
+                }
+                inserted
             }
             SessionHistoryRecord::Chunks { event: row } => {
                 // Attach to the LAST assistant block in the window, not the
@@ -528,10 +539,10 @@ impl TranscriptWindow {
                     _ => None,
                 }) {
                     chunks.rows.push(row.clone());
-                    return true;
+                    return 1;
                 }
                 tracing::warn!("chunkrow has no assistant owner; skipped");
-                false
+                0
             }
         }
     }
@@ -572,8 +583,12 @@ impl TranscriptWindow {
     }
 }
 
-/// Build a Block from a wire event (unknown types keep raw as-is, D-4).
-fn block_from_event(ev: &SessionWireEvent, seq: SessionSeq) -> Block {
+/// Build Blocks from a wire event (unknown types keep raw as-is, D-4).
+///
+/// AC-004-01: a user/assistant/tool event carrying nested image references
+/// yields the host block plus one `Block::Image` per reference in wire order —
+/// each placeholder renders independently.
+fn blocks_from_event(ev: &SessionWireEvent, seq: SessionSeq) -> Vec<Block> {
     let t = ev.event_type.as_str();
     let data = ev.data.clone().unwrap_or(Value::Null);
     let time = ev.time;
@@ -583,11 +598,34 @@ fn block_from_event(ev: &SessionWireEvent, seq: SessionSeq) -> Block {
             .filter(|s| !s.is_empty())
             .map(String::from)
     };
-    if t.starts_with("user/") {
+    // Top-level attachment identity: the whole event is one image block.
+    if let Some(object) = data
+        .as_object()
+        .filter(|o| o.contains_key("attachmentId") || o.contains_key("attachment_id"))
+    {
+        return vec![image_block_from(object, seq)];
+    }
+    let mut image_refs: Vec<&serde_json::Map<String, Value>> = Vec::new();
+    collect_image_objects(&data, &mut image_refs);
+    if !image_refs.is_empty() {
+        let mut out = Vec::with_capacity(image_refs.len() + 1);
+        out.push(host_block(t, &data, time, seq));
+        out.extend(
+            image_refs
+                .into_iter()
+                .map(|image| image_block_from(image, seq)),
+        );
+        return out;
+    }
+    vec![if t.starts_with("user/") {
         Block::UserMessage {
             seq,
             content: str_of("content")
-                .or_else(|| data.get("content").map(|v| v.to_string()))
+                .or_else(|| {
+                    data.get("content")
+                        .filter(|v| !v.is_array() && !v.is_object())
+                        .map(|v| v.to_string())
+                })
                 .unwrap_or_default(),
             time,
         }
@@ -633,19 +671,184 @@ fn block_from_event(ev: &SessionWireEvent, seq: SessionSeq) -> Block {
             seq,
             attachment_id: str_of("attachmentId").or_else(|| str_of("attachment_id")),
             name: str_of("name"),
-            dims: data.get("dims").map(|v| v.to_string()).or_else(|| {
-                Some(format!(
-                    "{}x{}",
-                    data.get("width").and_then(|v| v.as_u64()).unwrap_or(0),
-                    data.get("height").and_then(|v| v.as_u64()).unwrap_or(0)
-                ))
-            }),
+            // REQ-004 AC-004-01：dims 优先字符串形式（剥离 JSON 引号），
+            // 否则以 width/height 回退为 `WxH`。
+            dims: data
+                .get("dims")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+                .or_else(|| {
+                    Some(format!(
+                        "{}x{}",
+                        data.get("width").and_then(|v| v.as_u64()).unwrap_or(0),
+                        data.get("height").and_then(|v| v.as_u64()).unwrap_or(0)
+                    ))
+                }),
         }
     } else {
         Block::Unknown {
             seq,
             event_type: ev.event_type.clone(),
             raw: data,
+        }
+    }]
+}
+
+/// Host block for an event that carries nested image references: surrounding
+/// text/state is preserved instead of being swallowed by the image branch.
+fn host_block(t: &str, data: &Value, time: Option<i64>, seq: SessionSeq) -> Block {
+    let str_of = |key: &str| -> Option<String> {
+        data.get(key)
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+    };
+    if t.starts_with("user/") {
+        Block::UserMessage {
+            seq,
+            content: str_of("content")
+                .or_else(|| nested_text(data))
+                .unwrap_or_default(),
+            time,
+        }
+    } else if t.starts_with("assistant/") {
+        // Text parts travel as packed chunk rows so the markdown path renders
+        // them; image references became separate Image blocks.
+        let mut chunks = PackedChunks::default();
+        if let Some(text) = nested_text(data) {
+            chunks.rows.push(ChunkRow::TextChunks(ChunkData {
+                texts: vec![text],
+                ..ChunkData::default()
+            }));
+        }
+        Block::AssistantMessage { seq, chunks, time }
+    } else if t.starts_with("tool/call") {
+        Block::ToolCall {
+            seq,
+            call_id: str_of("id").or_else(|| str_of("callId")),
+            name: str_of("name"),
+            args_raw: data.get("args").cloned(),
+            time,
+        }
+    } else if t.starts_with("tool/result") {
+        Block::ToolResult {
+            seq,
+            call_id: str_of("id").or_else(|| str_of("callId")),
+            content: str_of("content")
+                .or_else(|| nested_text(data))
+                .unwrap_or_default(),
+            is_error: data
+                .get("isError")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            time,
+        }
+    } else if t.contains("request") && t.contains("header") {
+        Block::RequestHeader {
+            seq,
+            summary: str_of("summary").unwrap_or_default(),
+        }
+    } else if t.contains("compaction") {
+        Block::Compaction {
+            seq,
+            summary: str_of("summary").unwrap_or_default(),
+        }
+    } else {
+        // Unknown host type: raw payload is preserved alongside the images
+        // (D-4 never drops).
+        Block::Unknown {
+            seq,
+            event_type: t.to_string(),
+            raw: data.clone(),
+        }
+    }
+}
+
+/// Concatenate `{"type":"text","text":..}` entries found under `content` /
+/// `parts` / `blocks` (multi-part message with images keeps its text).
+fn nested_text(data: &Value) -> Option<String> {
+    let mut texts: Vec<String> = Vec::new();
+    collect_text_parts(data, &mut texts);
+    if texts.is_empty() {
+        return None;
+    }
+    Some(texts.join(" "))
+}
+
+fn collect_text_parts(value: &Value, out: &mut Vec<String>) {
+    if let Some(object) = value.as_object() {
+        let kind = object
+            .get("type")
+            .or_else(|| object.get("kind"))
+            .and_then(Value::as_str);
+        if kind == Some("text") {
+            if let Some(t) = object.get("text").and_then(Value::as_str) {
+                out.push(t.to_string());
+            }
+            return;
+        }
+        for key in ["content", "parts", "blocks", "children"] {
+            if let Some(nested) = object.get(key) {
+                collect_text_parts(nested, out);
+            }
+        }
+        return;
+    }
+    if let Some(items) = value.as_array() {
+        for item in items {
+            collect_text_parts(item, out);
+        }
+    }
+}
+
+fn image_block_from(image: &serde_json::Map<String, Value>, seq: SessionSeq) -> Block {
+    Block::Image {
+        seq,
+        attachment_id: image
+            .get("attachmentId")
+            .or_else(|| image.get("attachment_id"))
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        name: image.get("name").and_then(|v| v.as_str()).map(String::from),
+        // REQ-004 AC-004-01：dims 优先字符串形式，否则以 width/height 回退。
+        dims: image
+            .get("dims")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .or_else(|| {
+                Some(format!(
+                    "{}x{}",
+                    image.get("width").and_then(|v| v.as_u64()).unwrap_or(0),
+                    image.get("height").and_then(|v| v.as_u64()).unwrap_or(0)
+                ))
+            }),
+    }
+}
+
+/// Recursively collect every image/attachment reference under `content` /
+/// `parts` / `blocks` / `children` in wire order (AC-004-01 multi-image).
+fn collect_image_objects<'a>(value: &'a Value, out: &mut Vec<&'a serde_json::Map<String, Value>>) {
+    if let Some(object) = value.as_object() {
+        let kind = object
+            .get("type")
+            .or_else(|| object.get("kind"))
+            .and_then(Value::as_str);
+        if matches!(kind, Some("image" | "attachment"))
+            && (object.contains_key("attachmentId") || object.contains_key("attachment_id"))
+        {
+            out.push(object);
+            return;
+        }
+        for key in ["content", "parts", "blocks", "children"] {
+            if let Some(nested) = object.get(key) {
+                collect_image_objects(nested, out);
+            }
+        }
+        return;
+    }
+    if let Some(items) = value.as_array() {
+        for item in items {
+            collect_image_objects(item, out);
         }
     }
 }
