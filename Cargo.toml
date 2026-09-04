@@ -33,6 +33,11 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 thiserror = "1"
+ratatui-markdown = "0.3.6"
+pulldown-cmark = "0.13.4"
+syntect = "5.3.0"
+arboard = "3.6.1"
+open = "5.4.3"
 
 [dev-dependencies]
 

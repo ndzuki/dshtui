@@ -179,3 +179,63 @@ pub fn parse_follow_item(value: &Value) -> Option<FollowItem> {
     tracing::warn!("session/follow 帧形态无法识别，跳过并计入日志");
     None
 }
+
+/// `session/search` unary (REQ-003 §3): server-side read-only full-history
+/// search, does NOT activate the agent. Bounded by an explicit deadline
+/// (`unary_with_timeout` — the baseline unary has none).
+pub async fn search(
+    http: &reqwest::Client,
+    base: &str,
+    query: &str,
+    timeout: std::time::Duration,
+) -> Result<super::types::SearchResult, ClientError> {
+    let args = serde_json::json!({ "query": query });
+    let value = super::unary_with_timeout(http, base, "session/search", args, timeout).await?;
+    serde_json::from_value(value)
+        .map_err(|e| ClientError::Protocol(format!("session/search 响应形状异常: {e}")))
+}
+
+/// Open a `session/control` stream (REQ-003 §3): live baseline + replacement
+/// frames for running/queued state. The open-frame args follow the official
+/// address shape; payload fields stay `[未验证]`-tolerant.
+pub async fn open_control(
+    mux: &super::Mux,
+    address: &SessionAddress,
+) -> Result<StreamHandle, ClientError> {
+    let args = serde_json::json!({ "address": address });
+    mux.open_stream("session/control", args).await
+}
+
+/// Parse one `session/control` stream value. The baseline carries
+/// queues/jobs/projections; replacement frames arrive per key. Unknown shapes
+/// are preserved as `Unknown` (never silently dropped).
+pub fn parse_control_item(value: &Value) -> Option<super::types::ControlItem> {
+    use super::types::ControlItem;
+    let get = |key: &str| value.get(key).cloned().unwrap_or(Value::Null);
+    if let Some(q) = value.get("queues") {
+        return Some(ControlItem::Baseline {
+            queues: q.clone(),
+            jobs: get("jobs"),
+            projections: get("projections"),
+            raw: value.clone(),
+        });
+    }
+    if let Some(q) = value.get("queue") {
+        return Some(ControlItem::Queue { queue: q.clone() });
+    }
+    if let Some(j) = value.get("jobs") {
+        return Some(ControlItem::Jobs { jobs: j.clone() });
+    }
+    if let Some(p) = value.get("projection") {
+        return Some(ControlItem::Projection {
+            projection: p.clone(),
+        });
+    }
+    value
+        .get("type")
+        .and_then(|t| t.as_str())
+        .map(|kind| ControlItem::Unknown {
+            kind: kind.to_string(),
+            raw: value.clone(),
+        })
+}

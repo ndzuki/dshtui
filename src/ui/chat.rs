@@ -7,10 +7,17 @@ use ratatui::widgets::{Block as TuiBlock, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::api::types::ChunkRow;
-use crate::app::AppState;
+use crate::app::{AppState, Mode};
 use crate::model::{Block, PackedChunks, PendingEcho, PendingEchoStatus, TranscriptWindow};
 
 use super::format_hhmm;
+use super::markdown;
+
+/// 一行渲染输出：可回溯到窗口块下标（视觉选择/搜索命中/焦点高亮的锚）。
+pub struct ChatLine {
+    pub block_index: Option<usize>,
+    pub line: Line<'static>,
+}
 
 /// Render the active transcript window using the app viewport.
 pub fn render(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
@@ -20,16 +27,19 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         frame.render_widget(body, area);
         return;
     };
-    render_window(
+    let mut lines = window_lines(window);
+    apply_highlights(&mut lines, app);
+    draw_lines(
         frame,
         area,
-        window,
+        lines,
         app.viewport.offset,
         app.viewport.follow_tail,
     );
 }
 
 /// Render a transcript window without requiring mutable model access.
+/// （无高亮：视觉选择/搜索命中样式走 `render` + `apply_highlights`。）
 pub fn render_window(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -37,17 +47,18 @@ pub fn render_window(
     offset: usize,
     follow_tail: bool,
 ) {
-    let len = window.len();
-    let mut lines: Vec<Line<'static>> = window
-        .blocks()
-        .enumerate()
-        .map(|(i, block)| block_line(block, i + 1 == len))
-        .collect();
-    // 乐观回显（REQ-002）：durable 之外追加 pending/error 行；durable
-    // 同 requestId 到达后 pending 被对账 retire，绝不重复显示。
-    for echo in window.pending() {
-        lines.push(echo_line(echo));
-    }
+    let lines = window_lines(window);
+    draw_lines(frame, area, lines, offset, follow_tail);
+}
+
+fn draw_lines(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    lines: Vec<ChatLine>,
+    offset: usize,
+    follow_tail: bool,
+) {
+    let lines: Vec<Line<'static>> = lines.into_iter().map(|l| l.line).collect();
     let title = if follow_tail {
         " Chat • live "
     } else {
@@ -58,6 +69,59 @@ pub fn render_window(
         .wrap(Wrap { trim: false })
         .scroll(((offset.min(u16::MAX as usize)) as u16, 0));
     frame.render_widget(paragraph, area);
+}
+
+/// 窗口全部行：durable 块（markdown 块可多行）+ 乐观回显行。
+pub fn window_lines(window: &TranscriptWindow) -> Vec<ChatLine> {
+    let len = window.len();
+    let mut out = Vec::new();
+    for (i, block) in window.blocks().enumerate() {
+        for line in block_lines(block, i + 1 == len) {
+            out.push(ChatLine {
+                block_index: Some(i),
+                line,
+            });
+        }
+    }
+    // 乐观回显（REQ-002）：durable 之外追加 pending/error 行；durable
+    // 同 requestId 到达后 pending 被对账 retire，绝不重复显示。
+    for echo in window.pending() {
+        out.push(ChatLine {
+            block_index: None,
+            line: echo_line(echo),
+        });
+    }
+    out
+}
+
+/// 视觉选择反色 + 搜索当前命中高亮（AC-003-05/12）。块级语义：选择区间
+/// 与命中块由 model 层给出，这里只做样式叠加。
+pub fn apply_highlights(lines: &mut [ChatLine], app: &AppState) {
+    // VISUAL：选择区间整块反色。
+    if let Some(sel) = &app.yank.visual {
+        let (start, end) = sel.range();
+        for chat in lines.iter_mut() {
+            if let Some(i) = chat.block_index {
+                if (start..=end).contains(&i) {
+                    chat.line.style = chat.line.style.add_modifier(Modifier::REVERSED);
+                }
+            }
+        }
+    }
+    // SEARCH：当前匹配块黄底高亮（与反色选择区分）。
+    if app.mode == Mode::Search && app.search.open {
+        if let Some(&item_index) = app.search.window_matches.get(app.search.cursor) {
+            if let Some(item) = app.search_index.items().get(item_index) {
+                if let Some(block_idx) = app.active_window().and_then(|w| w.offset_of(item.seq)) {
+                    for chat in lines.iter_mut() {
+                        if chat.block_index == Some(block_idx) {
+                            chat.line.style = chat.line.style.fg(Color::Black).bg(Color::Yellow);
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// 乐观回显行：Pending → `…`（黄色）；Failed → `!`（红色）+ 稳定错误码。
@@ -102,8 +166,8 @@ fn echo_line(echo: &PendingEcho) -> Line<'static> {
 
 /// FR-001-04 §4：携带 time 的 Block 渲染 HH:MM 前缀（UTC，纯展示）；
 /// 状态标记：running（空 chunks 的 assistant）●、pending（末尾 user 等待回复）…、
-/// error（tool result isError）!。
-fn block_line(block: &Block, is_last: bool) -> Line<'static> {
+/// error（tool result isError）!。助手块经 markdown 渲染（REQ-003），可多行。
+fn block_lines(block: &Block, is_last: bool) -> Vec<Line<'static>> {
     let mut spans: Vec<Span<'static>> = Vec::new();
     match block {
         Block::UserMessage { seq, content, time } => {
@@ -124,6 +188,7 @@ fn block_line(block: &Block, is_last: bool) -> Line<'static> {
                     .add_modifier(Modifier::BOLD),
             ));
             spans.push(Span::raw(single_line(content)));
+            vec![Line::from(spans)]
         }
         Block::AssistantMessage { seq, chunks, time } => {
             push_time(&mut spans, *time);
@@ -143,7 +208,34 @@ fn block_line(block: &Block, is_last: bool) -> Line<'static> {
                     .fg(Color::Green)
                     .add_modifier(Modifier::BOLD),
             ));
-            spans.push(Span::raw(packed_chunks_text(chunks)));
+            if running {
+                spans.push(Span::raw("(streaming)"));
+                return vec![Line::from(spans)];
+            }
+            // REQ-003：助手内容 markdown 渲染（标题/列表/表格/代码高亮）。
+            // 流式中未闭合代码块先纯文本（AC-003-02）。
+            let text = chunks_joined_text(chunks);
+            if markdown::has_unclosed_fence(&text) {
+                spans.push(Span::raw(single_line(&text)));
+                return vec![Line::from(spans)];
+            }
+            let width = 60usize;
+            let mut lines = markdown::markdown_lines(&text, width);
+            if lines.is_empty() {
+                spans.push(Span::raw("(packed chunks)"));
+                return vec![Line::from(spans)];
+            }
+            // 首行接在 A/seq 前缀后；后续行等宽缩进保持对齐。
+            let first = lines.remove(0);
+            spans.extend(first.spans);
+            let mut out = vec![Line::from(spans)];
+            let indent = Span::raw("        "); // 8 空格，与 "A 12345 " 对齐
+            for line in lines {
+                let mut line_spans = vec![indent.clone()];
+                line_spans.extend(line.spans);
+                out.push(Line::from(line_spans));
+            }
+            out
         }
         Block::ToolCall {
             seq,
@@ -167,6 +259,7 @@ fn block_line(block: &Block, is_last: bool) -> Line<'static> {
                     .map(|id| format!(" ({id})"))
                     .unwrap_or_default()
             )));
+            vec![Line::from(spans)]
         }
         Block::ToolResult {
             seq,
@@ -187,6 +280,7 @@ fn block_line(block: &Block, is_last: bool) -> Line<'static> {
                     .add_modifier(Modifier::BOLD),
             ));
             spans.push(Span::raw(single_line(content)));
+            vec![Line::from(spans)]
         }
         Block::RequestHeader { seq, summary } => {
             spans.push(Span::styled(
@@ -196,6 +290,7 @@ fn block_line(block: &Block, is_last: bool) -> Line<'static> {
                     .add_modifier(Modifier::BOLD),
             ));
             spans.push(Span::raw(single_line(summary)));
+            vec![Line::from(spans)]
         }
         Block::Compaction { seq, summary } => {
             spans.push(Span::styled(
@@ -205,6 +300,7 @@ fn block_line(block: &Block, is_last: bool) -> Line<'static> {
                     .add_modifier(Modifier::BOLD),
             ));
             spans.push(Span::raw(single_line(summary)));
+            vec![Line::from(spans)]
         }
         Block::Image {
             seq,
@@ -227,6 +323,7 @@ fn block_line(block: &Block, is_last: bool) -> Line<'static> {
                     .map(|id| format!(" [{id}]"))
                     .unwrap_or_default()
             )));
+            vec![Line::from(spans)]
         }
         Block::Unknown {
             seq, event_type, ..
@@ -238,9 +335,9 @@ fn block_line(block: &Block, is_last: bool) -> Line<'static> {
                     .add_modifier(Modifier::BOLD),
             ));
             spans.push(Span::raw(format!("unknown event {event_type}")));
+            vec![Line::from(spans)]
         }
     }
-    Line::from(spans)
 }
 
 /// time → HH:MM 前缀（缺失时省略）。
@@ -253,11 +350,9 @@ fn push_time(spans: &mut Vec<Span<'static>>, time: Option<i64>) {
     }
 }
 
-/// Keep packed chunk rows as one rendered summary; never create one widget per delta.
-fn packed_chunks_text(chunks: &PackedChunks) -> String {
-    if chunks.rows.is_empty() {
-        return "(streaming)".to_string();
-    }
+/// 拼接 packed chunk rows 为完整文本（REQ-003 markdown 渲染源；保留换行，
+/// 不像 V0.1 那样压成单行）。
+fn chunks_joined_text(chunks: &PackedChunks) -> String {
     let mut parts = Vec::with_capacity(chunks.rows.len());
     for row in &chunks.rows {
         let part = match row {
@@ -279,11 +374,7 @@ fn packed_chunks_text(chunks: &PackedChunks) -> String {
             parts.push(part);
         }
     }
-    if parts.is_empty() {
-        "(packed chunks)".to_string()
-    } else {
-        single_line(&parts.join(" "))
-    }
+    parts.join("\n")
 }
 
 fn single_line(text: &str) -> String {

@@ -141,3 +141,187 @@ fn insert_mode_decodes_and_routes_composer_lifecycle_ac002_01_04() {
     assert_eq!(app.draft.as_ref().map(|d| d.text.as_str()), Some("\n"));
     assert!(app.composer.visible);
 }
+
+// ---------- REQ-003：搜索 / 视觉 / 审批 / 大纲 / 历史键位 ----------
+
+#[test]
+fn normal_mode_req003_keys_decode_ac003() {
+    let mut decoder = KeyDecoder::new();
+    assert_eq!(
+        decoder.decode(InputMode::Normal, key(KeyCode::Char('/'))),
+        Some(Command::StartSearch)
+    );
+    assert_eq!(
+        decoder.decode(InputMode::Normal, key(KeyCode::Char('v'))),
+        Some(Command::VisualStart { line: false })
+    );
+    assert_eq!(
+        decoder.decode(InputMode::Normal, key(KeyCode::Char('V'))),
+        Some(Command::VisualStart { line: true })
+    );
+    assert_eq!(
+        decoder.decode(InputMode::Normal, key(KeyCode::Char('y'))),
+        Some(Command::YankContext)
+    );
+    assert_eq!(
+        decoder.decode(InputMode::Normal, key(KeyCode::Char('O'))),
+        Some(Command::OpenOutline)
+    );
+    assert_eq!(
+        decoder.decode(InputMode::Normal, key(KeyCode::Char(']'))),
+        Some(Command::NextTurn)
+    );
+    assert_eq!(
+        decoder.decode(InputMode::Normal, key(KeyCode::Char('['))),
+        Some(Command::PrevTurn)
+    );
+    // `o` 打开语义保持不变（D-19 不与 `O` 冲突）。
+    assert_eq!(
+        decoder.decode(InputMode::Normal, key(KeyCode::Char('o'))),
+        Some(Command::OpenSelected)
+    );
+}
+
+#[test]
+fn search_mode_keys_decode_ac003_05_19() {
+    let mut decoder = KeyDecoder::new();
+    assert_eq!(
+        decoder.decode(InputMode::Search, key(KeyCode::Char('c'))),
+        Some(Command::PickerInput("c".into()))
+    );
+    assert_eq!(
+        decoder.decode(InputMode::Search, key(KeyCode::Backspace)),
+        Some(Command::PickerBackspace)
+    );
+    assert_eq!(
+        decoder.decode(InputMode::Search, key(KeyCode::Enter)),
+        Some(Command::PickerConfirm)
+    );
+    assert_eq!(
+        decoder.decode(InputMode::Search, key(KeyCode::Esc)),
+        Some(Command::ClosePicker)
+    );
+    assert_eq!(
+        decoder.decode(InputMode::Search, key(KeyCode::Char('n'))),
+        Some(Command::SearchNext)
+    );
+    assert_eq!(
+        decoder.decode(InputMode::Search, key(KeyCode::Char('N'))),
+        Some(Command::SearchPrev)
+    );
+    assert_eq!(
+        decoder.decode(InputMode::Search, key(KeyCode::Char('y'))),
+        Some(Command::YankContext)
+    );
+    assert_eq!(
+        decoder.decode(InputMode::Search, key(KeyCode::Char('j'))),
+        Some(Command::PickerDown)
+    );
+    assert_eq!(
+        decoder.decode(InputMode::Search, key(KeyCode::Char('k'))),
+        Some(Command::PickerUp)
+    );
+}
+
+#[test]
+fn visual_mode_keys_decode_ac003_12() {
+    let mut decoder = KeyDecoder::new();
+    assert_eq!(
+        decoder.decode(InputMode::Visual, key(KeyCode::Char('j'))),
+        Some(Command::MoveDown)
+    );
+    assert_eq!(
+        decoder.decode(InputMode::Visual, key(KeyCode::Char('y'))),
+        Some(Command::YankContext)
+    );
+    assert_eq!(
+        decoder.decode(InputMode::Visual, key(KeyCode::Esc)),
+        Some(Command::ClosePicker)
+    );
+    assert_eq!(
+        decoder.decode(InputMode::Visual, key(KeyCode::Char('v'))),
+        Some(Command::ClosePicker)
+    );
+}
+
+#[test]
+fn approval_mode_keys_decode_ac003_07() {
+    let mut decoder = KeyDecoder::new();
+    assert_eq!(
+        decoder.decode(InputMode::Approval, key(KeyCode::Char('y'))),
+        Some(Command::ApprovalAllow)
+    );
+    assert_eq!(
+        decoder.decode(InputMode::Approval, key(KeyCode::Char('n'))),
+        Some(Command::ApprovalReject)
+    );
+    assert_eq!(
+        decoder.decode(InputMode::Approval, key(KeyCode::Char('q'))),
+        Some(Command::ApprovalCancel)
+    );
+    assert_eq!(
+        decoder.decode(InputMode::Approval, key(KeyCode::Esc)),
+        Some(Command::ApprovalCancel)
+    );
+    assert_eq!(
+        decoder.decode(InputMode::Approval, key(KeyCode::Char('a'))),
+        Some(Command::ApprovalAlways)
+    );
+    assert_eq!(
+        decoder.decode(InputMode::Approval, key(KeyCode::Enter)),
+        Some(Command::PickerConfirm)
+    );
+}
+
+#[test]
+fn insert_mode_history_keys_decode_ac003_10() {
+    let mut decoder = KeyDecoder::new();
+    assert_eq!(
+        decoder.decode(InputMode::Insert, key(KeyCode::Up)),
+        Some(Command::HistoryPrev)
+    );
+    assert_eq!(
+        decoder.decode(InputMode::Insert, key(KeyCode::Down)),
+        Some(Command::HistoryNext)
+    );
+}
+
+#[test]
+fn req003_key_route_updates_app_state() {
+    let mut app = AppState::default();
+    // `/` → SEARCH overlay。
+    app.handle_command(Command::StartSearch);
+    assert_eq!(app.mode, Mode::Search);
+    assert!(app.search.open);
+    app.handle_command(Command::ClosePicker);
+    assert_eq!(app.mode, Mode::Normal);
+    // `v`/`V` → VISUAL；y 退出并复制。
+    app.handle_command(Command::OpenSession(SessionId("s1".into())));
+    app.handle(AppEvent::FollowSnapshot {
+        session_id: SessionId("s1".into()),
+        cursor: Some(SessionLogOffset(1)),
+        records: vec![dshtui::api::types::SessionHistoryRecord::Event {
+            event: dshtui::api::types::SessionWireEvent {
+                event_type: "user/message".into(),
+                seq: Some(dshtui::api::types::SessionSeq(1)),
+                time: None,
+                request_id: None,
+                ignorable: None,
+                source_event_seqs: None,
+                surface_op: None,
+                data: Some(serde_json::json!({"content": "hi"})),
+            },
+        }],
+        has_more: true,
+        projections: Some(serde_json::json!({"running": false})),
+    });
+    app.handle_command(Command::VisualStart { line: true });
+    assert_eq!(app.mode, Mode::Visual);
+    app.handle_command(Command::ClosePicker);
+    assert_eq!(app.mode, Mode::Normal);
+    // `O` → 大纲列表。
+    app.handle_command(Command::OpenOutline);
+    assert!(app.outline.open);
+    app.handle_command(Command::ClosePicker);
+    assert!(!app.outline.open);
+}

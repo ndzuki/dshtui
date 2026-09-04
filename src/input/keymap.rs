@@ -13,6 +13,12 @@ pub enum InputMode {
     Picker,
     Insert,
     Help,
+    /// `/` 结构化搜索 overlay（REQ-003）。
+    Search,
+    /// `v`/`V` 视觉选择（REQ-003）。
+    Visual,
+    /// 审批弹窗（REQ-003，y/n/q/Esc 决策）。
+    Approval,
 }
 
 /// Domain commands emitted by the input layer.
@@ -44,7 +50,37 @@ pub enum Command {
     CollapseProject,
     ExpandProject,
     OpenSession(crate::api::types::SessionId),
-    Resize { width: u16, height: u16 },
+    Resize {
+        width: u16,
+        height: u16,
+    },
+    // ---------- REQ-003：搜索/视觉/审批/大纲/历史 ----------
+    /// `/` 打开 SEARCH overlay。
+    StartSearch,
+    /// SEARCH 中 `n`/`N` 巡览窗口命中。
+    SearchNext,
+    SearchPrev,
+    /// `v`/`V` 进入视觉选择（char / line）。
+    VisualStart {
+        line: bool,
+    },
+    /// VISUAL/SEARCH 中 `y` 复制（上下文 yank）。
+    VisualYank,
+    /// NORMAL `y` 上下文 yank（代码块/链接/图片/工具结果/段落）。
+    YankContext,
+    /// `O` 打开 turnOutline 大纲列表（D-19 独立键）。
+    OpenOutline,
+    /// `]`/`[` 跳下一/上一轮（turnOutline + loadThrough）。
+    NextTurn,
+    PrevTurn,
+    /// APPROVAL 决策键（REQ-003 §3）。
+    ApprovalAllow,
+    ApprovalReject,
+    ApprovalCancel,
+    ApprovalAlways,
+    /// INSERT `↑`/`↓` 输入历史（REQ-F06）。
+    HistoryPrev,
+    HistoryNext,
 }
 
 /// Stateful decoder for multi-key Normal-mode commands such as `gg`.
@@ -77,6 +113,9 @@ impl KeyDecoder {
             InputMode::Picker => self.picker(key),
             InputMode::Insert => self.insert(key),
             InputMode::Help => self.help(key),
+            InputMode::Search => self.search(key),
+            InputMode::Visual => self.visual(key),
+            InputMode::Approval => self.approval(key),
         }
     }
 
@@ -111,6 +150,14 @@ impl KeyDecoder {
                     ('h', false) => Some(Command::CollapseProject),
                     ('l', false) => Some(Command::ExpandProject),
                     ('o', false) => Some(Command::OpenSelected),
+                    // REQ-003 键位（REQ §3 输入契约，D-19 `O` 独立键）。
+                    ('/', false) => Some(Command::StartSearch),
+                    ('v', false) => Some(Command::VisualStart { line: false }),
+                    ('V', false) => Some(Command::VisualStart { line: true }),
+                    ('y', false) => Some(Command::YankContext),
+                    ('O', false) => Some(Command::OpenOutline),
+                    (']', false) => Some(Command::NextTurn),
+                    ('[', false) => Some(Command::PrevTurn),
                     _ => None,
                 }
             }
@@ -170,6 +217,62 @@ impl KeyDecoder {
                 Some(Command::PickerInput(c.to_string()))
             }
             KeyCode::Backspace => Some(Command::PickerBackspace),
+            // REQ-003 AC-003-10：INSERT 中 ↑/↓ 输入历史（全局最近 50 条）。
+            KeyCode::Up => Some(Command::HistoryPrev),
+            KeyCode::Down => Some(Command::HistoryNext),
+            _ => None,
+        }
+    }
+
+    /// SEARCH overlay 键位（REQ-003 §3.3）：输入实时过滤，Enter 跳转，
+    /// n/N 巡览，j/k 选中历史命中，y 复制命中，Esc 退出。
+    fn search(&mut self, key: KeyEvent) -> Option<Command> {
+        self.pending_g = false;
+        match key.code {
+            KeyCode::Esc => Some(Command::ClosePicker),
+            KeyCode::Enter if key.modifiers.is_empty() => Some(Command::PickerConfirm),
+            KeyCode::Backspace => Some(Command::PickerBackspace),
+            KeyCode::Up => Some(Command::PickerUp),
+            KeyCode::Down => Some(Command::PickerDown),
+            KeyCode::Char('j') if key.modifiers.is_empty() => Some(Command::PickerDown),
+            KeyCode::Char('k') if key.modifiers.is_empty() => Some(Command::PickerUp),
+            KeyCode::Char('n') if key.modifiers.is_empty() => Some(Command::SearchNext),
+            KeyCode::Char('N') if key.modifiers.is_empty() => Some(Command::SearchPrev),
+            KeyCode::Char('y') if key.modifiers.is_empty() => Some(Command::YankContext),
+            KeyCode::Char(c) if key.modifiers.is_empty() => {
+                Some(Command::PickerInput(c.to_string()))
+            }
+            _ => None,
+        }
+    }
+
+    /// VISUAL 键位（Notes/04 §3.1）：j/k 扩展选择，y 复制，o 打开选中链接，
+    /// Esc/v/V 退出。
+    fn visual(&mut self, key: KeyEvent) -> Option<Command> {
+        self.pending_g = false;
+        match key.code {
+            KeyCode::Esc => Some(Command::ClosePicker),
+            KeyCode::Char('v') if key.modifiers.is_empty() => Some(Command::ClosePicker),
+            KeyCode::Char('V') if key.modifiers.is_empty() => Some(Command::ClosePicker),
+            KeyCode::Char('j') if key.modifiers.is_empty() => Some(Command::MoveDown),
+            KeyCode::Char('k') if key.modifiers.is_empty() => Some(Command::MoveUp),
+            KeyCode::Char('y') if key.modifiers.is_empty() => Some(Command::YankContext),
+            KeyCode::Char('o') if key.modifiers.is_empty() => Some(Command::OpenSelected),
+            _ => None,
+        }
+    }
+
+    /// APPROVAL 键位（REQ-003 §3.5）：y 允许 / n 拒绝 / q·Esc 中止（cancelled）；
+    /// a 显示始终允许指引（非 outcome）；Enter 等同 y。
+    fn approval(&mut self, key: KeyEvent) -> Option<Command> {
+        self.pending_g = false;
+        match key.code {
+            KeyCode::Esc => Some(Command::ApprovalCancel),
+            KeyCode::Char('y') if key.modifiers.is_empty() => Some(Command::ApprovalAllow),
+            KeyCode::Char('n') if key.modifiers.is_empty() => Some(Command::ApprovalReject),
+            KeyCode::Char('q') if key.modifiers.is_empty() => Some(Command::ApprovalCancel),
+            KeyCode::Char('a') if key.modifiers.is_empty() => Some(Command::ApprovalAlways),
+            KeyCode::Enter if key.modifiers.is_empty() => Some(Command::PickerConfirm),
             _ => None,
         }
     }

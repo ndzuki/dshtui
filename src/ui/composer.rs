@@ -24,9 +24,14 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         ..area
     };
     frame.render_widget(Clear, composer_area);
+    let title = if app.composer.steer {
+        " Composer • STEER "
+    } else {
+        " Composer "
+    };
     frame.render_widget(
         Paragraph::new(composer_lines(app))
-            .block(Block::default().borders(Borders::ALL).title(" Composer "))
+            .block(Block::default().borders(Borders::ALL).title(title))
             .wrap(Wrap { trim: false }),
         composer_area,
     );
@@ -83,7 +88,8 @@ fn cursor_span() -> Span<'static> {
 mod tests {
     use super::*;
     use crate::api::types::SessionId;
-    use crate::app::{AppState, DraftState};
+    use crate::app::AppState;
+    use crate::model::DraftState;
 
     #[test]
     fn composer_height_grows_with_lines_and_caps_at_8() {

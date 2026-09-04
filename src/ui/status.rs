@@ -38,12 +38,83 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         Style::default().fg(color).add_modifier(Modifier::BOLD),
     )];
 
-    // 模式指示（REQ-002）：INSERT 高亮；NORMAL 为默认态不重复标注。
-    if app.mode == crate::app::Mode::Insert {
+    // 模式指示（REQ-002/003）：INSERT/SEARCH/VISUAL/APPROVAL 高亮；
+    // NORMAL 为默认态不重复标注。
+    match app.mode {
+        crate::app::Mode::Insert => {
+            spans.push(Span::styled(
+                " INSERT ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            // REQ-003 AC-003-06：运行中 composer 为 steer，状态条显示 STEER。
+            if app.composer.steer {
+                spans.push(Span::styled(
+                    " STEER ",
+                    Style::default()
+                        .fg(Color::Magenta)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+        }
+        crate::app::Mode::Search => {
+            spans.push(Span::styled(
+                " SEARCH ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        crate::app::Mode::Visual => {
+            spans.push(Span::styled(
+                " VISUAL ",
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        crate::app::Mode::Approval => {
+            spans.push(Span::styled(
+                " APPROVAL ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        _ => {}
+    }
+    // AC-003-18：不可编程审批降级 → 状态条 `等待审批` 高亮（不弹窗）。
+    if app.approval.waiting_hint {
         spans.push(Span::styled(
-            " INSERT ",
+            " 等待审批（官方 web 完成） ",
             Style::default()
-                .fg(Color::Cyan)
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    // AC-003-05：搜索打开时状态条计数 `3/17 matches`。
+    if app.search.open {
+        let text = match app.search.window_matches.len() {
+            0 => "0 matches".to_string(),
+            total => format!(
+                "{}/{} matches",
+                app.search.cursor.saturating_add(1).min(total),
+                total
+            ),
+        };
+        spans.push(Span::styled(
+            format!("  {text}"),
+            Style::default().fg(Color::Cyan),
+        ));
+    }
+    // 复制成功 toast（AC-003-08；`copied`）。
+    if let Some(toast) = &app.yank.toast {
+        spans.push(Span::styled(
+            format!("  {toast} "),
+            Style::default()
+                .fg(Color::Green)
                 .add_modifier(Modifier::BOLD),
         ));
     }

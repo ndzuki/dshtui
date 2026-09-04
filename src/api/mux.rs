@@ -17,7 +17,7 @@ use std::sync::Arc;
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::Value;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{broadcast, mpsc, Mutex};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::MaybeTlsStream;
@@ -49,11 +49,14 @@ impl StreamHandle {
     }
 }
 
-/// A connected mux: open/cancel streams.
+/// A connected mux: open/cancel streams, plus a server-push bypass channel
+/// (REQ-003: forwarded `approval/request` waterfall events arrive without a
+/// streamId).
 pub struct Mux {
     sink: Arc<Mutex<Sink>>,
     streams: Arc<Mutex<StreamMap>>,
     next_id: AtomicU64,
+    push_tx: broadcast::Sender<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -94,29 +97,40 @@ impl Mux {
         let (sink, mut stream) = ws.split();
         let streams: Arc<Mutex<StreamMap>> = Arc::new(Mutex::new(HashMap::new()));
         let sink = Arc::new(Mutex::new(sink));
+        let (push_tx, _) = broadcast::channel(64);
         let mux = Self {
             sink,
             streams: streams.clone(),
             next_id: AtomicU64::new(1),
+            push_tx,
         };
 
         // Single read loop: item → matching stream channel; end → close the
-        // channel; error → error frame.
+        // channel; error → error frame; anything else (server-pushed frames
+        // without a streamId, REQ-003 approval/request) → push bypass channel.
         let streams2 = streams.clone();
+        let push_tx2 = mux.push_tx.clone();
         tokio::spawn(async move {
             loop {
                 match stream.next().await {
                     Some(Ok(Message::Text(t))) => {
-                        let frame: ServerFrame = match serde_json::from_str(&t) {
-                            Ok(f) => f,
+                        let raw: Value = match serde_json::from_str(&t) {
+                            Ok(v) => v,
                             Err(e) => {
                                 tracing::warn!(error = %e, "mux 收到不可解析帧，跳过");
                                 continue;
                             }
                         };
+                        let frame: ServerFrame = match serde_json::from_value(raw.clone()) {
+                            Ok(f) => f,
+                            Err(e) => {
+                                tracing::warn!(error = %e, "mux 帧形状异常，跳过");
+                                continue;
+                            }
+                        };
                         let mut guard = streams2.lock().await;
                         match frame.kind.as_str() {
-                            "item" => {
+                            "item" if frame.stream_id != 0 => {
                                 if let Some(tx) = guard.get(&frame.stream_id) {
                                     if tx
                                         .send(Ok(frame.value.unwrap_or(Value::Null)))
@@ -127,10 +141,10 @@ impl Mux {
                                     }
                                 }
                             }
-                            "end" => {
+                            "end" if frame.stream_id != 0 => {
                                 guard.remove(&frame.stream_id); // drop sender → recv None
                             }
-                            "error" => {
+                            "error" if frame.stream_id != 0 => {
                                 let err = frame.error.unwrap_or(super::envelope::RpcError {
                                     code: "stream/error".into(),
                                     message: None,
@@ -146,9 +160,13 @@ impl Mux {
                                 }
                             }
                             _ => {
-                                // Tolerate unknown frame types (Notes/03 §7
-                                // compatibility action); log and skip.
-                                tracing::warn!(kind = %frame.kind, "mux 未知帧类型，跳过");
+                                // Server-pushed frames (no streamId, unknown
+                                // kinds, or orphaned stream routing): whole
+                                // raw JSON goes to the push bypass. A dropped
+                                // broadcast (no subscribers) is expected and
+                                // harmless.
+                                drop(guard);
+                                let _ = push_tx2.send(raw);
                             }
                         }
                     }
@@ -161,7 +179,8 @@ impl Mux {
                 }
             }
             // Connection closed: broadcast a Transport error to all active
-            // streams (the upper layer reconnects uniformly).
+            // streams (the upper layer reconnects uniformly). The push channel
+            // dies with the mux (all senders dropped → subscribers see Closed).
             let mut guard = streams2.lock().await;
             let ids = guard.keys().copied().collect::<Vec<_>>();
             for id in ids {
@@ -173,6 +192,13 @@ impl Mux {
             }
         });
         mux
+    }
+
+    /// Subscribe to server-pushed frames (REQ-003 approval bypass). The
+    /// subscription dies when the mux is dropped or the connection closes,
+    /// so reader tasks need no generation guard of their own.
+    pub fn subscribe_push(&self) -> broadcast::Receiver<Value> {
+        self.push_tx.subscribe()
     }
 
     /// Open a stream (open frame), returning the receive handle.
@@ -240,5 +266,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(f.error.unwrap().code, "PERMISSION_DENIED");
+    }
+
+    #[test]
+    fn server_frame_without_stream_id_defaults_to_zero() {
+        // Server-pushed frames (approval/request) carry no streamId; serde
+        // default gives 0, which the read loop routes to the push bypass.
+        let f: ServerFrame =
+            serde_json::from_str(r#"{"type":"approval/request","clientId":"c1"}"#).unwrap();
+        assert_eq!(f.kind, "approval/request");
+        assert_eq!(f.stream_id, 0);
     }
 }

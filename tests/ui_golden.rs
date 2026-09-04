@@ -1,7 +1,10 @@
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
-use dshtui::api::types::{SessionHistoryRecord, SessionId, SessionSeq, SessionWireEvent};
-use dshtui::app::{AppEvent, AppState, ConnState, DraftState, Mode, StopState};
-use dshtui::model::Incoming;
+use dshtui::api::types::{
+    ApprovalEvent, ChunkData, ChunkRow, SessionHistoryRecord, SessionId, SessionSeq,
+    SessionWireEvent,
+};
+use dshtui::app::{AppEvent, AppState, ConnState, Mode, StopState};
+use dshtui::model::{Block, Incoming};
 use dshtui::ui;
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
@@ -124,7 +127,7 @@ fn composer_overlay_visible_in_insert_and_hidden_in_normal_ac002_01() {
     app.mode = Mode::Insert;
     app.composer.visible = true;
     app.composer.active_session = Some(SessionId("sess-1".into()));
-    app.draft = Some(DraftState {
+    app.draft = Some(dshtui::model::DraftState {
         text: "你好 draft".into(),
         cursor: 8,
         bound_session: SessionId("sess-1".into()),
@@ -172,4 +175,130 @@ fn stopping_state_and_insert_mode_render_in_status_ac002_05() {
     let text = rendered_text(&terminal);
     assert!(text.contains("停止中"), "本地停止中转场, text={text}");
     assert!(text.contains("INSERT"), "INSERT 模式指示, text={text}");
+}
+
+// ---------- REQ-003：markdown / 搜索 / 审批 / 状态条 golden ----------
+
+#[test]
+fn markdown_block_renders_headings_and_code_ac003_01_02() {
+    let mut app = AppState::new(40);
+    app.conn = ConnState::Ready;
+    app.active_session = Some(SessionId("sess-1".into()));
+    app.sessions.touch("sess-1", 40).apply(Incoming::Snapshot {
+        cursor: None,
+        records: vec![SessionHistoryRecord::Event {
+            event: SessionWireEvent {
+                event_type: "assistant/message".into(),
+                seq: Some(SessionSeq(1)),
+                time: None,
+                request_id: None,
+                ignorable: None,
+                source_event_seqs: None,
+                surface_op: None,
+                data: None,
+            },
+        }],
+        has_more: false,
+        projections: None,
+    });
+    app.handle(AppEvent::FollowChunks {
+        session_id: SessionId("sess-1".into()),
+        row: ChunkRow::TextChunks(ChunkData {
+            texts: vec!["# 标题一\n\n- 列表甲\n- 列表乙\n\n```rust\nfn main() {}\n```".into()],
+            ..Default::default()
+        }),
+    });
+    let backend = TestBackend::new(90, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::render(frame, &app)).unwrap();
+    let text = rendered_text(&terminal);
+    assert!(text.contains("标题一"), "标题渲染, text={text}");
+    assert!(
+        text.contains("列表甲") && text.contains("列表乙"),
+        "列表渲染, text={text}"
+    );
+    assert!(text.contains("fn main"), "代码块内容, text={text}");
+}
+
+#[test]
+fn search_overlay_and_status_matches_count_ac003_05() {
+    let mut app = AppState::new(20);
+    app.conn = ConnState::Ready;
+    app.active_session = Some(SessionId("sess-1".into()));
+    app.mode = Mode::Search;
+    app.search.open = true;
+    app.search.query = "deploy".into();
+    app.search.cursor = 0;
+    app.search_index.rebuild(&[Block::UserMessage {
+        seq: SessionSeq(1),
+        content: "deploy the operator".into(),
+        time: None,
+    }]);
+    app.search.window_matches = vec![0];
+    let backend = TestBackend::new(100, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::render(frame, &app)).unwrap();
+    let text = rendered_text(&terminal);
+    assert!(text.contains("SEARCH"), "状态条 SEARCH, text={text}");
+    assert!(text.contains("1/1 matches"), "状态条计数, text={text}");
+    assert!(
+        text.contains("deploy the operator"),
+        "命中列表, text={text}"
+    );
+}
+
+#[test]
+fn approval_modal_renders_over_chat_ac003_07() {
+    let mut app = AppState::new(20);
+    app.conn = ConnState::Ready;
+    app.active_session = Some(SessionId("sess-1".into()));
+    app.mode = Mode::Approval;
+    app.approval.visible = true;
+    app.approval.event = Some(ApprovalEvent {
+        client_id: "c-1".into(),
+        event_id: "e-1".into(),
+        raw: serde_json::json!({
+            "type": "approval/request",
+            "agent": {"kind": "tool", "name": "bash"},
+            "reason": "部署"
+        }),
+    });
+    let backend = TestBackend::new(100, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::render(frame, &app)).unwrap();
+    let text = rendered_text(&terminal);
+    assert!(text.contains("APPROVAL"), "状态条 APPROVAL, text={text}");
+    assert!(text.contains("bash"), "审批载荷, text={text}");
+    assert!(text.contains("允许本次"), "y 提示, text={text}");
+}
+
+#[test]
+fn waiting_approval_status_only_no_modal_ac003_18() {
+    let mut app = AppState::new(20);
+    app.conn = ConnState::Ready;
+    app.active_session = Some(SessionId("sess-1".into()));
+    app.approval.waiting_hint = true;
+    let backend = TestBackend::new(100, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::render(frame, &app)).unwrap();
+    let text = rendered_text(&terminal);
+    assert!(text.contains("等待审批"), "状态条等待审批高亮, text={text}");
+    assert!(!text.contains("允许本次"), "弹窗不出现, text={text}");
+}
+
+#[test]
+fn copied_toast_and_steer_label_render_in_status_ac003_06_08() {
+    let mut app = AppState::new(20);
+    app.conn = ConnState::Ready;
+    app.active_session = Some(SessionId("sess-1".into()));
+    app.mode = Mode::Insert;
+    app.composer.visible = true;
+    app.composer.steer = true;
+    app.yank.toast = Some("copied".into());
+    let backend = TestBackend::new(120, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::render(frame, &app)).unwrap();
+    let text = rendered_text(&terminal);
+    assert!(text.contains("STEER"), "状态条 STEER, text={text}");
+    assert!(text.contains("copied"), "复制 toast, text={text}");
 }
