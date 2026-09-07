@@ -962,7 +962,7 @@ fn traj_app() -> AppState {
         session_id: sid,
         cursor: None,
         records,
-        has_more: false,
+        has_more: true,
         projections: None,
     });
     app
@@ -1194,4 +1194,128 @@ fn trajectory_filter_esc_and_backspace_ac005_05() {
     app.handle_command(Command::Quit);
     assert!(!app.traj.filter.open, "过滤中 q 关过滤");
     assert!(!app.exited, "过滤中 q 不退出程序");
+}
+
+#[test]
+fn trajectory_page_permission_error_no_retry_ac005_09() {
+    // AC-005-09：session/page 权限错误 → 提示 + 不自动重试、不崩溃
+    // （Notes/03 §8：PERMISSION_DENIED 权限类不自动重试）。
+    let mut app = traj_app();
+    // 触发一页请求得到 generation（single-flight guard）。
+    let cmds = app.handle_command(Command::GotoTop);
+    let gen = match cmds.as_slice() {
+        [dshtui::app::Cmd::RequestPage { generation, .. }] => *generation,
+        other => panic!("期望 RequestPage，得到 {other:?}"),
+    };
+    // 权限错误（generation 匹配，非 stale）。
+    let cmds = app.handle(AppEvent::PageError {
+        session_id: SessionId("sess-traj".into()),
+        generation: gen,
+        error: dshtui::api::ClientError::Remote {
+            code: "PERMISSION_DENIED".into(),
+            message: "无权限读取历史".into(),
+            class: dshtui::api::envelope::ErrorClass::PermissionDenied,
+        },
+    });
+    assert!(cmds.is_empty(), "权限错误不自动重试: {cmds:?}");
+    assert!(
+        app.last_error.is_some(),
+        "用户可见错误提示: {:?}",
+        app.last_error
+    );
+    assert!(
+        app.last_error.as_deref().unwrap().contains("权限"),
+        "提示含权限语义"
+    );
+    // 恢复路径：权限错误后正常操作不被污染（重新滚动到底部可再次请求）。
+    app.last_error = None;
+    let cmds = app.handle_command(Command::GotoBottom);
+    assert!(
+        cmds.is_empty() || matches!(cmds.as_slice(), [dshtui::app::Cmd::CopyToClipboard { .. }])
+    );
+    assert_eq!(app.last_error, None, "失败状态不残留");
+}
+
+#[test]
+fn trajectory_reconnect_snapshot_no_dup_and_gap_fill_ac005_08() {
+    // AC-005-08（AppState 集成）：断网重连 snapshot 重建后轨迹窗口不重复；
+    // 缺口（重建快照仅含部分）由 follow 补齐后事件链完整。
+    let mut app = traj_app(); // 已含 turn1 7 行（seq 1..=7）
+    let seq_before: Vec<u64> = {
+        let w = app
+            .active_session
+            .as_ref()
+            .and_then(|sid| app.traj_sessions.get(&sid.0))
+            .unwrap();
+        w.raw_rows().map(|r| r.seq().0).collect()
+    };
+    assert_eq!(seq_before.len(), 7);
+    // 重连快照（模拟 unfixable gap 重建：同 seq 1..=7 重放）。
+    app.handle(AppEvent::FollowSnapshot {
+        session_id: SessionId("sess-traj".into()),
+        cursor: None,
+        records: vec![dshtui::api::types::SessionHistoryRecord::Event {
+            event: dshtui::api::types::SessionWireEvent {
+                event_type: "turn/start".into(),
+                seq: Some(dshtui::api::types::SessionSeq(1)),
+                time: Some(1),
+                request_id: None,
+                ignorable: None,
+                source_event_seqs: None,
+                surface_op: None,
+                data: Some(serde_json::json!({"turn": 1})),
+            },
+        }],
+        has_more: true,
+        projections: None,
+    });
+    // 重建后窗口仅新快照内容；follow 补齐后续缺口（2..=7 逐个到达）不重复。
+    let w = app
+        .active_session
+        .as_ref()
+        .and_then(|sid| app.traj_sessions.get(&sid.0))
+        .unwrap();
+    assert_eq!(w.len(), 1, "重建只含快照行");
+    let sid = SessionId("sess-traj".into());
+    for s in 2..=7 {
+        let data = match s {
+            2 => serde_json::json!({"turn":1,"step":1}),
+            3 => serde_json::json!({"turn":1,"step":1,"content":"a1"}),
+            4 => {
+                serde_json::json!({"turn":1,"step":1,"callId":"c1","name":"bash","arguments":"{}"})
+            }
+            5 => serde_json::json!({"turn":1,"step":1,"callId":"c1","message":"done"}),
+            6 => serde_json::json!({"turn":1,"step":1}),
+            _ => serde_json::json!({"turn":1}),
+        };
+        let ty = match s {
+            2 => "step/start",
+            3 => "assistant/message",
+            4 => "tool/call",
+            5 => "tool/result",
+            6 => "step/end",
+            _ => "turn/end",
+        };
+        let e = dshtui::api::types::SessionWireEvent {
+            event_type: ty.into(),
+            seq: Some(dshtui::api::types::SessionSeq(s)),
+            time: Some(s as i64),
+            request_id: None,
+            ignorable: None,
+            source_event_seqs: None,
+            surface_op: None,
+            data: Some(data),
+        };
+        app.handle(AppEvent::FollowEvent {
+            session_id: sid.clone(),
+            event: e,
+        });
+    }
+    let w = app
+        .active_session
+        .as_ref()
+        .and_then(|sid| app.traj_sessions.get(&sid.0))
+        .unwrap();
+    let seqs: Vec<u64> = w.raw_rows().map(|r| r.seq().0).collect();
+    assert_eq!(seqs, (1..=7).collect::<Vec<_>>(), "缺口补齐、无重复无空洞");
 }

@@ -817,3 +817,69 @@ async fn attachment_fetch_error_envelope_classifies_by_code() {
     assert_eq!(err.class(), ErrorClass::PermissionDenied);
     server.await.unwrap();
 }
+
+// ============================================================================
+// REQ-005 Step 7：wire 边界事件 → TrajectoryWindow 投影对接（mock wire JSON
+// 实解析后过 apply 漏斗；AC-005-06 边界行不丢的协议侧证据，D-23）。
+// ============================================================================
+
+#[test]
+fn trajectory_wire_snapshot_boundary_events_survive_to_window_ac005_06() {
+    // mock 一段官方形状 snapshot wire JSON（边界事件 + chunks + compaction +
+    // request/header），经 serde 解析成 SessionHistoryRecord 后喂轨迹投影。
+    let wire = r#"{
+        "type": "snapshot",
+        "cursor": 12,
+        "hasMore": true,
+        "records": [
+            {"type": "event", "event": {"type": "request/header", "seq": 1, "time": 1, "data": {"reason": "initial"}}},
+            {"type": "event", "event": {"type": "turn/start", "seq": 2, "time": 2, "data": {"turn": 1, "reason": "user-prompt"}}},
+            {"type": "event", "event": {"type": "step/start", "seq": 3, "time": 3, "data": {"turn": 1, "step": 1, "reason": "max"}}},
+            {"type": "event", "event": {"type": "user/message", "seq": 4, "time": 4, "data": {"content": "hi"}}},
+            {"type": "event", "event": {"type": "assistant/message", "seq": 5, "time": 5, "data": {"turn": 1, "step": 1, "usage": {"input": 1}}}},
+            {"type": "chunks", "event": {"type": "chunkrow/text-chunks", "texts": ["packed"], "turn": 1, "step": 1, "index": 0, "dt": []}},
+            {"type": "event", "event": {"type": "tool/call", "seq": 6, "time": 6, "data": {"turn": 1, "step": 1, "callId": "c1", "name": "bash", "arguments": "{\"a\":1}"}}},
+            {"type": "event", "event": {"type": "tool/result", "seq": 7, "time": 7, "data": {"turn": 1, "step": 1, "callId": "c1", "message": "ok"}}},
+            {"type": "event", "event": {"type": "step/end", "seq": 8, "time": 8, "data": {"turn": 1, "step": 1}}},
+            {"type": "event", "event": {"type": "turn/end", "seq": 9, "time": 9, "data": {"turn": 1, "reason": "stop"}}},
+            {"type": "event", "event": {"type": "compaction/summary", "seq": 10, "time": 10, "data": {"summary": "pruned"}}}
+        ]
+    }"#;
+    let frame: dshtui::api::types::FollowFrame = serde_json::from_str(wire).unwrap();
+    let (records, has_more) = match frame {
+        dshtui::api::types::FollowFrame::Snapshot {
+            records, has_more, ..
+        } => (records, has_more.unwrap_or(false)),
+        _ => panic!("expect snapshot"),
+    };
+    // api 层解析出 10 event + 1 chunk = 11 records（边界不丢）。
+    assert_eq!(records.len(), 11, "wire records 全保留");
+    // 过轨迹投影漏斗（AppState 双写同 seam）。
+    let mut w = dshtui::model::TrajectoryWindow::new(200);
+    w.apply(dshtui::model::TrajIncoming::Snapshot {
+        cursor: None,
+        records,
+        has_more,
+        projections: None,
+    });
+    use dshtui::model::TrajKind;
+    let kinds: Vec<TrajKind> = w.raw_rows().map(|r| r.kind()).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            TrajKind::RequestHeader,
+            TrajKind::TurnStart,
+            TrajKind::StepStart,
+            TrajKind::UserMessage,
+            TrajKind::AssistantMessage,
+            TrajKind::ToolCall,
+            TrajKind::ToolResult,
+            TrajKind::StepEnd,
+            TrajKind::TurnEnd,
+            TrajKind::Compaction,
+        ],
+        "wire 边界事件全链投影不丢（packed chunks 汇总进 assistant）"
+    );
+    // 无逐 delta 展开：10 event 行（chunks 不占独立行）。
+    assert_eq!(w.len(), 10);
+}

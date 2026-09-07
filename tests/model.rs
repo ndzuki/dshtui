@@ -1362,3 +1362,78 @@ fn trajectory_search_item_displays_kind_digest() {
     };
     assert!(item.display.starts_with("tool:"));
 }
+
+// ============================================================================
+// REQ-005 Step 7：27turn/1144step 轨迹性能（AC-005-14，D-26；复用 REQ-001
+// §8 口径）。#[ignore] 由 release 手动跑（plan Step 7：性能日志沿用
+// /tmp/dshtui-perf.log）：
+//   cargo test --release --test model trajectory_27turn_1144step_perf -- --ignored
+// ============================================================================
+
+#[test]
+#[ignore = "性能测量：release 手动运行（见上方命令）"]
+fn trajectory_27turn_1144step_perf_ac005_14() {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+    use std::time::{Duration, Instant};
+
+    // 首屏构建：snapshot 全量 apply + 一次 view < 1s。
+    let records = synth_trajectory(27, 1144);
+    assert!(records.len() > 1144, "fixture 规模达标: {}", records.len());
+    let t0 = Instant::now();
+    let mut w = TrajectoryWindow::new(200);
+    w.apply(TrajIncoming::Snapshot {
+        cursor: None,
+        records,
+        has_more: true,
+        projections: None,
+    });
+    let build = t0.elapsed();
+    assert!(
+        build < Duration::from_secs(1),
+        "首屏构建必须 <1s: {build:?}"
+    );
+    // 单帧折叠 view 重算 p99 <33ms（折叠一半 turn 组）。
+    let mut fold = FoldState::default();
+    for t in (1..=27).step_by(2) {
+        fold.toggle(GroupId::Turn(t)); // 折叠奇数 turn 组
+    }
+    let mut samples: Vec<Duration> = Vec::with_capacity(300);
+    for _ in 0..300 {
+        let s = Instant::now();
+        let v = w.view(&fold);
+        std::hint::black_box(v.len());
+        samples.push(s.elapsed());
+    }
+    samples.sort();
+    let p99 = samples[(samples.len() as f64 * 0.99) as usize];
+    assert!(
+        p99 < Duration::from_millis(33),
+        "滚动帧 p99 必须 <33ms: {p99:?}"
+    );
+    // 定位任意 tool/call 并复制详情（AC-005-14 排障闭环）。
+    use dshtui::model::detail_for;
+    let mut located = 0usize;
+    for row in w.raw_rows().filter(|r| r.kind() == TrajKind::ToolCall) {
+        let d = detail_for(row, &w).expect("tool/call 详情");
+        assert!(d.yank_text().is_some(), "复制目标存在");
+        located += 1;
+    }
+    assert!(located > 0, "窗口内定位到 tool/call");
+    // 性能证据写入 /tmp/dshtui-perf.log（既有机制）。
+    let summary = format!(
+        "TASK-005 AC-005-14 27turn/1144step: build={:?} rows={} view_p99={:?} located_tool_calls={}\n",
+        build,
+        w.len(),
+        p99,
+        located
+    );
+    if let Ok(mut f) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/dshtui-perf.log")
+    {
+        let _ = f.write_all(summary.as_bytes());
+    }
+    println!("PERF {summary}");
+}
