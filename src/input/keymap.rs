@@ -30,6 +30,9 @@ pub enum InputMode {
     /// REQ-005：轨迹内过滤输入态（`/` 打开后任意字符进 query；仍在
     /// Trajectory 模式，模态上不离开轨迹 tab）。
     TrajectoryFilter,
+    /// REQ-006：模型目录 overlay（`M` 打开；输入即时本地 nucleo 过滤，
+    /// j/k 移动、Enter 选择、q/Esc 关闭）。effort 子阶段同键位表。
+    ModelCatalog,
     /// REQ-009 V0.3：MONITOR 模式（`dshtui monitor` 独立键位表）。
     Monitor,
 }
@@ -130,6 +133,9 @@ pub enum Command {
     MonitorCheer,
     /// `l`：定位焦点 agent（跳转 NPC + 状态提示）。
     MonitorLocate,
+    // ---------- REQ-006 模型目录（FR-006-01） ----------
+    /// NORMAL `M`：打开模型目录 overlay（本地 nucleo 过滤 + 热切换）。
+    OpenModelCatalog,
 }
 
 /// Stateful decoder for multi-key Normal-mode commands such as `gg`.
@@ -169,6 +175,7 @@ impl KeyDecoder {
             InputMode::ImageView => self.image_view(key),
             InputMode::Trajectory => self.trajectory(key),
             InputMode::TrajectoryFilter => self.trajectory_filter(key),
+            InputMode::ModelCatalog => self.model_catalog(key),
             InputMode::Monitor => self.monitor(key),
         }
     }
@@ -226,6 +233,8 @@ impl KeyDecoder {
                     // REQ-005 Tab 数字键（`1` Chat / `2` Trajectory）。
                     '1' => Some(Command::GotoChat),
                     '2' => Some(Command::ToggleTrajectory),
+                    // REQ-006 模型目录（FR-006-01；`M` 现未占用）。
+                    'M' => Some(Command::OpenModelCatalog),
                     _ => None,
                 }
             }
@@ -460,6 +469,26 @@ impl KeyDecoder {
         }
     }
 
+    /// 模型目录 overlay 键位（REQ-006 FR-006-01，D-032/ADR-003）：普通字符
+    /// 输入 query（本地即时过滤）、j/k 移动命中、Enter 选择（effort 子阶段
+    /// 确认 effort）、Esc/q 关闭、Backspace 删字符。effort 子阶段由 reducer
+    /// 依状态分派 Enter/Esc（同键位表，无独立 InputMode）。
+    fn model_catalog(&mut self, key: KeyEvent) -> Option<Command> {
+        self.pending_g = false;
+        match key.code {
+            KeyCode::Esc => Some(Command::ClosePicker),
+            KeyCode::Char('q') if key.modifiers.is_empty() => Some(Command::ClosePicker),
+            KeyCode::Enter if key.modifiers.is_empty() => Some(Command::PickerConfirm),
+            KeyCode::Char('j') if key.modifiers.is_empty() => Some(Command::PickerDown),
+            KeyCode::Char('k') if key.modifiers.is_empty() => Some(Command::PickerUp),
+            KeyCode::Backspace => Some(Command::PickerBackspace),
+            KeyCode::Char(c) if key.modifiers.is_empty() => {
+                Some(Command::PickerInput(c.to_string()))
+            }
+            _ => None,
+        }
+    }
+
     fn help(&mut self, key: KeyEvent) -> Option<Command> {
         self.pending_g = false;
         match key.code {
@@ -603,6 +632,51 @@ mod tests {
         assert_eq!(
             d.decode(InputMode::Normal, key(KeyCode::Char('o'))),
             Some(Command::OpenSelected)
+        );
+        // REQ-006：`M` 打开模型目录（FR-006-01）。
+        assert_eq!(
+            d.decode(InputMode::Normal, key(KeyCode::Char('M'))),
+            Some(Command::OpenModelCatalog)
+        );
+    }
+
+    #[test]
+    fn model_catalog_mode_keys_filter_navigate_and_close_ac006() {
+        let mut d = KeyDecoder::new();
+        // 字符进查询（本地即时过滤）。
+        assert_eq!(
+            d.decode(InputMode::ModelCatalog, key(KeyCode::Char('v'))),
+            Some(Command::PickerInput("v".into()))
+        );
+        assert_eq!(
+            d.decode(InputMode::ModelCatalog, key(KeyCode::Char('4'))),
+            Some(Command::PickerInput("4".into()))
+        );
+        // j/k 移动、Enter 确认、Backspace 删、Esc/q 关闭。
+        assert_eq!(
+            d.decode(InputMode::ModelCatalog, key(KeyCode::Char('j'))),
+            Some(Command::PickerDown)
+        );
+        assert_eq!(
+            d.decode(InputMode::ModelCatalog, key(KeyCode::Char('k'))),
+            Some(Command::PickerUp)
+        );
+        assert_eq!(
+            d.decode(InputMode::ModelCatalog, key(KeyCode::Enter)),
+            Some(Command::PickerConfirm)
+        );
+        assert_eq!(
+            d.decode(InputMode::ModelCatalog, key(KeyCode::Backspace)),
+            Some(Command::PickerBackspace)
+        );
+        assert_eq!(
+            d.decode(InputMode::ModelCatalog, key(KeyCode::Esc)),
+            Some(Command::ClosePicker)
+        );
+        assert_eq!(
+            d.decode(InputMode::ModelCatalog, key(KeyCode::Char('q'))),
+            Some(Command::ClosePicker),
+            "q=关闭（与 Esc 同义）"
         );
     }
 

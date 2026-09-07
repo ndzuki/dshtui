@@ -30,9 +30,9 @@ use crate::api::types::{
 use crate::api::{ClientError, ErrorClass};
 use crate::model::{
     block_plain_text, block_yank_target, detail_for, selection_text, ApplyEffect, AttachmentRef,
-    DraftRegistry, DraftState, FoldState, ImageViewState, Incoming, InputHistory, SearchIndex,
-    SearchKindFilter, SessionStore, TrajIncoming, VisualMode, VisualSelection, WorkspaceStore,
-    YankBackend, YankState,
+    DraftRegistry, DraftState, FoldState, ImageViewState, Incoming, InputHistory,
+    ProjectionSnapshot, SearchIndex, SearchKindFilter, SessionStore, TrajIncoming, VisualMode,
+    VisualSelection, WorkspaceStore, YankBackend, YankState,
 };
 
 /// 已编码的 Kitty 帧（ratatui-image `Protocol` 对象；`Box<dyn Protocol>` 无
@@ -63,6 +63,9 @@ pub enum Mode {
     /// Trajectory（REQ-005 V0.3，D-25）：顶部 Tab 独立模式；右栏详情为
     /// Trajectory 内焦点子层（`focus==Details` + `traj.detail_open`）。
     Trajectory,
+    /// 模型目录 overlay（REQ-006 FR-006-01，`M` 打开；ADDR-007 独立模态，
+    /// 不串 SEARCH）。
+    ModelCatalog,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -210,6 +213,93 @@ impl Default for ApprovalState {
             policy_display: None,
         }
     }
+}
+
+/// 模型目录 overlay 阶段（REQ-006 FR-006-01；M 打开后异步拉取）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CatalogPhase {
+    /// `session/modelCatalog` 拉取中（加载失败/断网可观察，AC-006-06）。
+    #[default]
+    Loading,
+    /// 目录就绪（含空目录 → 空态提示，AC-006-07 由 query 命中判定）。
+    Ready,
+    /// 加载失败（保留错误提示，可重开/重试）。
+    Error,
+}
+
+/// Model catalog overlay 状态（REQ-006 §5 `ModelCatalogState`；仅内存）。
+///
+/// - `index` 为扁平化后的全量目录（本地 nucleo 过滤，AC-006-01/07 即时性=
+///   本地，官方 modelCatalog 零参数）。
+/// - `current_model`/`next_model` 是官方 projections.modelSelection 的只读
+///   镜像（ADR-008，reducer 在快照/切换时刷新，不自算）。
+/// - effort 子阶段（`effort: Some`）：选中模型自带 reasoning.efforts 子集
+///   时，Enter 先选 effort 再提交（不越界 V0.4）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelCatalogState {
+    pub visible: bool,
+    pub phase: CatalogPhase,
+    /// 扁平目录（含描述/efforts 元数据；查询命中实时过滤）。
+    pub index: crate::model::CatalogIndex,
+    /// 输入行 query（nucleo 本地即时过滤）。
+    pub query: String,
+    /// 过滤后命中列表选中下标（j/k 移动）。
+    pub selection: usize,
+    /// 官方投影 current/next 的展示串（reducer 刷新，ADR-008）。
+    pub current_model: Option<String>,
+    pub next_model: Option<String>,
+    /// 最近一次加载失败提示（AC-006-06）。
+    pub load_error: Option<String>,
+    /// 最近一次 selectModel 失败 `error.code`（AC-006-09 状态条提示）。
+    pub last_error_code: Option<String>,
+    /// selectModel 在途（provider/model）：防重入（同一弹窗只提交一次）。
+    pub selecting: Option<(String, String)>,
+    /// effort 子阶段（选中模型带 reasoning.efforts 时进入）。
+    pub effort: Option<EffortPick>,
+}
+
+impl Default for ModelCatalogState {
+    fn default() -> Self {
+        Self {
+            visible: false,
+            phase: CatalogPhase::Loading,
+            index: crate::model::CatalogIndex::new(),
+            query: String::new(),
+            selection: 0,
+            current_model: None,
+            next_model: None,
+            load_error: None,
+            last_error_code: None,
+            selecting: None,
+            effort: None,
+        }
+    }
+}
+
+impl ModelCatalogState {
+    /// 重置为「打开即拉取」初态（清查询/选中/错误，保留目录在重开时刷新）。
+    pub fn reset_for_open(&mut self) {
+        self.visible = true;
+        self.phase = CatalogPhase::Loading;
+        self.query.clear();
+        self.selection = 0;
+        self.load_error = None;
+        self.last_error_code = None;
+        self.selecting = None;
+        self.effort = None;
+    }
+}
+
+/// effort 子阶段：选中模型的 reasoning effort 候选（id 列表）+ 光标。
+#[derive(Debug, Clone, PartialEq)]
+pub struct EffortPick {
+    pub provider_id: String,
+    pub model_id: String,
+    pub model_name: String,
+    /// 候选 effort id（wire `efforts[].id`；off/low/high/max…）。
+    pub efforts: Vec<String>,
+    pub default: Option<String>,
+    pub cursor: usize,
 }
 
 /// turnOutline 大纲列表（`O`；D-19 独立键，与 `o` 打开不冲突）。
@@ -458,6 +548,28 @@ pub enum AppEvent {
         retryable: bool,
         for_viewer: bool,
     },
+    // ---------- REQ-006 V0.3 模型目录（FR-006-01） ----------
+    /// `session/modelCatalog` 加载成功（generation 关联在途目录；stale 忽略）。
+    ModelCatalogLoaded {
+        generation: u64,
+        catalog: crate::api::types::ModelCatalog,
+    },
+    /// `session/modelCatalog` 加载失败（目录区/状态条可观察，AC-006-06；
+    /// 权限错误不自动重试，网络走既有重连）。
+    ModelCatalogLoadFailed {
+        generation: u64,
+        error: ClientError,
+    },
+    /// `session/selectModel` 成功（服务端已确认 next；热切换生效，
+    /// AC-006-08）。
+    ModelSelected {
+        selected: crate::api::types::WireModelSelection,
+    },
+    /// `session/selectModel` 失败（显示 error.code、当前模型不变、
+    /// 权限错误不自动重试，AC-006-09）。
+    ModelSelectFailed {
+        error: ClientError,
+    },
 }
 
 /// Orchestration commands emitted by the reducer (executed by the run loop).
@@ -546,6 +658,19 @@ pub enum Cmd {
     CopyImageText {
         text: String,
     },
+    // ---------- REQ-006 V0.3 模型目录（FR-006-01） ----------
+    /// `session/modelCatalog` 拉取（打开 overlay 时一次；单飞 generation）。
+    FetchModelCatalog {
+        generation: u64,
+    },
+    /// `session/selectModel` 热切换（当前活动会话；reasoning effort 可选）。
+    /// 幂等：reducer 以 `selecting` 单飞守卫，同一弹窗只提交一次（AC-006-15
+    /// 同源；selectModel 请求无独立 requestId wire 字段，本地单飞足够）。
+    SelectModel {
+        provider: String,
+        model: String,
+        reasoning_effort: Option<String>,
+    },
 }
 
 #[derive(Debug)]
@@ -580,6 +705,8 @@ pub struct AppState {
     pub yank: YankState,
     /// 审批模态。
     pub approval: ApprovalState,
+    /// 模型目录 overlay（REQ-006 FR-006-01，`M` 打开）。
+    pub model_catalog: ModelCatalogState,
     /// turnOutline 大纲列表（`O`）。
     pub outline: OutlineState,
     /// 焦点块游标（窗口块下标；搜索跳转/视觉选择/上下文 yank 的锚）。
@@ -605,6 +732,9 @@ pub struct AppState {
     /// clamp 30–60 由 layout 侧执行，Notes/04 §1）。
     pub details_width_cells: u16,
     page_guard: PageGuard,
+    /// 模型目录 fetch 单飞 generation（REQ-006 FR-006-01）：打开时自增，
+    /// stale 响应（overlay 已关/已重开）直接丢弃（模式 15 in-flight 去重）。
+    catalog_generation: u64,
     want_backfill: bool,
     /// `loadThrough(seq)` 在途目标：每页合并后 reducer 判断是否已覆盖，
     /// 未覆盖且仍有更多历史则继续发下一页（AC-003-09 按 seq 落位）。
@@ -663,6 +793,7 @@ impl Default for AppState {
             search_index: SearchIndex::new(),
             yank: YankState::default(),
             approval: ApprovalState::default(),
+            model_catalog: ModelCatalogState::default(),
             outline: OutlineState::default(),
             cursor_block: 0,
             stop: StopState::default(),
@@ -677,6 +808,7 @@ impl Default for AppState {
             window_cap: 200,
             details_width_cells: crate::ui::layout::DEFAULT_DETAILS_WIDTH,
             page_guard: PageGuard::default(),
+            catalog_generation: 0,
             want_backfill: false,
             load_through_target: None,
             load_through_pages: 0,
@@ -1338,6 +1470,82 @@ impl AppState {
                 retryable,
                 for_viewer,
             ),
+            // ---------- REQ-006：模型目录（FR-006-01） ----------
+            AppEvent::ModelCatalogLoaded {
+                generation,
+                catalog,
+            } => {
+                // stale（overlay 已关/已重开后迟到）直接丢弃（模式 15）。
+                if generation != self.catalog_generation || !self.model_catalog.visible {
+                    tracing::debug!(generation, "modelCatalog stale 响应丢弃");
+                    return vec![];
+                }
+                self.model_catalog.index.rebuild(&catalog);
+                self.model_catalog.phase = CatalogPhase::Ready;
+                self.model_catalog.load_error = None;
+                self.model_catalog.selection = 0;
+                self.model_catalog.query.clear();
+                // ADR-008：current/next 只读官方 modelSelection 投影镜像。
+                self.model_catalog.current_model = self
+                    .active_window()
+                    .map(|w| ProjectionSnapshot::new(w.projections().clone()))
+                    .and_then(|p| p.model_selection().last_used);
+                self.model_catalog.next_model = self
+                    .active_window()
+                    .map(|w| ProjectionSnapshot::new(w.projections().clone()))
+                    .and_then(|p| p.model_selection().next);
+                vec![]
+            }
+            AppEvent::ModelCatalogLoadFailed { generation, error } => {
+                if generation != self.catalog_generation || !self.model_catalog.visible {
+                    tracing::debug!(generation, "modelCatalog stale 失败丢弃");
+                    return vec![];
+                }
+                self.model_catalog.phase = CatalogPhase::Error;
+                let code = error.code();
+                let msg = format!("模型目录加载失败: {error}");
+                self.model_catalog.load_error = Some(if code.is_empty() {
+                    msg
+                } else {
+                    format!("{msg}（error.code={code}）")
+                });
+                // 权限错误不自动重试（只记录，不置 last_error 干扰重连提示）；
+                // 网络断开走既有重连（既有 open follow 流驱动）。
+                if error.class() == ErrorClass::PermissionDenied {
+                    tracing::error!(error = %error, "模型目录权限不足");
+                } else {
+                    tracing::warn!(error = %error, "模型目录加载失败");
+                }
+                vec![]
+            }
+            AppEvent::ModelSelected { selected } => {
+                self.model_catalog.selecting = None;
+                self.model_catalog.phase = CatalogPhase::Ready;
+                self.model_catalog.effort = None;
+                self.model_catalog.next_model = Some(selected.display());
+                self.model_catalog.visible = false;
+                self.mode = Mode::Normal;
+                self.notice = Some(format!(
+                    "模型已切换: {}（下一次 prompt 生效）",
+                    selected.display()
+                ));
+                vec![]
+            }
+            AppEvent::ModelSelectFailed { error } => {
+                // 当前使用模型不变（不本地改）；显示 error.code，权限错误不
+                // 自动重试（AC-006-09）。目录保持打开可继续选/退出。
+                self.model_catalog.selecting = None;
+                self.model_catalog.phase = CatalogPhase::Ready;
+                let code = error.code();
+                self.model_catalog.last_error_code = Some(code.clone());
+                self.model_catalog.load_error = Some(format!("模型切换失败: {error}"));
+                if error.class() == ErrorClass::PermissionDenied {
+                    tracing::error!(error = %error, "selectModel 权限不足");
+                } else {
+                    tracing::warn!(error = %error, "selectModel 失败");
+                }
+                vec![]
+            }
         }
     }
 
@@ -2009,6 +2217,17 @@ impl AppState {
                 // REQ-005：Trajectory Esc（详情/过滤关闭）已由分流处理；
                 // 此处保持穷尽性。
                 Mode::Trajectory => vec![],
+                // REQ-006：模型目录 q/Esc 关闭（effort 子阶段先退一级回主列表，
+                // 再按一次才关闭整个目录）。
+                Mode::ModelCatalog => {
+                    if self.model_catalog.effort.is_some() {
+                        self.model_catalog.effort = None;
+                        self.model_catalog.selection = 0;
+                    } else {
+                        self.close_model_catalog();
+                    }
+                    vec![]
+                }
             },
             C::PickerDown => {
                 if self.approval.list_open && self.mode == Mode::Approval {
@@ -2029,6 +2248,9 @@ impl AppState {
                             (self.search.history_selection + 1).min(total - 1);
                     }
                     vec![]
+                } else if self.mode == Mode::ModelCatalog {
+                    self.model_catalog_cursor_move(true);
+                    vec![]
                 } else {
                     self.picker.selection += 1;
                     vec![]
@@ -2046,6 +2268,9 @@ impl AppState {
                     }
                     self.search.history_selection = self.search.history_selection.saturating_sub(1);
                     vec![]
+                } else if self.mode == Mode::ModelCatalog {
+                    self.model_catalog_cursor_move(false);
+                    vec![]
                 } else {
                     self.picker.selection = self.picker.selection.saturating_sub(1);
                     vec![]
@@ -2056,6 +2281,9 @@ impl AppState {
                     self.composer_input(&text)
                 } else if self.mode == Mode::Search {
                     self.search_input(&text)
+                } else if self.mode == Mode::ModelCatalog {
+                    self.model_catalog_input(&text);
+                    vec![]
                 } else {
                     self.picker.query.push_str(&text);
                     self.picker.selection = 0;
@@ -2067,6 +2295,9 @@ impl AppState {
                     self.composer_backspace()
                 } else if self.mode == Mode::Search {
                     self.search_input_backspace()
+                } else if self.mode == Mode::ModelCatalog {
+                    self.model_catalog_backspace();
+                    vec![]
                 } else {
                     self.picker.query.pop();
                     vec![]
@@ -2235,6 +2466,9 @@ impl AppState {
                     }
                 }
                 Mode::Search => self.search_confirm(),
+                // REQ-006：模型目录 Enter——主列表：选中模型（带 efforts →
+                // 进 effort 子阶段）；effort 子阶段：确认 effort 提交热切换。
+                Mode::ModelCatalog => self.model_catalog_confirm(),
                 // APPROVAL 仅 y/n/q/Esc/a（§3 键位边界；Enter 无语义，no-op）。
                 Mode::Normal if self.outline.open => self.outline_confirm(),
                 _ => vec![],
@@ -2301,6 +2535,14 @@ impl AppState {
                 self.conn = ConnState::Connecting;
                 self.startup_guidance = None;
                 vec![]
+            }
+            // REQ-006：模型目录 `M` 打开（仅 NORMAL；打开即拉取目录）。
+            C::OpenModelCatalog => {
+                if self.mode == Mode::Normal {
+                    self.open_model_catalog()
+                } else {
+                    vec![]
+                }
             }
 
             // REQ-005：Chat（NORMAL）`gt`/`2` → Trajectory（AC-005-01）。
@@ -2733,6 +2975,167 @@ impl AppState {
         self.search.history_generation = self.search.history_generation.wrapping_add(1);
         self.search.history_loading = false;
         self.search.results_locked = false;
+    }
+
+    // ---------- REQ-006 模型目录（FR-006-01） ----------
+
+    /// `M` 打开模型目录 overlay：重置为加载态并拉取 `session/modelCatalog`
+    /// （单飞 generation；仅 NORMAL 语义，调用方已检查）。
+    fn open_model_catalog(&mut self) -> Vec<Cmd> {
+        self.mode = Mode::ModelCatalog;
+        self.model_catalog.reset_for_open();
+        // 读一次当前官方 modelSelection 投影（ADR-008；会话级镜像）。
+        let projections = self
+            .active_window()
+            .map(|w| ProjectionSnapshot::new(w.projections().clone()));
+        if let Some(p) = projections.as_ref() {
+            let sel = p.model_selection();
+            self.model_catalog.current_model = sel.last_used;
+            self.model_catalog.next_model = sel.next;
+        }
+        self.catalog_generation = self.catalog_generation.wrapping_add(1);
+        vec![Cmd::FetchModelCatalog {
+            generation: self.catalog_generation,
+        }]
+    }
+
+    /// q/Esc 关闭模型目录（effort 子阶段已先退一级；此处直接关闭）。
+    fn close_model_catalog(&mut self) {
+        self.model_catalog.visible = false;
+        self.model_catalog.effort = None;
+        self.model_catalog.selecting = None;
+        // 作废在途目录拉取（迟到响应丢弃）。
+        self.catalog_generation = self.catalog_generation.wrapping_add(1);
+        self.mode = Mode::Normal;
+    }
+
+    /// 主列表过滤命中（UI 与 reducer 共用同一 seam：`CatalogIndex::query`）。
+    fn model_catalog_hits(&self) -> Vec<&crate::model::ModelCatalogItem> {
+        self.model_catalog.index.query(&self.model_catalog.query)
+    }
+
+    /// j/k 移动光标：effort 子阶段移 effort 候选；主列表移命中行。
+    fn model_catalog_cursor_move(&mut self, down: bool) {
+        if let Some(pick) = self.model_catalog.effort.as_mut() {
+            if down {
+                if !pick.efforts.is_empty() {
+                    pick.cursor = (pick.cursor + 1).min(pick.efforts.len() - 1);
+                }
+            } else {
+                pick.cursor = pick.cursor.saturating_sub(1);
+            }
+            return;
+        }
+        let total = self.model_catalog_hits().len();
+        if total == 0 {
+            return;
+        }
+        if down {
+            self.model_catalog.selection = (self.model_catalog.selection + 1).min(total - 1);
+        } else {
+            self.model_catalog.selection = self.model_catalog.selection.saturating_sub(1);
+        }
+    }
+
+    /// 字符输入进 query（effort 子阶段输入忽略，避免误改查询词）。
+    fn model_catalog_input(&mut self, text: &str) {
+        if self.model_catalog.effort.is_some() {
+            return;
+        }
+        self.model_catalog.query.push_str(text);
+        self.model_catalog.selection = 0;
+    }
+
+    fn model_catalog_backspace(&mut self) {
+        if self.model_catalog.effort.is_some() {
+            return;
+        }
+        self.model_catalog.query.pop();
+        self.model_catalog.selection = 0;
+    }
+
+    /// Enter：主列表 → 选中模型（自带 efforts → 进 effort 子阶段，否则直接
+    /// 热切换）；effort 子阶段 → 确认 effort 提交。Error 态 Enter = 重试加载。
+    /// selectModel 单飞：`selecting` 在途时忽略（同一弹窗只提交一次，
+    /// AC-006-15 同源守卫）。
+    fn model_catalog_confirm(&mut self) -> Vec<Cmd> {
+        if self.model_catalog.selecting.is_some() {
+            return vec![];
+        }
+        match self.model_catalog.phase {
+            CatalogPhase::Error => {
+                // 重试加载（恢复后重试成功，AC-006-06）。
+                self.model_catalog.phase = CatalogPhase::Loading;
+                self.model_catalog.load_error = None;
+                self.model_catalog.last_error_code = None;
+                self.catalog_generation = self.catalog_generation.wrapping_add(1);
+                return vec![Cmd::FetchModelCatalog {
+                    generation: self.catalog_generation,
+                }];
+            }
+            CatalogPhase::Loading => return vec![],
+            CatalogPhase::Ready => {}
+        }
+        // effort 子阶段确认。
+        if let Some(pick) = self.model_catalog.effort.clone() {
+            let effort = pick
+                .efforts
+                .get(pick.cursor)
+                .cloned()
+                .or(pick.default.clone());
+            self.model_catalog.effort = None;
+            self.model_catalog.selection = 0;
+            return self.model_catalog_submit(pick.provider_id, pick.model_id, effort);
+        }
+        // 主列表：选中行（与 UI 同 query 同序）。
+        let Some(item) = self
+            .model_catalog_hits()
+            .into_iter()
+            .nth(self.model_catalog.selection)
+            .cloned()
+        else {
+            return vec![];
+        };
+        if !item.reasoning_efforts.is_empty() {
+            // 模型自带 reasoning efforts → 先选 effort（不越界 V0.4）。
+            let default_idx = item
+                .default_effort
+                .as_ref()
+                .and_then(|d| item.reasoning_efforts.iter().position(|e| e == d))
+                .unwrap_or(0);
+            self.model_catalog.effort = Some(EffortPick {
+                provider_id: item.provider_id,
+                model_id: item.model_id,
+                model_name: item.model_name,
+                efforts: item.reasoning_efforts,
+                default: item.default_effort,
+                cursor: default_idx,
+            });
+            return vec![];
+        }
+        self.model_catalog_submit(item.provider_id, item.model_id, None)
+    }
+
+    /// 发起 `session/selectModel`（无活动会话 → 目录区提示，不发命令）。
+    fn model_catalog_submit(
+        &mut self,
+        provider: String,
+        model: String,
+        reasoning_effort: Option<String>,
+    ) -> Vec<Cmd> {
+        if self.active_session.is_none() {
+            self.model_catalog.load_error =
+                Some("无打开的会话：先用 f/o 打开会话再切换模型".into());
+            return vec![];
+        }
+        self.model_catalog.selecting = Some((provider.clone(), model.clone()));
+        self.model_catalog.load_error = None;
+        self.model_catalog.last_error_code = None;
+        vec![Cmd::SelectModel {
+            provider,
+            model,
+            reasoning_effort,
+        }]
     }
 
     fn search_input(&mut self, text: &str) -> Vec<Cmd> {
@@ -5020,5 +5423,273 @@ mod tests {
             panic!("预期复制, 得到 {cmds:?}")
         };
         assert_eq!(text, "{\"k\": \"v\"}\n", "SEARCH y 复制整块代码");
+    }
+
+    // ---------- REQ-006 模型目录 reducer 测试（FR-006-01） ----------
+
+    fn wire_catalog() -> crate::api::types::ModelCatalog {
+        serde_json::from_value(serde_json::json!({
+            "default": {"provider": "deepseek_official", "model": "deepseek-chat"},
+            "routableProviders": ["deepseek_official"],
+            "groups": [{
+                "id": "deepseek_official",
+                "name": "DeepSeek 官方",
+                "models": [
+                    {"id": "deepseek-chat", "name": "DeepSeek Chat",
+                     "reasoning": {"efforts": [{"id": "low", "name": "Low"},
+                                               {"id": "high", "name": "High"}],
+                                   "defaultEffort": "low"}},
+                    {"id": "deepseek-v4-pro", "name": "V4 Pro",
+                     "description": "旗舰推理"}
+                ]
+            }],
+            "failures": []
+        }))
+        .unwrap()
+    }
+
+    fn open_catalog_loaded(s: &mut AppState) -> u64 {
+        let cmds = s.handle_command(C::OpenModelCatalog);
+        let Cmd::FetchModelCatalog { generation } = cmds[0] else {
+            panic!("打开目录应发 fetch, 得到 {cmds:?}")
+        };
+        s.handle(AppEvent::ModelCatalogLoaded {
+            generation,
+            catalog: wire_catalog(),
+        });
+        generation
+    }
+
+    #[test]
+    fn catalog_m_opens_overlay_and_fetches_once_ac006_01() {
+        let mut s = AppState::default();
+        let cmds = s.handle_command(C::OpenModelCatalog);
+        assert_eq!(s.mode, Mode::ModelCatalog);
+        assert!(s.model_catalog.visible);
+        assert_eq!(s.model_catalog.phase, CatalogPhase::Loading);
+        assert_eq!(cmds.len(), 1);
+        let Cmd::FetchModelCatalog { generation } = &cmds[0] else {
+            panic!("预期拉取目录, 得到 {cmds:?}")
+        };
+        assert_eq!(*generation, 1, "首次打开 generation=1");
+        // 非 NORMAL 打开被忽略。
+        s.mode = Mode::Search;
+        assert!(s.handle_command(C::OpenModelCatalog).is_empty());
+    }
+
+    #[test]
+    fn catalog_loaded_indexes_ready_and_local_fuzzy_query_ac006_01_07() {
+        let mut s = AppState::default();
+        open_catalog_loaded(&mut s);
+        assert_eq!(s.model_catalog.phase, CatalogPhase::Ready);
+        assert_eq!(s.model_catalog.index.len(), 2);
+        // 本地 nucleo 即时过滤（AC-006-01 即时性=本地）。
+        s.handle_command(C::PickerInput("v4".into()));
+        assert_eq!(s.model_catalog.index.query("v4").len(), 1);
+        // 无匹配 → 空态（不误报错误）。
+        s.handle_command(C::PickerInput("zzz".into()));
+        let hits = s.model_catalog.index.query("zzz");
+        assert!(hits.is_empty());
+        assert!(s.model_catalog.load_error.is_none(), "空态不误报错误");
+        // 退格恢复。
+        for _ in 0..5 {
+            s.handle_command(C::PickerBackspace);
+        }
+        assert_eq!(s.model_catalog.index.query("").len(), 2);
+    }
+
+    #[test]
+    fn catalog_load_failure_shows_error_code_without_auto_retry_ac006_06() {
+        let mut s = AppState::default();
+        s.handle_command(C::OpenModelCatalog);
+        // 权限拒绝：显示 error.code、不自动重试（无 Reconnect/重发 Cmd）。
+        let cmds = s.handle(AppEvent::ModelCatalogLoadFailed {
+            generation: 1,
+            error: ClientError::Remote {
+                code: "PERMISSION_DENIED".into(),
+                message: "no permission".into(),
+                class: ErrorClass::PermissionDenied,
+            },
+        });
+        assert!(cmds.is_empty(), "权限错误不自动重试, cmds={cmds:?}");
+        assert_eq!(s.model_catalog.phase, CatalogPhase::Error);
+        let err = s.model_catalog.load_error.as_deref().unwrap();
+        assert!(err.contains("PERMISSION_DENIED"), "err={err}");
+        // 恢复路径：Error 态 Enter = 重试加载 → 成功（恢复后重试成功）。
+        let cmds = s.handle_command(C::PickerConfirm);
+        let Cmd::FetchModelCatalog { generation } = cmds[0] else {
+            panic!("Error 态 Enter 应重试, 得到 {cmds:?}")
+        };
+        assert_eq!(s.model_catalog.phase, CatalogPhase::Loading);
+        s.handle(AppEvent::ModelCatalogLoaded {
+            generation,
+            catalog: wire_catalog(),
+        });
+        assert_eq!(s.model_catalog.phase, CatalogPhase::Ready);
+        assert!(s.model_catalog.load_error.is_none(), "重试成功后清除错误");
+    }
+
+    #[test]
+    fn catalog_select_no_effort_success_updates_next_and_closes_ac006_08() {
+        let mut s = AppState::default();
+        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        open_catalog_loaded(&mut s);
+        // 选中无 efforts 的 v4-pro（本地过滤 + Enter）。
+        s.handle_command(C::PickerInput("v4".into()));
+        s.handle_command(C::PickerConfirm);
+        // selecting 单飞在途。
+        assert_eq!(
+            s.model_catalog.selecting,
+            Some(("deepseek_official".into(), "deepseek-v4-pro".into()))
+        );
+        // 服务端确认成功。
+        let cmds = s.handle(AppEvent::ModelSelected {
+            selected: crate::api::types::WireModelSelection {
+                provider: "deepseek_official".into(),
+                model: "deepseek-v4-pro".into(),
+                reasoning_effort: None,
+            },
+        });
+        assert!(cmds.is_empty());
+        assert_eq!(s.mode, Mode::Normal, "切换成功后关闭目录回 NORMAL");
+        assert!(!s.model_catalog.visible);
+        assert!(s.model_catalog.selecting.is_none(), "在途清除");
+        assert_eq!(
+            s.model_catalog.next_model.as_deref(),
+            Some("deepseek_official/deepseek-v4-pro"),
+            "next 镜像更新"
+        );
+        let notice = s.notice.as_deref().unwrap();
+        assert!(
+            notice.contains("deepseek_official/deepseek-v4-pro"),
+            "notice={notice}"
+        );
+        assert!(notice.contains("下一次 prompt 生效"), "notice={notice}");
+    }
+
+    #[test]
+    fn catalog_select_failure_keeps_current_and_shows_code_ac006_09() {
+        let mut s = AppState::default();
+        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        open_catalog_loaded(&mut s);
+        s.handle_command(C::PickerInput("v4".into()));
+        s.handle_command(C::PickerConfirm);
+        // 权限拒绝失败：当前模型不变（无 current 变化）、error.code 显示、
+        // 无自动重试命令。
+        let cmds = s.handle(AppEvent::ModelSelectFailed {
+            error: ClientError::Remote {
+                code: "PERMISSION_DENIED".into(),
+                message: "no".into(),
+                class: ErrorClass::PermissionDenied,
+            },
+        });
+        assert!(cmds.is_empty(), "权限错误不自动重试, cmds={cmds:?}");
+        assert_eq!(
+            s.model_catalog.last_error_code.as_deref(),
+            Some("PERMISSION_DENIED")
+        );
+        assert!(s.model_catalog.selecting.is_none(), "在途清除");
+        assert_eq!(s.mode, Mode::ModelCatalog, "目录保持打开可继续");
+        assert!(s.model_catalog.current_model.is_none(), "当前模型不变");
+    }
+
+    #[test]
+    fn catalog_select_without_active_session_hints_not_crash() {
+        let mut s = AppState::default();
+        open_catalog_loaded(&mut s);
+        // 过滤到无 efforts 的 v4-pro 再 Enter → 直接 submit 路径（无活动会话
+        // 时提示而非崩溃）。
+        s.handle_command(C::PickerInput("v4".into()));
+        let cmds = s.handle_command(C::PickerConfirm);
+        assert!(cmds.is_empty(), "无活动会话不发 selectModel, cmds={cmds:?}");
+        assert!(s
+            .model_catalog
+            .load_error
+            .as_deref()
+            .unwrap()
+            .contains("无打开的会话"));
+    }
+
+    #[test]
+    fn catalog_effort_subflow_uses_model_declared_efforts() {
+        let mut s = AppState::default();
+        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        open_catalog_loaded(&mut s);
+        // 选中带 efforts 的 deepseek-chat（默认 cursor 落在 defaultEffort=low）。
+        s.handle_command(C::PickerInput("chat".into()));
+        s.handle_command(C::PickerConfirm);
+        let pick = s
+            .model_catalog
+            .effort
+            .as_ref()
+            .expect("应进入 effort 子阶段");
+        assert_eq!(pick.efforts, vec!["low", "high"]);
+        assert_eq!(pick.cursor, 0, "default 光标落在 low");
+        // effort 阶段输入被忽略（字符不是查询词）。
+        s.handle_command(C::PickerInput("x".into()));
+        assert_eq!(s.model_catalog.effort.as_ref().unwrap().cursor, 0);
+        // j 移动 → high。
+        s.handle_command(C::PickerDown);
+        assert_eq!(s.model_catalog.effort.as_ref().unwrap().cursor, 1);
+        // Esc 从 effort 返回主列表（目录仍开）；再 Enter 重新进入 effort。
+        s.handle_command(C::ClosePicker);
+        assert!(s.model_catalog.effort.is_none(), "Esc 退回主列表");
+        assert!(s.model_catalog.visible, "目录仍开");
+        s.handle_command(C::PickerConfirm);
+        assert!(s.model_catalog.effort.is_some(), "主列表 Enter 重进 effort");
+        s.handle_command(C::PickerDown);
+        s.handle_command(C::PickerDown);
+        assert_eq!(
+            s.model_catalog.effort.as_ref().unwrap().cursor,
+            1,
+            "光标钳制在末尾"
+        );
+        // Enter 提交带 effort（确认后 effort 清空）。
+        let cmds = s.handle_command(C::PickerConfirm);
+        let Cmd::SelectModel {
+            provider,
+            model,
+            reasoning_effort,
+        } = &cmds[0]
+        else {
+            panic!("预期 SelectModel, 得到 {cmds:?}")
+        };
+        assert_eq!(provider, "deepseek_official");
+        assert_eq!(model, "deepseek-chat");
+        assert_eq!(reasoning_effort.as_deref(), Some("high"));
+        assert!(s.model_catalog.effort.is_none(), "确认后 effort 子阶段结束");
+    }
+
+    #[test]
+    fn catalog_stale_response_after_reopen_is_dropped() {
+        // 生命周期/单飞（模式 15）：关闭后重开 → 旧 generation 的迟到响应
+        // 不得污染新目录状态。
+        let mut s = AppState::default();
+        // 第一次打开（gen=1）。
+        let cmds = s.handle_command(C::OpenModelCatalog);
+        let Cmd::FetchModelCatalog { generation: g1 } = cmds[0] else {
+            panic!()
+        };
+        // 关闭（作废 gen=1）→ 重开（gen=2）。
+        s.handle_command(C::ClosePicker);
+        let cmds = s.handle_command(C::OpenModelCatalog);
+        let Cmd::FetchModelCatalog { generation: g2 } = cmds[0] else {
+            panic!()
+        };
+        assert_ne!(g1, g2);
+        // gen=1 迟到成功 → 丢弃（不进入 Ready，仍是 Loading 等 gen=2）。
+        let cmds = s.handle(AppEvent::ModelCatalogLoaded {
+            generation: g1,
+            catalog: wire_catalog(),
+        });
+        assert!(cmds.is_empty());
+        assert_eq!(s.model_catalog.phase, CatalogPhase::Loading, "旧响应不落位");
+        // gen=2 正常到达 → Ready。
+        s.handle(AppEvent::ModelCatalogLoaded {
+            generation: g2,
+            catalog: wire_catalog(),
+        });
+        assert_eq!(s.model_catalog.phase, CatalogPhase::Ready);
+        assert_eq!(s.model_catalog.index.len(), 2);
     }
 }

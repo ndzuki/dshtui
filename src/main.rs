@@ -420,6 +420,8 @@ async fn run_connected(eff: Effective, token: String, client: DshClient) -> Resu
                 // 无独立 InputMode）。
                 Mode::Trajectory if app.traj.filter.open => InputMode::TrajectoryFilter,
                 Mode::Trajectory => InputMode::Trajectory,
+                // REQ-006：模型目录 overlay（`M` 打开；effort 子阶段同键位表）。
+                Mode::ModelCatalog => InputMode::ModelCatalog,
             };
             if let Some(command) = decoder.decode(mode, input) {
                 commands.extend(app.handle_command(command));
@@ -663,6 +665,64 @@ async fn execute_one(
                 Err(error) => AppEvent::ApprovalReplyFailed { outcome, error },
             };
             commands.extend(app.handle(ev));
+        }
+        // ---------- REQ-006：模型目录（FR-006-01） ----------
+        Cmd::FetchModelCatalog { generation } => {
+            let Some(client) = client.as_ref() else {
+                // 未连接（重连中/启动失败）：目录区给出可观察错误，不静默
+                // （AC-006-06 断网可观察；网络恢复后重新打开/重试即成功）。
+                let event = AppEvent::ModelCatalogLoadFailed {
+                    generation,
+                    error: ClientError::Transport(
+                        "未连接（dsh web 不可达），模型目录暂不可用".into(),
+                    ),
+                };
+                commands.extend(app.handle(event));
+                return;
+            };
+            let event = match dshtui::api::session::model_catalog(&client.http, &client.base).await
+            {
+                Ok(catalog) => AppEvent::ModelCatalogLoaded {
+                    generation,
+                    catalog,
+                },
+                Err(error) => AppEvent::ModelCatalogLoadFailed { generation, error },
+            };
+            commands.extend(app.handle(event));
+        }
+        Cmd::SelectModel {
+            provider,
+            model,
+            reasoning_effort,
+        } => {
+            let Some(client) = client.as_ref() else {
+                let event = AppEvent::ModelSelectFailed {
+                    error: ClientError::Transport("未连接（dsh web 不可达），模型切换失败".into()),
+                };
+                commands.extend(app.handle(event));
+                return;
+            };
+            // 目标会话 = 当前活动会话（模型选择是会话级，next 对该会话生效）。
+            let Some(session_id) = app.active_session.clone() else {
+                app.model_catalog.last_error_code = Some("no-active-session".into());
+                app.model_catalog.load_error =
+                    Some("无打开的会话：先用 f/o 打开会话再切换模型".into());
+                return;
+            };
+            let event = match dshtui::api::session::select_model(
+                &client.http,
+                &client.base,
+                &session_id,
+                &provider,
+                &model,
+                reasoning_effort.as_deref(),
+            )
+            .await
+            {
+                Ok(selected) => AppEvent::ModelSelected { selected },
+                Err(error) => AppEvent::ModelSelectFailed { error },
+            };
+            commands.extend(app.handle(event));
         }
         Cmd::OpenExternal { target } => {
             // 仅用户显式触发才调用系统 open（REQ-003 §3 安全边界）。

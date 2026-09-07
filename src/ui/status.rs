@@ -119,6 +119,15 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
                 ));
             }
         }
+        // REQ-006：模型目录模式指示（FR-006-01）。
+        crate::app::Mode::ModelCatalog => {
+            spans.push(Span::styled(
+                " MODEL ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
         _ => {}
     }
     // AC-003-18：不可编程审批降级 → 状态条 `等待审批` 高亮（不弹窗）。
@@ -196,11 +205,19 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
                     .add_modifier(Modifier::BOLD),
             ));
         }
-        if let Some(model) = projections
-            .model_selection()
-            .last_used
-            .or_else(|| projections.model_selection().next)
-        {
+        // AC-006-08（FR-006-01/D-033）：状态条显示模型选择——next 与
+        // lastUsed 不同时显示 `last → next`（next = 下一次 prompt 实际模型，
+        // 与官方 modelSelection 一致，ADR-008）；相同/无 next 时显示当前。
+        let sel = projections.model_selection();
+        let model_display = if sel.next.is_some() && sel.next != sel.last_used {
+            match (sel.last_used, &sel.next) {
+                (Some(last), Some(next)) => Some(format!("{last} → {next}")),
+                (_, next) => next.clone(),
+            }
+        } else {
+            sel.last_used.clone().or(sel.next)
+        };
+        if let Some(model) = model_display {
             spans.push(Span::raw(format!(" {model}")));
         }
         let context = projections.context_pressure();
@@ -468,6 +485,63 @@ mod tests {
         assert!(rendered.contains("/meta/cwd"), "rendered={rendered}");
         assert!(rendered.contains("●run"), "rendered={rendered}");
         assert!(rendered.contains("ctx 1/2"));
+    }
+
+    #[test]
+    fn status_model_shows_last_then_next_when_changed_ac006_08() {
+        // AC-006-08/D-033：selectModel 后官方 modelSelection.next ≠ lastUsed
+        // → 状态条显示 `last → next`（next=下一次 prompt 实际模型）。
+        let mut app = AppState::default();
+        app.active_session = Some(SessionId("s1".into()));
+        app.conn = ConnState::Ready;
+        app.sessions.touch("s1", 20).apply(Incoming::Snapshot {
+            cursor: None,
+            records: vec![],
+            has_more: false,
+            projections: Some(serde_json::json!({
+                "modelSelection": {
+                    "lastUsed": {"provider": "deepseek_official", "model": "deepseek-chat"},
+                    "next": {"provider": "deepseek_official", "model": "deepseek-reasoner",
+                             "reasoningEffort": "high"}
+                }
+            })),
+        });
+        let backend = TestBackend::new(140, 2);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render(frame, Rect::new(0, 0, 140, 2), &app))
+            .unwrap();
+        let rendered = rendered_text(&terminal);
+        assert!(
+            rendered
+                .contains("deepseek_official/deepseek-chat → deepseek_official/deepseek-reasoner"),
+            "状态条 last → next, rendered={rendered}"
+        );
+        // 相同（无切换）→ 只显示当前一个。
+        let mut app2 = AppState::default();
+        app2.active_session = Some(SessionId("s1".into()));
+        app2.conn = ConnState::Ready;
+        app2.sessions.touch("s1", 20).apply(Incoming::Snapshot {
+            cursor: None,
+            records: vec![],
+            has_more: false,
+            projections: Some(serde_json::json!({
+                "modelSelection": {
+                    "lastUsed": {"provider": "deepseek_official", "model": "deepseek-chat"},
+                    "next": {"provider": "deepseek_official", "model": "deepseek-chat"}
+                }
+            })),
+        });
+        let backend = TestBackend::new(140, 2);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render(frame, Rect::new(0, 0, 140, 2), &app2))
+            .unwrap();
+        let rendered = rendered_text(&terminal);
+        assert!(
+            rendered.contains("deepseek_official/deepseek-chat") && !rendered.contains("→"),
+            "未切换不显示箭头, rendered={rendered}"
+        );
     }
 
     #[test]

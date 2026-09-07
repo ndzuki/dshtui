@@ -8,6 +8,7 @@
 pub mod agent_roster;
 pub mod agent_town;
 pub mod approval;
+pub mod catalog;
 pub mod draft;
 pub mod image;
 pub mod kb_stats;
@@ -26,6 +27,7 @@ pub use agent_roster::{
     AgentStatus, RosterSnapshot, StageMeta, STAGES,
 };
 pub use approval::{ApprovalItem, ApprovalQueue, ApprovalSummary};
+pub use catalog::{CatalogIndex, ModelCatalogItem};
 pub use draft::{DraftRegistry, DraftState, InputHistory};
 pub use image::{
     image_block_of, is_supported_image, AttachmentRef, ImageBlockRef, ImageCacheEntry,

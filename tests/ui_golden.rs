@@ -817,3 +817,46 @@ fn trajectory_filter_overlay_renders_matches_ac005_05() {
     assert!(text.contains("/ db"), "过滤 query 显示, text={text}");
     assert!(text.contains("matches"), "命中计数, text={text}");
 }
+
+#[test]
+fn model_catalog_overlay_renders_rows_and_status_ac006_01() {
+    // AC-006-01（渲染侧）：模型目录 overlay 显示输入行、命中列表与模式徽标。
+    use dshtui::model::catalog::CatalogIndex;
+    let mut app = AppState::new(20);
+    app.conn = ConnState::Ready;
+    app.active_session = Some(SessionId("sess-1".into()));
+    app.mode = Mode::ModelCatalog;
+    app.model_catalog.visible = true;
+    let catalog: dshtui::api::types::ModelCatalog = serde_json::from_value(serde_json::json!({
+        "default": {"provider": "deepseek_official", "model": "deepseek-chat"},
+        "routableProviders": ["deepseek_official"],
+        "groups": [{
+            "id": "deepseek_official",
+            "name": "DeepSeek 官方",
+            "models": [
+                {"id": "deepseek-chat", "name": "DeepSeek Chat",
+                 "reasoning": {"efforts": [{"id": "low", "name": "Low"}], "defaultEffort": "low"}},
+                {"id": "deepseek-v4-pro", "name": "V4 Pro"}
+            ]
+        }],
+        "failures": []
+    }))
+    .unwrap();
+    app.model_catalog.index = {
+        let mut idx = CatalogIndex::new();
+        idx.rebuild(&catalog);
+        idx
+    };
+    app.model_catalog.phase = dshtui::app::CatalogPhase::Ready;
+    app.model_catalog.query = "chat".into();
+    app.model_catalog.current_model = Some("deepseek_official/deepseek-chat".into());
+    let backend = TestBackend::new(140, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::render(frame, &app)).unwrap();
+    let text = rendered_text(&terminal);
+    assert!(text.contains("MODEL"), "状态条 MODEL 徽标, text={text}");
+    assert!(text.contains("Model Catalog"), "面板标题, text={text}");
+    assert!(text.contains("DeepSeek Chat"), "命中行, text={text}");
+    assert!(text.contains("1/2"), "命中/总数计数, text={text}");
+    assert!(text.contains("effort: low"), "effort 元数据, text={text}");
+}

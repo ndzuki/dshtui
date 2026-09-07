@@ -9,6 +9,7 @@ pub mod image;
 pub mod image_view;
 pub mod layout;
 pub mod markdown;
+pub mod model_catalog;
 pub mod monitor;
 pub mod outline;
 pub mod picker;
@@ -100,6 +101,8 @@ pub fn render(frame: &mut Frame<'_>, app: &AppState) {
     outline::render(frame, areas.center, app);
     search::render(frame, areas.center, app);
     approval::render(frame, areas.center, app);
+    // REQ-006：模型目录 overlay（`M` 打开，在审批之上、帮助之下）。
+    model_catalog::render(frame, areas.center, app);
     // FR-001-07：帮助 overlay 最后渲染，位于 picker 之上。
     render_help(frame, frame.area(), app);
 }
