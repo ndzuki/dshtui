@@ -992,9 +992,8 @@ async fn session_fork_rename_create_nest_request_and_parse_typed_values() {
     use dshtui::api::types::SessionId;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let methods: std::sync::Arc<
-        std::sync::Mutex<Vec<(String, Value)>>,
-    > = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let methods: std::sync::Arc<std::sync::Mutex<Vec<(String, Value)>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let methods2 = methods.clone();
     let server = tokio::spawn(async move {
         for _ in 0..3 {
@@ -1031,13 +1030,14 @@ async fn session_fork_rename_create_nest_request_and_parse_typed_values() {
         .await
         .unwrap();
     assert_eq!(fork.session_id, "new-fork-1");
-    let rename =
-        dshtui::api::session::rename(&http, &base, &SessionId("sess-1".into()), "新标题")
-            .await
-            .unwrap();
+    let rename = dshtui::api::session::rename(&http, &base, &SessionId("sess-1".into()), "新标题")
+        .await
+        .unwrap();
     assert_eq!(rename.title, "新标题");
     assert_eq!(rename.seq, 42);
-    let created = dshtui::api::session::create(&http, &base, Some("ws-1"), None).await.unwrap();
+    let created = dshtui::api::session::create(&http, &base, Some("ws-1"), None)
+        .await
+        .unwrap();
     assert_eq!(created.session_id, "created-1");
     server.await.unwrap();
 
@@ -1069,7 +1069,9 @@ async fn workspace_mutations_nest_request_and_archive_is_workspace_namespace() {
                     // archiveSession 属 workspace namespace，请求仅 sessionId
                     // （FR-006-02 fact 修正）。
                     assert_eq!(body["payload"]["args"]["request"]["sessionId"], "sess-9");
-                    assert!(body["payload"]["args"]["request"].get("workspaceId").is_none());
+                    assert!(body["payload"]["args"]["request"]
+                        .get("workspaceId")
+                        .is_none());
                     write_json_response(
                         &mut socket,
                         json!({"type": "server-response", "rpcId": rpc_id,
@@ -1083,10 +1085,10 @@ async fn workspace_mutations_nest_request_and_archive_is_workspace_namespace() {
                     write_json_response(
                         &mut socket,
                         json!({"type": "server-response", "rpcId": rpc_id,
-                               "result": {"ok": true, "value": {"workspace": {
-                                   "workspaceId": "ws-2", "path": "/p", "title": "项目 B",
-                                   "sessionIds": [], "createdAt": "x", "updatedAt": "y"
-                               }}}}),
+                        "result": {"ok": true, "value": {"workspace": {
+                            "workspaceId": "ws-2", "path": "/p", "title": "项目 B",
+                            "sessionIds": [], "createdAt": "x", "updatedAt": "y"
+                        }}}}),
                     )
                     .await;
                 }
@@ -1096,8 +1098,9 @@ async fn workspace_mutations_nest_request_and_archive_is_workspace_namespace() {
 
     let http = reqwest::Client::new();
     let base = format!("http://{addr}");
-    let archive =
-        dshtui::api::workspace::archive_session(&http, &base, "sess-9").await.unwrap();
+    let archive = dshtui::api::workspace::archive_session(&http, &base, "sess-9")
+        .await
+        .unwrap();
     assert_eq!(archive["archivedSessionIds"][0], "sess-9");
     let renamed = dshtui::api::workspace::rename_workspace(&http, &base, "ws-2", "项目 B")
         .await
@@ -1145,7 +1148,9 @@ async fn commands_flat_args_list_and_execute_undefined_tolerance_ac006_04() {
 
     let http = reqwest::Client::new();
     let base = format!("http://{addr}");
-    let cmds = dshtui::api::commands::list(&http, &base, "agent-1").await.unwrap();
+    let cmds = dshtui::api::commands::list(&http, &base, "agent-1")
+        .await
+        .unwrap();
     assert_eq!(cmds.len(), 2);
     assert_eq!(cmds[0].name, "plan");
     assert_eq!(cmds[0].input.as_ref().unwrap().hint, "off");
@@ -1189,9 +1194,10 @@ async fn command_execute_surfaces_remote_error_code_ac006_13() {
     });
 
     let http = reqwest::Client::new();
-    let err = dshtui::api::commands::execute(&http, &format!("http://{addr}"), "agent-1", "/nope", &[])
-        .await
-        .unwrap_err();
+    let err =
+        dshtui::api::commands::execute(&http, &format!("http://{addr}"), "agent-1", "/nope", &[])
+            .await
+            .unwrap_err();
     match err {
         dshtui::api::ClientError::Remote { code, class, .. } => {
             assert_eq!(code, "commands/not-found");

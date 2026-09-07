@@ -43,7 +43,7 @@ pub struct ApprovalSummary {
 }
 
 /// Serial approval queue (pure model). Default = empty queue.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct ApprovalQueue {
     /// Arrival-ordered items not yet shown.
     queue: VecDeque<ApprovalItem>,
@@ -68,10 +68,7 @@ impl ApprovalQueue {
         if self.is_granted(id) {
             return false;
         }
-        if self
-            .iter_all()
-            .any(|item| item.event.event_id == id)
-        {
+        if self.iter_all().any(|item| item.event.event_id == id) {
             return false;
         }
         self.queue.push_back(ApprovalItem {
@@ -135,7 +132,11 @@ impl ApprovalQueue {
         let mut item = self.active.take()?;
         item.acked = false;
         let event = item.event.clone();
-        if !self.failed.iter().any(|f| f.event.event_id == item.event.event_id) {
+        if !self
+            .failed
+            .iter()
+            .any(|f| f.event.event_id == item.event.event_id)
+        {
             self.failed.push(item);
         }
         self.promote();
@@ -182,6 +183,11 @@ impl ApprovalQueue {
     /// Whether the active item is acked (for a "confirmed" display).
     pub fn head_acked(&self) -> bool {
         self.active.as_ref().is_some_and(|item| item.acked)
+    }
+
+    /// Whether an event id is currently a failed (retryable) item.
+    pub fn is_failed(&self, id: &str) -> bool {
+        self.failed.iter().any(|item| item.event.event_id == id)
     }
 
     /// Drop any item (used when leaving the approval flow: Esc/q on the list).

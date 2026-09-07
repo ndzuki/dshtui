@@ -204,7 +204,10 @@ mod tests {
 
     #[test]
     fn policy_hint_reads_ask_and_never_tolerantly() {
-        assert_eq!(policy_hint(&serde_json::json!({"policy": "ask"})), Some("ask"));
+        assert_eq!(
+            policy_hint(&serde_json::json!({"policy": "ask"})),
+            Some("ask")
+        );
         assert_eq!(
             policy_hint(&serde_json::json!({"approvalPolicy": "never"})),
             Some("never")
@@ -216,7 +219,10 @@ mod tests {
         // Unknown key / value / always-alias: display-only.
         assert_eq!(policy_hint(&serde_json::json!({})), None);
         assert_eq!(policy_hint(&serde_json::json!({"policy": "unknown"})), None);
-        assert_eq!(policy_hint(&serde_json::json!({"policy": "always"})), Some("never"));
+        assert_eq!(
+            policy_hint(&serde_json::json!({"policy": "always"})),
+            Some("never")
+        );
     }
 
     #[test]

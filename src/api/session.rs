@@ -255,9 +255,8 @@ pub async fn select_model(
         .get("selected")
         .cloned()
         .unwrap_or(serde_json::Value::Null);
-    serde_json::from_value(selected).map_err(|e| {
-        ClientError::Protocol(format!("session/selectModel 响应形状异常: {e}"))
-    })
+    serde_json::from_value(selected)
+        .map_err(|e| ClientError::Protocol(format!("session/selectModel 响应形状异常: {e}")))
 }
 
 /// `session/fork` — fork a session (optionally at a seq); returns the new

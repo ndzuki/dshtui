@@ -11,12 +11,18 @@ use ratatui::Frame;
 use crate::app::AppState;
 
 /// 渲染审批弹窗（仅 visible 时；AC-003-18 降级 waiting_hint 走状态条，
-/// 弹窗不出现也不阻塞）。
+/// 弹窗不出现也不阻塞）。REQ-006（D-036）：`list_open` 时渲染队列列表
+/// （j/k 移动、r 重试、A 批量）；否则渲染单条槽 + 队列摘要 + danger/ack
+/// 指示 + 只读 policy 徽标。
 pub fn render(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
     if !app.approval.visible {
         return;
     }
-    let overlay = crate::ui::centered_rect(area, 70, 50);
+    if app.approval.list_open {
+        render_list(frame, area, app);
+        return;
+    }
+    let overlay = crate::ui::centered_rect(area, 72, 55);
     frame.render_widget(Clear, overlay);
     let mut lines: Vec<Line<'static>> = Vec::new();
 
@@ -39,34 +45,41 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
             ]));
         }
     }
-    lines.push(Line::from(""));
-    lines.push(Line::from(vec![
-        Span::styled(
-            "[y]",
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" 允许本次  "),
-        Span::styled(
-            "[n]",
+    // danger-full-access：第二层风险确认提示（AC-006-16）。
+    if app.approval.queue.head_requires_ack() {
+        lines.push(Line::from(Span::styled(
+            "⚠ 危险操作：需按 [a] 确认风险后，再 [y] 允许（仍仅授权本次）",
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        ),
+        )));
+    } else if app.approval.acked {
+        lines.push(Line::from(Span::styled(
+            "风险已确认；仍仅授权本次（allowed-once）",
+            Style::default().fg(Color::Green),
+        )));
+    }
+    lines.push(Line::from(""));
+    // 键位提示（D-036）：非 danger 项 `a` = 始终允许指引（REQ-003 语义）；
+    // danger 项 `a` = 风险确认。队列摘要提示列表入口 [L]。
+    let summary = app.approval.queue.summary();
+    let a_hint = if app.approval.queue.head_requires_ack() {
+        "确认风险"
+    } else {
+        "始终允许指引"
+    };
+    lines.push(Line::from(vec![
+        Span::styled("[y]", green()),
+        Span::raw(" 允许本次  "),
+        Span::styled("[n]", red()),
         Span::raw(" 拒绝  "),
-        Span::styled(
-            "[q/Esc]",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ),
+        Span::styled("[q/Esc]", yellow()),
         Span::raw(" 中止  "),
-        Span::styled(
-            "[a]",
-            Style::default()
-                .fg(Color::Gray)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" 始终允许指引"),
+        Span::styled("[a]", gray()),
+        Span::raw(format!(" {a_hint}  ")),
+        Span::styled("[L]", cyan()),
+        Span::raw(format!(
+            " 列表 (队列 {} 待 / {} 失败)",
+            summary.pending, summary.failed
+        )),
     ]));
 
     if app.approval.reply_inflight {
@@ -81,6 +94,19 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
             Style::default().fg(Color::DarkGray),
         )));
     }
+    if let Some(toast) = &app.approval.toast {
+        lines.push(Line::from(Span::styled(
+            toast.clone(),
+            Style::default().fg(Color::Yellow),
+        )));
+    }
+    // AC-006-17：approval/policy 只读徽标（ask|never；无切换入口 D-037）。
+    if let Some(policy) = app.approval.policy_display {
+        lines.push(Line::from(Span::styled(
+            format!("approval policy: {policy}（只读，切换请用官方 web / V0.4）"),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
 
     frame.render_widget(
         Paragraph::new(lines).block(
@@ -91,6 +117,135 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         ),
         overlay,
     );
+}
+
+/// 审批队列列表视图（REQ-006 D-036）：active 置顶 + pending + failed；
+/// 光标行以反色标识；底部提示键位。
+fn render_list(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
+    let overlay = crate::ui::centered_rect(area, 76, 70);
+    frame.render_widget(Clear, overlay);
+    let items = app.approval.queue.list();
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for (idx, item) in items.iter().enumerate() {
+        let cursor = idx == app.approval.list_cursor;
+        let status = if app.approval.queue.is_failed(&item.event.event_id) {
+            "FAILED"
+        } else if app
+            .approval
+            .event
+            .as_ref()
+            .is_some_and(|ev| ev.event_id == item.event.event_id)
+        {
+            "ACTIVE"
+        } else {
+            "pending"
+        };
+        let (label, summary_text) = item_title(&item.event.raw);
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        if cursor {
+            spans.push(Span::styled(
+                "▌",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        let color = match status {
+            "FAILED" => Color::Red,
+            "ACTIVE" => Color::Green,
+            _ => Color::Gray,
+        };
+        spans.push(Span::styled(
+            format!("{status:>7} {label} {summary_text}"),
+            Style::default().fg(color),
+        ));
+        if cursor {
+            for s in spans.iter_mut() {
+                s.style = s.style.add_modifier(Modifier::REVERSED);
+            }
+        }
+        lines.push(Line::from(spans));
+    }
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "（无待处理审批）",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("[j/k]", gray()),
+        Span::raw(" 移动  "),
+        Span::styled("[r]", gray()),
+        Span::raw(" 重试失败项  "),
+        Span::styled("[A]", yellow()),
+        Span::raw(" 批量允许  "),
+        Span::styled("[y/n]", gray()),
+        Span::raw(" 单条决策  "),
+        Span::styled("[q/Esc]", gray()),
+        Span::raw(" 回单条槽（不中止）"),
+    ]));
+
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow))
+                .title(" Approval 队列 "),
+        ),
+        overlay,
+    );
+}
+
+/// 列表行标题：从原始载荷宽松提取（与单条槽 summary 同口径）。
+fn item_title(raw: &serde_json::Value) -> (String, String) {
+    let get_str = |keys: &[&str]| -> Option<String> {
+        keys.iter()
+            .find_map(|k| raw.get(k))
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    };
+    let label = get_str(&["tool", "toolName", "command"])
+        .or_else(|| {
+            raw.get("agent")
+                .and_then(|a| a.get("name"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "approval".into());
+    let summary = get_str(&["reason", "summary"])
+        .or_else(|| {
+            raw.get("request")
+                .and_then(|r| r.get("toolName"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_default();
+    (label, summary)
+}
+
+fn green() -> Style {
+    Style::default()
+        .fg(Color::Green)
+        .add_modifier(Modifier::BOLD)
+}
+fn red() -> Style {
+    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+}
+fn yellow() -> Style {
+    Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD)
+}
+fn gray() -> Style {
+    Style::default()
+        .fg(Color::Gray)
+        .add_modifier(Modifier::BOLD)
+}
+fn cyan() -> Style {
+    Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD)
 }
 
 /// 从原始审批载荷宽松提取可读字段（`[未验证]` 形状；缺失即省略）。

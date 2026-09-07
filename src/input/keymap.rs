@@ -19,6 +19,8 @@ pub enum InputMode {
     Visual,
     /// 审批弹窗（REQ-003，y/n/q/Esc 决策）。
     Approval,
+    /// 审批列表视图（REQ-006，`L` 打开；j/k 移动、r 重试失败项、A 批量）。
+    ApprovalList,
     /// REQ-004 V0.2：IMAGEVIEW 模式（仅 Kitty 渲染态出现，D-14）。
     ImageView,
 
@@ -91,6 +93,15 @@ pub enum Command {
     ApprovalReject,
     ApprovalCancel,
     ApprovalAlways,
+    // ---------- REQ-006 审批队列增强（D-036） ----------
+    /// APPROVAL 单条槽中 `L`：打开审批列表视图。
+    OpenApprovalList,
+    /// ApprovalList 中 `r`：重试光标行失败项。
+    ApprovalRetry,
+    /// ApprovalList 中 `A`：批量 allowed-once（串行泵自动续发）。
+    ApprovalBatchAllow,
+    /// ApprovalList 中 q/Esc：回单条槽不中止。
+    CloseApprovalList,
     /// INSERT `↑`/`↓` 输入历史（REQ-F06）。
     HistoryPrev,
     HistoryNext,
@@ -154,6 +165,7 @@ impl KeyDecoder {
             InputMode::Search => self.search(key),
             InputMode::Visual => self.visual(key),
             InputMode::Approval => self.approval(key),
+            InputMode::ApprovalList => self.approval_list(key),
             InputMode::ImageView => self.image_view(key),
             InputMode::Trajectory => self.trajectory(key),
             InputMode::TrajectoryFilter => self.trajectory_filter(key),
@@ -412,8 +424,9 @@ impl KeyDecoder {
         }
     }
 
-    /// APPROVAL 键位（REQ-003 §3.5）：y 允许 / n 拒绝 / q·Esc 中止（cancelled）；
-    /// a 显示始终允许指引（非 outcome）；Enter 无语义（§3 键位边界）。
+    /// APPROVAL 键位（REQ-003 §3.5 + REQ-006 D-036）：y 允许 / n 拒绝 /
+    /// q·Esc 中止（cancelled）；a 危险项风险确认（否则始终允许指引）；
+    /// L 打开审批列表。Enter 无语义（§3 键位边界）。
     fn approval(&mut self, key: KeyEvent) -> Option<Command> {
         self.pending_g = false;
         match key.code {
@@ -422,6 +435,27 @@ impl KeyDecoder {
             KeyCode::Char('n') if key.modifiers.is_empty() => Some(Command::ApprovalReject),
             KeyCode::Char('q') if key.modifiers.is_empty() => Some(Command::ApprovalCancel),
             KeyCode::Char('a') if key.modifiers.is_empty() => Some(Command::ApprovalAlways),
+            KeyCode::Char('L') if key.modifiers.is_empty() => Some(Command::OpenApprovalList),
+            _ => None,
+        }
+    }
+
+    /// REQ-006 ApprovalList 键位（D-036）：j/k 移动、r 重试失败项、
+    /// A 批量 allowed-once、q/Esc 回单条槽不中止（不发出 cancelled）。
+    fn approval_list(&mut self, key: KeyEvent) -> Option<Command> {
+        self.pending_g = false;
+        match key.code {
+            KeyCode::Esc => Some(Command::CloseApprovalList),
+            KeyCode::Char('q') if key.modifiers.is_empty() => Some(Command::CloseApprovalList),
+            KeyCode::Char('j') if key.modifiers.is_empty() => Some(Command::PickerDown),
+            KeyCode::Char('k') if key.modifiers.is_empty() => Some(Command::PickerUp),
+            KeyCode::Char('r') if key.modifiers.is_empty() => Some(Command::ApprovalRetry),
+            KeyCode::Char('A') if key.modifiers.is_empty() => Some(Command::ApprovalBatchAllow),
+            // 列表视图中 y/n 仍对单条槽（active）决策（批量便捷键之外保留单条）。
+            KeyCode::Char('y') if key.modifiers.is_empty() => Some(Command::ApprovalAllow),
+            KeyCode::Char('n') if key.modifiers.is_empty() => Some(Command::ApprovalReject),
+            KeyCode::Char('a') if key.modifiers.is_empty() => Some(Command::ApprovalAlways),
+            KeyCode::Char('L') if key.modifiers.is_empty() => Some(Command::CloseApprovalList),
             _ => None,
         }
     }
@@ -621,6 +655,79 @@ mod tests {
         assert_eq!(
             d.decode(InputMode::Insert, key(KeyCode::Esc)),
             Some(Command::ClosePicker)
+        );
+    }
+
+    #[test]
+    fn approval_list_keys_navigate_retry_batch_and_close_ac006() {
+        let mut d = KeyDecoder::new();
+        // 单条槽：L 打开列表。
+        assert_eq!(
+            d.decode(InputMode::Approval, key(KeyCode::Char('L'))),
+            Some(Command::OpenApprovalList)
+        );
+        // 列表：j/k 移动、r 重试、A 批量、y/n 单条决策、q/Esc/L 回单条槽。
+        assert_eq!(
+            d.decode(InputMode::ApprovalList, key(KeyCode::Char('j'))),
+            Some(Command::PickerDown)
+        );
+        assert_eq!(
+            d.decode(InputMode::ApprovalList, key(KeyCode::Char('k'))),
+            Some(Command::PickerUp)
+        );
+        assert_eq!(
+            d.decode(InputMode::ApprovalList, key(KeyCode::Char('r'))),
+            Some(Command::ApprovalRetry)
+        );
+        assert_eq!(
+            d.decode(InputMode::ApprovalList, key(KeyCode::Char('A'))),
+            Some(Command::ApprovalBatchAllow)
+        );
+        assert_eq!(
+            d.decode(InputMode::ApprovalList, key(KeyCode::Char('q'))),
+            Some(Command::CloseApprovalList)
+        );
+        assert_eq!(
+            d.decode(InputMode::ApprovalList, key(KeyCode::Esc)),
+            Some(Command::CloseApprovalList)
+        );
+        assert_eq!(
+            d.decode(InputMode::ApprovalList, key(KeyCode::Char('y'))),
+            Some(Command::ApprovalAllow)
+        );
+        assert_eq!(
+            d.decode(InputMode::ApprovalList, key(KeyCode::Char('n'))),
+            Some(Command::ApprovalReject)
+        );
+        // 列表中 `q` 不回 Quit（不中止当前项）。
+        assert_ne!(
+            d.decode(InputMode::ApprovalList, key(KeyCode::Char('q'))),
+            Some(Command::Quit)
+        );
+    }
+
+    #[test]
+    fn approval_single_slot_still_decides_with_y_n_q_a_ac003() {
+        let mut d = KeyDecoder::new();
+        assert_eq!(
+            d.decode(InputMode::Approval, key(KeyCode::Char('y'))),
+            Some(Command::ApprovalAllow)
+        );
+        assert_eq!(
+            d.decode(InputMode::Approval, key(KeyCode::Char('n'))),
+            Some(Command::ApprovalReject)
+        );
+        assert_eq!(
+            d.decode(InputMode::Approval, key(KeyCode::Char('q'))),
+            Some(Command::ApprovalCancel)
+        );
+        assert_eq!(
+            d.decode(InputMode::Approval, key(KeyCode::Esc)),
+            Some(Command::ApprovalCancel)
+        );
+        assert_eq!(
+            d.decode(InputMode::Approval, key(KeyCode::Char('a'))),
+            Some(Command::ApprovalAlways)
         );
     }
 

@@ -412,6 +412,8 @@ async fn run_connected(eff: Effective, token: String, client: DshClient) -> Resu
                 // REQ-003 模式机扩展（app.mode 镜像）。
                 Mode::Search => InputMode::Search,
                 Mode::Visual => InputMode::Visual,
+                // REQ-006：审批列表子视图（`L` 打开）用独立键位表（D-036）。
+                Mode::Approval if app.approval.list_open => InputMode::ApprovalList,
                 Mode::Approval => InputMode::Approval,
                 Mode::ImageView => InputMode::ImageView,
                 // REQ-005：Trajectory 独立模式（详情子层由 focus 分派，

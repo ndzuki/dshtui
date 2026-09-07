@@ -287,6 +287,82 @@ fn waiting_approval_status_only_no_modal_ac003_18() {
 }
 
 #[test]
+fn approval_queue_list_renders_pending_and_failed_ac006_05_14() {
+    use dshtui::model::ApprovalQueue;
+    let mut app = AppState::new(20);
+    app.conn = ConnState::Ready;
+    app.active_session = Some(SessionId("sess-1".into()));
+    app.mode = Mode::Approval;
+    app.approval.visible = true;
+    app.approval.list_open = true;
+    // 队列：e1 失败可重试、e2 待处理。
+    let mut q = ApprovalQueue::new();
+    q.enqueue(
+        ApprovalEvent {
+            client_id: "c-1".into(),
+            event_id: "e1".into(),
+            raw: serde_json::json!({"type": "approval/request", "request": {"toolName": "bash"}}),
+        },
+        false,
+    );
+    q.enqueue(
+        ApprovalEvent {
+            client_id: "c-2".into(),
+            event_id: "e2".into(),
+            raw: serde_json::json!({"type": "approval/request", "request": {"toolName": "bash"}}),
+        },
+        false,
+    );
+    q.promote();
+    q.fail_active(); // e1 failed
+    app.approval.queue = q;
+    let backend = TestBackend::new(110, 24);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::render(frame, &app)).unwrap();
+    let text = rendered_text(&terminal);
+    assert!(text.contains("Approval 队列"), "列表标题, text={text}");
+    assert!(text.contains("FAILED"), "失败项可见, text={text}");
+    assert!(text.contains("pending"), "待处理项可见, text={text}");
+    assert!(text.contains("重试失败项"), "r 提示, text={text}");
+    assert!(text.contains("批量允许"), "A 提示, text={text}");
+}
+
+#[test]
+fn approval_danger_banner_requires_ack_ac006_16() {
+    let mut app = AppState::new(20);
+    app.conn = ConnState::Ready;
+    app.active_session = Some(SessionId("sess-1".into()));
+    app.mode = Mode::Approval;
+    app.approval.visible = true;
+    app.approval.event = Some(ApprovalEvent {
+        client_id: "c-1".into(),
+        event_id: "d1".into(),
+        raw: serde_json::json!({
+            "type": "approval/request",
+            "request": {"toolName": "danger-full-access", "reason": "rm -rf /"}
+        }),
+    });
+    app.approval.queue.enqueue(
+        ApprovalEvent {
+            client_id: "c-1".into(),
+            event_id: "d1".into(),
+            raw: serde_json::json!({
+                "type": "approval/request",
+                "request": {"toolName": "danger-full-access", "reason": "rm -rf /"}
+            }),
+        },
+        true,
+    );
+    app.approval.queue.promote();
+    let backend = TestBackend::new(110, 22);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::render(frame, &app)).unwrap();
+    let text = rendered_text(&terminal);
+    assert!(text.contains("危险操作"), "风险横幅, text={text}");
+    assert!(text.contains("确认风险"), "a=确认, text={text}");
+}
+
+#[test]
 fn copied_toast_and_steer_label_render_in_status_ac003_06_08() {
     let mut app = AppState::new(20);
     app.conn = ConnState::Ready;

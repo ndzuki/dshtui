@@ -83,7 +83,8 @@ mod tests {
     #[test]
     fn command_descriptor_tolerates_missing_input() {
         let v: CommandDescriptor =
-            serde_json::from_value(serde_json::json!({"name": "help", "description": "h"})).unwrap();
+            serde_json::from_value(serde_json::json!({"name": "help", "description": "h"}))
+                .unwrap();
         assert_eq!(v.name, "help");
         assert!(v.input.is_none());
     }

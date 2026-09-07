@@ -25,13 +25,13 @@ pub use agent_roster::{
     esc, fmt_elapsed, short_session, stage_key, stage_meta, AgentKind, AgentRosterEntry,
     AgentStatus, RosterSnapshot, StageMeta, STAGES,
 };
+pub use approval::{ApprovalItem, ApprovalQueue, ApprovalSummary};
 pub use draft::{DraftRegistry, DraftState, InputHistory};
 pub use image::{
     image_block_of, is_supported_image, AttachmentRef, ImageBlockRef, ImageCacheEntry,
     ImageViewError, ImageViewPhase, ImageViewState, OriginalDimensions, SUPPORTED_IMAGE_TYPES,
 };
 pub use kb_stats::{KbBucket, KbHistogram, KbStatsError, KbStatsSnapshot, KB_DURATION_BOUNDARIES};
-pub use approval::{ApprovalItem, ApprovalQueue, ApprovalSummary};
 pub use projections::ProjectionSnapshot;
 pub use search::{SearchIndex, SearchItem, SearchKind, SearchKindFilter, SearchMatch};
 pub use session::{

@@ -159,9 +159,11 @@ impl SearchState {
 }
 
 /// APPROVAL 模态状态（REQ-003 §5 `ApprovalState`；仅内存）。
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ApprovalState {
     pub visible: bool,
+    /// 当前展示项 = 队列 active 的镜像（REQ-006 D-036 additive：事件恒为
+    /// queue active 镜像，队列在途覆盖隐患由入队语义消除）。
     pub event: Option<ApprovalEvent>,
     pub last_outcome: Option<ApprovalOutcome>,
     /// outcome 回复在途：同一弹窗只回复一次（幂等）。
@@ -172,6 +174,42 @@ pub struct ApprovalState {
     pub waiting_hint: bool,
     /// 一次性提示（toast）。
     pub toast: Option<String>,
+    // ---------- REQ-006 审批队列扩展（D-036 additive） ----------
+    /// 串行审批队列（纯模型；pending/active/failed + 有界 granted 去重）。
+    pub queue: crate::model::ApprovalQueue,
+    /// danger-full-access 当前项第二层风险确认（AC-006-16）。
+    pub acked: bool,
+    /// 批量 allowed-once 模式：队列自动续发（≤1 在途，AC-006-15）；danger
+    /// 项停点等 ack 后继续。
+    pub batch_allow: bool,
+    /// 审批列表视图（`L` 打开：j/k 移动、`r` 重试失败项、`A` 批量、q/Esc
+    /// 回单条槽）。
+    pub list_open: bool,
+    /// 列表光标（`ApprovalQueue::list()` 下标）。
+    pub list_cursor: usize,
+    /// 会话 approval/policy 只读展示（ask|never；AC-006-17/D-037，从官方
+    /// 投影宽容解析，TUI 无切换入口）。
+    pub policy_display: Option<&'static str>,
+}
+
+impl Default for ApprovalState {
+    fn default() -> Self {
+        Self {
+            visible: false,
+            event: None,
+            last_outcome: None,
+            reply_inflight: false,
+            prev_mode: Mode::Normal,
+            waiting_hint: false,
+            toast: None,
+            queue: crate::model::ApprovalQueue::new(),
+            acked: false,
+            batch_allow: false,
+            list_open: false,
+            list_cursor: 0,
+            policy_display: None,
+        }
+    }
 }
 
 /// turnOutline 大纲列表（`O`；D-19 独立键，与 `o` 打开不冲突）。
@@ -797,6 +835,11 @@ impl AppState {
                         self.approval.waiting_hint = projections_await_approval(p);
                     }
                 }
+                // AC-006-17：approval/policy ask|never 只读展示（宽容解析，
+                // 无 TUI 切换入口 D-037）。逐快照刷新：最新投影为准。
+                if let Some(p) = projections.as_ref() {
+                    self.approval.policy_display = crate::api::approval::policy_hint(p);
+                }
                 if running {
                     self.running_sessions.insert(session_id.clone());
                 } else {
@@ -1090,45 +1133,87 @@ impl AppState {
                 vec![]
             }
             AppEvent::ApprovalRequest { event } => {
-                // 同一事件重复投递（重连/重放）只保留一次（模式 15 去重）。
-                if self
-                    .approval
-                    .event
-                    .as_ref()
-                    .is_some_and(|cur| cur.event_id == event.event_id)
-                {
-                    tracing::debug!(event_id = %event.event_id, "重复审批事件忽略");
+                // 队列去重（pending/active/failed/granted 命中 → false 忽略；
+                // 模式 15 重放防护，AC-006-15/18）。danger 标记为宽容读取
+                // （api 层 needs_ack；wire `[未验证]`）。
+                // AC-006-17：帧自身携带 policy（ask|never）→ 只读展示。
+                if let Some(policy) = crate::api::approval::policy_hint(&event.raw) {
+                    self.approval.policy_display = Some(policy);
+                }
+                let danger = crate::api::approval::needs_ack(&event.raw);
+                if !self.approval.queue.enqueue(event, danger) {
+                    tracing::debug!("重复审批事件忽略（队列去重）");
                     return vec![];
                 }
-                if self.mode != Mode::Approval {
-                    self.approval.prev_mode = self.mode;
+                // 无活动项（首次到达 / 上一项已清）→ promote 进单条槽显示。
+                if self.approval.event.is_none() {
+                    self.approval_promote_display();
                 }
-                self.mode = Mode::Approval;
-                self.approval.event = Some(event);
-                self.approval.visible = true;
-                self.approval.reply_inflight = false;
-                self.approval.waiting_hint = false;
                 vec![]
             }
             AppEvent::ApprovalReplied { outcome } => {
                 self.approval.reply_inflight = false;
                 self.approval.last_outcome = Some(outcome);
                 self.approval.toast = Some(format!("审批已回复: {}", outcome.as_str()));
-                self.approval.event = None;
-                self.approval.visible = false;
-                self.mode = self.approval.prev_mode;
-                vec![]
+                let granted = outcome == ApprovalOutcome::AllowedOnce;
+                // settle 后队列自动 promote 下一 pending（≤1 在途）。
+                self.approval.queue.settle(granted);
+                // 批量模式：非 danger 停点 → 自动续发下一项（AC-006-15
+                // 串行泵；逐条 unary，无服务端批量端点）。
+                let batch_cmds = self.approval_pump_if_batch();
+                if self.approval.queue.has_active() {
+                    // 展示下一项（danger 停点等 ack 时禁用批量）。
+                    self.approval_sync_from_queue();
+                    if self.approval.queue.head_requires_ack() {
+                        self.approval.batch_allow = false;
+                        self.approval.toast = Some(
+                            "危险操作需先确认风险：按 a 确认后再允许（仍仅授权本次）".to_string(),
+                        );
+                    }
+                } else if self.approval.queue.summary().failed > 0 {
+                    // pending/active 已清但仍有失败项：留在 Approval 并打开
+                    // 列表视图（`r` 重试失败项入口，AC-006-14）。
+                    self.approval.event = None;
+                    self.approval.batch_allow = false;
+                    self.approval.list_open = true;
+                    self.approval.list_cursor = 0;
+                    self.approval.waiting_hint = false;
+                    self.approval.toast =
+                        Some("部分审批失败（已保留）：列表 [r] 重试失败项 / [q] 退出".to_string());
+                } else {
+                    // 队列全空 → 关闭弹窗恢复先前模式（AC-003 单条行为不变）。
+                    self.approval.event = None;
+                    self.approval.visible = false;
+                    self.approval.waiting_hint = false;
+                    self.approval.batch_allow = false;
+                    self.approval.list_open = false;
+                    self.mode = self.approval.prev_mode;
+                }
+                batch_cmds
             }
             AppEvent::ApprovalReplyFailed { outcome, error } => {
-                // fail closed：不授权；弹窗收缩为状态条 `等待审批` + 指引官方
-                // web（AC-003-17/18），运行状态不丢。
+                // fail closed：不授权；本条保留为失败项可单独重试（AC-006-14
+                // 部分失败语义），其余队列项自动续发继续处理。
                 self.approval.reply_inflight = false;
+                self.approval.queue.fail_active();
+                if self.approval.queue.has_active() {
+                    self.approval_sync_from_queue();
+                    let batch_cmds = self.approval_pump_if_batch();
+                    self.last_error = Some(format!(
+                        "审批回复失败（{}，不授权）: {error}；失败项可 [L] 列表重试",
+                        outcome.as_str()
+                    ));
+                    return batch_cmds;
+                }
+                // 无剩余项：收缩为状态条 `等待审批` + 指引官方 web
+                // （AC-003-17/18），失败项保留可 [L] 列表重试。
                 self.approval.event = None;
                 self.approval.visible = false;
                 self.approval.waiting_hint = true;
+                self.approval.batch_allow = false;
                 self.mode = self.approval.prev_mode;
                 self.last_error = Some(format!(
-                    "审批回复失败（{}，不授权）: {error}；请在官方 web 完成审批",
+                    "审批回复失败（{}，不授权）: {error}；请在官方 web 完成审批（失败项可 [L] 列表重试）",
                     outcome.as_str()
                 ));
                 vec![]
@@ -1147,6 +1232,8 @@ impl AppState {
                     if self.approval.event.is_none() {
                         self.approval.waiting_hint = projections_await_approval(&projections);
                     }
+                    // AC-006-17：approval/policy ask|never 只读展示。
+                    self.approval.policy_display = crate::api::approval::policy_hint(&projections);
                     if running {
                         self.running_sessions.insert(session_id.clone());
                     } else {
@@ -1902,6 +1989,10 @@ impl AppState {
                     self.mode = Mode::Normal;
                     vec![]
                 }
+                Mode::Approval if self.approval.list_open => {
+                    // Esc 在审批列表 = 回单条槽不中止（REQ-006 D-036）。
+                    self.approval_close_list()
+                }
                 Mode::Approval => {
                     // Esc 在审批弹窗 = cancelled 决策（不退出程序）。
                     self.approval_decide(ApprovalOutcome::Cancelled)
@@ -1920,7 +2011,14 @@ impl AppState {
                 Mode::Trajectory => vec![],
             },
             C::PickerDown => {
-                if self.mode == Mode::Search {
+                if self.approval.list_open && self.mode == Mode::Approval {
+                    // REQ-006 审批列表：j/k 移动光标。
+                    let total = self.approval.queue.len();
+                    if total > 0 {
+                        self.approval.list_cursor = (self.approval.list_cursor + 1).min(total - 1);
+                    }
+                    vec![]
+                } else if self.mode == Mode::Search {
                     if !self.search.results_locked {
                         // 编辑段：j 是输入字符。
                         return self.search_input("j");
@@ -1930,22 +2028,28 @@ impl AppState {
                         self.search.history_selection =
                             (self.search.history_selection + 1).min(total - 1);
                     }
+                    vec![]
                 } else {
                     self.picker.selection += 1;
+                    vec![]
                 }
-                vec![]
             }
             C::PickerUp => {
-                if self.mode == Mode::Search {
+                if self.approval.list_open && self.mode == Mode::Approval {
+                    // REQ-006 审批列表：j/k 移动光标。
+                    self.approval.list_cursor = self.approval.list_cursor.saturating_sub(1);
+                    vec![]
+                } else if self.mode == Mode::Search {
                     if !self.search.results_locked {
                         // 编辑段：k 是输入字符。
                         return self.search_input("k");
                     }
                     self.search.history_selection = self.search.history_selection.saturating_sub(1);
+                    vec![]
                 } else {
                     self.picker.selection = self.picker.selection.saturating_sub(1);
+                    vec![]
                 }
-                vec![]
             }
             C::PickerInput(text) => {
                 if self.mode == Mode::Insert {
@@ -2139,14 +2243,30 @@ impl AppState {
             C::ApprovalReject => self.approval_decide(ApprovalOutcome::Rejected),
             C::ApprovalCancel => self.approval_decide(ApprovalOutcome::Cancelled),
             C::ApprovalAlways => {
-                // `a` 非 outcome 词表：TUI 不代远端切换 approval/policy=never
-                // （REQ-I04 V0.4），只显示指引（D-18）。
-                self.approval.toast = Some(
-                    "始终允许需在官方 web 策略设置中切换（approval/policy=never，V0.4）"
-                        .to_string(),
-                );
-                vec![]
+                if self.approval.queue.head_requires_ack() {
+                    // danger-full-access 项：`a` = 风险确认（第二层确认，
+                    // AC-006-16；确认后仍仅 allowed-once，不提升策略 D-037）。
+                    if self.approval.queue.ack_active() {
+                        self.approval.acked = true;
+                        self.approval.toast =
+                            Some("风险已确认；仍仅授权本次（allowed-once）".to_string());
+                    }
+                    vec![]
+                } else {
+                    // `a` 非 outcome 词表：TUI 不代远端切换 approval/policy
+                    // =never（REQ-I04 V0.4），只显示指引（D-18）。
+                    self.approval.toast = Some(
+                        "始终允许需在官方 web 策略设置中切换（approval/policy=never，V0.4）"
+                            .to_string(),
+                    );
+                    vec![]
+                }
             }
+            // REQ-006 审批列表/批量/重试（D-036）。
+            C::OpenApprovalList => self.approval_open_list(),
+            C::ApprovalRetry => self.approval_retry_list_item(),
+            C::ApprovalBatchAllow => self.approval_batch_allow(),
+            C::CloseApprovalList => self.approval_close_list(),
             C::OpenSession(sid) => self.open_session(sid),
             C::OpenHelp => {
                 self.help_open = true;
@@ -2166,7 +2286,10 @@ impl AppState {
             }
             C::ToggleWorkspace => vec![],
             C::Quit => {
-                if self.mode == Mode::Approval {
+                if self.mode == Mode::Approval && self.approval.list_open {
+                    // APPROVAL 列表中 `q` = 回单条槽不中止（REQ-006 D-036）。
+                    self.approval_close_list()
+                } else if self.mode == Mode::Approval {
                     // APPROVAL 中 `q` = 中止当前审批（cancelled），不退出
                     // （REQ-003 §3 `q` 键位边界）。
                     self.approval_decide(ApprovalOutcome::Cancelled)
@@ -2799,16 +2922,129 @@ impl AppState {
         vec![]
     }
 
-    /// 审批决策（y/n/q 共用；同一弹窗只回复一次 — 幂等，AC-003-17）。
+    /// 审批决策（y/n/q 共用；同一弹窗只回复一次 — 幂等，AC-003-17/AC-006-15）。
+    /// danger 未确认时 AllowedOnce 被拦截（AC-006-16 第二层确认停点）。
     fn approval_decide(&mut self, outcome: ApprovalOutcome) -> Vec<Cmd> {
         if self.mode != Mode::Approval || self.approval.reply_inflight {
+            return vec![];
+        }
+        if outcome == ApprovalOutcome::AllowedOnce && self.approval.queue.head_requires_ack() {
+            self.approval.toast =
+                Some("危险操作需先确认风险（按 a）后再允许，仍仅授权本次".to_string());
+            return vec![];
+        }
+        let Some(event) = self.approval.queue.active_event() else {
+            return vec![];
+        };
+        self.approval.reply_inflight = true;
+        vec![Cmd::ReplyApproval { event, outcome }]
+    }
+
+    /// Promote 队列首项到单条展示槽（镜像 `ApprovalState.event`），进入
+    /// Approval 模态。prev_mode 仅在非 Approval→Approval 首提时快照一次
+    /// （批量自动推进不重快照）。
+    fn approval_promote_display(&mut self) {
+        let Some(event) = self.approval.queue.promote() else {
+            return;
+        };
+        if self.mode != Mode::Approval {
+            self.approval.prev_mode = self.mode;
+        }
+        self.approval.event = Some(event);
+        self.approval.acked = self.approval.queue.head_acked();
+        self.approval.visible = true;
+        self.approval.reply_inflight = false;
+        self.approval.waiting_hint = false;
+        self.approval.list_open = false;
+        self.mode = Mode::Approval;
+    }
+
+    /// 把 queue active 状态镜像回 `ApprovalState`（event/acked/list）。
+    fn approval_sync_from_queue(&mut self) {
+        self.approval.event = self.approval.queue.active_event();
+        self.approval.acked = self.approval.queue.head_acked();
+    }
+
+    /// 批量续发：batch_allow 且无 danger 停点且无在途 → 对当前 active 发起
+    /// allowed-once（逐条 unary 串行泵；AC-006-15）。danger 停点自动关闭
+    /// batch（等 ack，AC-006-16）。
+    fn approval_pump_if_batch(&mut self) -> Vec<Cmd> {
+        if !self.approval.batch_allow || self.approval.reply_inflight {
+            return vec![];
+        }
+        if self.approval.queue.head_requires_ack() {
+            self.approval.batch_allow = false;
+            self.approval.toast =
+                Some("危险操作需先确认风险（按 a）后继续批量；仅授权本次".to_string());
             return vec![];
         }
         let Some(event) = self.approval.event.clone() else {
             return vec![];
         };
         self.approval.reply_inflight = true;
-        vec![Cmd::ReplyApproval { event, outcome }]
+        vec![Cmd::ReplyApproval {
+            event,
+            outcome: ApprovalOutcome::AllowedOnce,
+        }]
+    }
+
+    /// `L`：打开审批列表视图（pending/failed 全量；光标行用于 r 重试）。
+    fn approval_open_list(&mut self) -> Vec<Cmd> {
+        if self.mode != Mode::Approval {
+            return vec![];
+        }
+        self.approval.list_open = true;
+        self.approval.list_cursor = 0;
+        vec![]
+    }
+
+    /// q/Esc（列表视图）：有单条槽 → 回单条槽不中止（不发出 cancelled）；
+    /// 无单条槽（队列只剩失败项）→ 退出 Approval 回先前模式。
+    fn approval_close_list(&mut self) -> Vec<Cmd> {
+        self.approval.list_open = false;
+        self.approval.list_cursor = 0;
+        if self.approval.event.is_none() && !self.approval.queue.has_active() {
+            // 无单条槽可回：退出（失败项保留在内存，供下次审批/L 重试）。
+            self.approval.visible = false;
+            self.approval.batch_allow = false;
+            self.mode = self.approval.prev_mode;
+        }
+        vec![]
+    }
+
+    /// `r`（列表视图）：重试光标行失败项（回单条槽；若槽空则 promote）。
+    fn approval_retry_list_item(&mut self) -> Vec<Cmd> {
+        let event_id = {
+            let items = self.approval.queue.list();
+            items
+                .get(self.approval.list_cursor)
+                .map(|item| item.event.event_id.clone())
+        };
+        let Some(event_id) = event_id else {
+            return vec![];
+        };
+        if !self.approval.queue.is_failed(&event_id) {
+            return vec![];
+        }
+        self.approval.queue.retry_failed(&event_id);
+        self.approval.list_open = false;
+        self.approval.list_cursor = 0;
+        self.approval_sync_from_queue();
+        if self.approval.event.is_none() {
+            self.approval_promote_display();
+        }
+        vec![]
+    }
+
+    /// `A`（列表视图）：批量 allowed-once（串行泵自动续发；danger 停点）。
+    fn approval_batch_allow(&mut self) -> Vec<Cmd> {
+        if self.mode != Mode::Approval {
+            return vec![];
+        }
+        self.approval.batch_allow = true;
+        self.approval.list_open = false;
+        // 先对当前 active 发一条（若存在）；后续由 ApprovalReplied 续发。
+        self.approval_pump_if_batch()
     }
 
     fn outline_confirm(&mut self) -> Vec<Cmd> {
@@ -4423,6 +4659,232 @@ mod tests {
         assert!(!projections_await_approval(
             &serde_json::json!({"running": true})
         ));
+    }
+
+    // ================= REQ-006 审批队列（D-036） =================
+
+    fn approval_ev_raw(_id: &str, danger: bool) -> serde_json::Value {
+        let request = if danger {
+            serde_json::json!({"toolName": "danger-full-access", "callId": "c9", "reason": "rm -rf /"})
+        } else {
+            serde_json::json!({"toolName": "bash", "reason": "ls"})
+        };
+        serde_json::json!({ "type": "approval/request", "request": request })
+    }
+
+    fn approval_ev(id: &str, danger: bool) -> ApprovalEvent {
+        ApprovalEvent {
+            client_id: format!("c-{id}"),
+            event_id: id.to_string(),
+            raw: approval_ev_raw(id, danger),
+        }
+    }
+
+    #[test]
+    fn approval_serial_queue_y_y_q_each_once_ac006_15() {
+        let mut s = AppState::default();
+        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle(snapshot("s1", false));
+        // 三条审批到达：首条 promote 显示，其余入队（不覆盖在途）。
+        s.handle(AppEvent::ApprovalRequest {
+            event: approval_ev("e1", false),
+        });
+        s.handle(AppEvent::ApprovalRequest {
+            event: approval_ev("e2", false),
+        });
+        s.handle(AppEvent::ApprovalRequest {
+            event: approval_ev("e3", false),
+        });
+        assert_eq!(s.mode, Mode::Approval);
+        assert_eq!(s.approval.queue.summary().pending, 2, "两条排队");
+        // y → e1 allowed-once。
+        let cmds = s.handle_command(C::ApprovalAllow);
+        assert!(
+            matches!(&cmds[0], Cmd::ReplyApproval { outcome: ApprovalOutcome::AllowedOnce, event } if event.event_id == "e1")
+        );
+        // e1 回复成功 → 自动续发显示 e2（≤1 在途）。
+        s.handle(AppEvent::ApprovalReplied {
+            outcome: ApprovalOutcome::AllowedOnce,
+        });
+        assert_eq!(
+            s.approval.event.as_ref().unwrap().event_id,
+            "e2",
+            "自动 promote 下一项"
+        );
+        assert_eq!(s.mode, Mode::Approval, "仍在审批模态");
+        // y → e2。
+        let cmds = s.handle_command(C::ApprovalAllow);
+        assert!(matches!(&cmds[0], Cmd::ReplyApproval { event, .. } if event.event_id == "e2"));
+        s.handle(AppEvent::ApprovalReplied {
+            outcome: ApprovalOutcome::AllowedOnce,
+        });
+        // q → e3 cancelled。
+        assert_eq!(
+            s.approval.event.as_ref().unwrap().event_id,
+            "e3",
+            "第三条自动展示"
+        );
+        let cmds = s.handle_command(C::Quit);
+        assert!(
+            matches!(&cmds[0], Cmd::ReplyApproval { outcome: ApprovalOutcome::Cancelled, event } if event.event_id == "e3")
+        );
+        s.handle(AppEvent::ApprovalReplied {
+            outcome: ApprovalOutcome::Cancelled,
+        });
+        // 队列清空 → 回先前模式。
+        assert_eq!(s.mode, Mode::Normal);
+        assert!(!s.approval.visible);
+        assert_eq!(s.approval.queue.summary().pending, 0);
+    }
+
+    #[test]
+    fn approval_partial_failure_keeps_item_retryable_others_continue_ac006_14() {
+        let mut s = AppState::default();
+        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle(snapshot("s1", false));
+        s.handle(AppEvent::ApprovalRequest {
+            event: approval_ev("e1", false),
+        });
+        s.handle(AppEvent::ApprovalRequest {
+            event: approval_ev("e2", false),
+        });
+        s.handle_command(C::ApprovalAllow); // e1 reply in-flight
+                                            // e1 回复失败：fail-closed，e1 保留失败项；e2 自动展示可继续。
+        s.handle(AppEvent::ApprovalReplyFailed {
+            outcome: ApprovalOutcome::AllowedOnce,
+            error: ClientError::Transport("eof".into()),
+        });
+        assert_eq!(
+            s.approval.event.as_ref().unwrap().event_id,
+            "e2",
+            "失败后其余可继续"
+        );
+        assert!(s.approval.queue.is_failed("e1"), "失败项保留");
+        assert!(!s.approval.waiting_hint, "仍有项处理，不收缩等待审批");
+        // e2 成功。
+        s.handle_command(C::ApprovalAllow);
+        s.handle(AppEvent::ApprovalReplied {
+            outcome: ApprovalOutcome::AllowedOnce,
+        });
+        assert_eq!(s.approval.queue.summary().failed, 1, "e1 仍失败");
+        assert!(!s.approval.queue.is_empty(), "失败项仍在队列");
+        // 打开列表 → r 重试 e1（回单条槽）。
+        s.handle_command(C::OpenApprovalList);
+        assert!(s.approval.list_open);
+        s.handle_command(C::PickerUp); // 光标到顶部（无意义边界测试）
+        s.handle_command(C::PickerDown);
+        s.handle_command(C::PickerDown); // 光标在 e1(failed) 上（active 空）
+        s.handle_command(C::ApprovalRetry);
+        assert!(!s.approval.list_open, "重试后回单条槽");
+        assert_eq!(s.approval.event.as_ref().unwrap().event_id, "e1");
+        assert!(!s.approval.queue.is_failed("e1"));
+    }
+
+    #[test]
+    fn approval_danger_ack_then_allow_still_allowed_once_ac006_16() {
+        let mut s = AppState::default();
+        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle(snapshot("s1", false));
+        s.handle(AppEvent::ApprovalRequest {
+            event: approval_ev("d1", true),
+        });
+        // 未 ack 时 y 被拦截（不发 ReplyApproval）。
+        assert!(s.handle_command(C::ApprovalAllow).is_empty());
+        assert!(!s.approval.reply_inflight);
+        // `a` = 风险确认。
+        assert!(s.handle_command(C::ApprovalAlways).is_empty());
+        assert!(s.approval.acked);
+        // ack 后 y → allowed-once（仍不提升策略）。
+        let cmds = s.handle_command(C::ApprovalAllow);
+        assert!(
+            matches!(&cmds[0], Cmd::ReplyApproval { outcome: ApprovalOutcome::AllowedOnce, event } if event.event_id == "d1")
+        );
+        s.handle(AppEvent::ApprovalReplied {
+            outcome: ApprovalOutcome::AllowedOnce,
+        });
+        assert_eq!(s.mode, Mode::Normal);
+        // 已授权事件重放 → 不入队不再授权。
+        s.handle(AppEvent::ApprovalRequest {
+            event: approval_ev("d1", true),
+        });
+        assert_eq!(s.mode, Mode::Normal, "重放已授权事件被拒");
+    }
+
+    #[test]
+    fn approval_policy_display_read_only_from_projection_ac006_17() {
+        let mut s = AppState::default();
+        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        // projections 带 approval/policy=ask → 只读展示（不弹窗、无切换）。
+        s.handle(AppEvent::FollowSnapshot {
+            session_id: SessionId("s1".into()),
+            cursor: Some(SessionLogOffset(0)),
+            records: vec![],
+            has_more: false,
+            projections: Some(serde_json::json!({
+                "running": false,
+                "approvalPolicy": "ask"
+            })),
+        });
+        assert_eq!(s.approval.policy_display, Some("ask"));
+        // 帧自身携带 policy（approval/request 到达路径）。
+        s.handle(AppEvent::ApprovalRequest {
+            event: ApprovalEvent {
+                client_id: "c".into(),
+                event_id: "e".into(),
+                raw: serde_json::json!({
+                    "type": "approval/request",
+                    "request": {"toolName": "bash", "reason": "x"},
+                    "approval/policy": "never"
+                }),
+            },
+        });
+        assert_eq!(s.approval.policy_display, Some("never"));
+        // 未知/缺失 → None；never 无切换入口（handle_command 无对应命令）。
+        s.handle(AppEvent::FollowSnapshot {
+            session_id: SessionId("s1".into()),
+            cursor: Some(SessionLogOffset(0)),
+            records: vec![],
+            has_more: false,
+            projections: Some(serde_json::json!({"running": false})),
+        });
+        assert_eq!(s.approval.policy_display, None);
+    }
+
+    #[test]
+    fn approval_batch_allow_serial_pump_stops_at_danger_ac006_15_16() {
+        let mut s = AppState::default();
+        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle(snapshot("s1", false));
+        s.handle(AppEvent::ApprovalRequest {
+            event: approval_ev("e1", false),
+        });
+        s.handle(AppEvent::ApprovalRequest {
+            event: approval_ev("d1", true),
+        });
+        s.handle(AppEvent::ApprovalRequest {
+            event: approval_ev("e2", false),
+        });
+        // A 批量：对 e1 发 allowed-once，danger 前串行续发。
+        let cmds = s.handle_command(C::ApprovalBatchAllow);
+        assert!(matches!(&cmds[0], Cmd::ReplyApproval { event, .. } if event.event_id == "e1"));
+        assert!(s.approval.batch_allow);
+        // e1 成功 → 自动续发 d1？不：danger 停点等 ack，batch 自动关闭。
+        s.handle(AppEvent::ApprovalReplied {
+            outcome: ApprovalOutcome::AllowedOnce,
+        });
+        assert_eq!(s.approval.event.as_ref().unwrap().event_id, "d1");
+        assert!(!s.approval.batch_allow, "danger 停点关闭批量");
+        assert!(s.approval.queue.head_requires_ack());
+        // ack + y → d1 allowed-once（不提升）。
+        s.handle_command(C::ApprovalAlways);
+        let cmds = s.handle_command(C::ApprovalAllow);
+        assert!(matches!(&cmds[0], Cmd::ReplyApproval { event, .. } if event.event_id == "d1"));
+        s.handle(AppEvent::ApprovalReplied {
+            outcome: ApprovalOutcome::AllowedOnce,
+        });
+        // batch 已停 → e2 不自动续发（等待用户决策）。
+        assert_eq!(s.approval.event.as_ref().unwrap().event_id, "e2");
+        assert_eq!(s.handle_command(C::ApprovalAllow).len(), 1);
     }
 
     #[test]
