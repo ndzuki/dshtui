@@ -177,6 +177,9 @@ pub struct SearchState {
     /// Enter 后进入结果巡览：n/N/y/j/k 为命令；未锁定时它们是输入字符
     /// （AC-003-05 与「输入实时过滤」的模态内两段式）。
     pub results_locked: bool,
+    /// REQ-007 AC-007-31：query 历史回忆游标（None=不在回忆；
+    /// Some(i)=正在回看第 i 条 recent）。仅空 query 编辑态可用 ↑ 触发。
+    pub recall_cursor: Option<usize>,
 }
 
 impl SearchState {
@@ -1366,6 +1369,12 @@ pub struct AppState {
     pub goal_input: bool,
     /// REQ-007 AC-007-13：jobs 只读镜像（session/control 帧维护）。
     pub jobs: crate::model::JobsPanelState,
+    /// REQ-007 AC-007-31：搜索 query 历史（上限 50 FIFO，最近在前）。
+    pub query_history: crate::model::SearchHistory,
+    /// REQ-007 AC-007-29：timeline 缩略条（`[ui].show_timeline` 控制）。
+    pub timeline: crate::model::TimelineState,
+    /// config `[ui].show_timeline`（默认 false）。
+    pub show_timeline: bool,
     /// REQ-007 AC-007-15/16：settings 面板。
     pub settings: crate::model::SettingsPanelState,
     /// REQ-007 AC-007-18：skills 目录。
@@ -1482,6 +1491,9 @@ impl Default for AppState {
             goals: crate::model::GoalPanelState::default(),
             goal_input: false,
             jobs: crate::model::JobsPanelState::default(),
+            query_history: crate::model::SearchHistory::new(50),
+            timeline: crate::model::TimelineState::default(),
+            show_timeline: false,
             settings: crate::model::SettingsPanelState::default(),
             skills: crate::model::SkillsCatalogState::default(),
             export: crate::model::ExportState::default(),
@@ -3397,6 +3409,21 @@ impl AppState {
             .map(|w| w.block_snapshot())
             .unwrap_or_default();
         self.search_index.rebuild(&blocks);
+        // REQ-007 AC-007-29：本地窗口事件 → timeline 标记（无远端读取）。
+        if self.show_timeline {
+            use crate::model::timeline::TimelineMarkerKind as K;
+            let kinds: Vec<K> = blocks
+                .iter()
+                .filter_map(|b| match b {
+                    crate::model::Block::UserMessage { .. } => Some(K::User),
+                    crate::model::Block::AssistantMessage { .. } => Some(K::Assistant),
+                    crate::model::Block::ToolCall { .. }
+                    | crate::model::Block::ToolResult { .. } => Some(K::Tool),
+                    _ => None,
+                })
+                .collect();
+            self.timeline.rebuild(&kinds);
+        }
         if self.search.open {
             self.recompute_window_matches();
         }
@@ -4098,6 +4125,19 @@ impl AppState {
         // REQ-007：export（AC-007-17）。
         if self.mode == Mode::Export {
             return self.handle_export_command(cmd);
+        }
+        // REQ-007 AC-007-31：SEARCH 编辑态空 query 时 ↑/↓ = 历史回忆（非空时
+        // 箭头保持既有 'k'/'j' 输入语义）。
+        if self.mode == Mode::Search && !self.search.results_locked {
+            use crate::input::Command as C2;
+            // ↑ 回忆：空 query（起始）或正处于回忆游标（连续回看）。
+            let recalling = self.search.recall_cursor.is_some();
+            if matches!(cmd, C2::PickerUp) && (self.search.query.trim().is_empty() || recalling) {
+                return self.search_recall_older();
+            }
+            if recalling && matches!(cmd, C2::PickerDown) {
+                return self.search_recall_newer();
+            }
         }
         match cmd {
             C::MoveDown
@@ -5058,11 +5098,55 @@ impl AppState {
     }
 
     fn close_search(&mut self) {
+        // REQ-007 AC-007-31：非空 query 记入搜索历史（模型去重 + FIFO 50）。
+        if !self.search.query.trim().is_empty() {
+            self.query_history.push(self.search.query.trim());
+        }
+        self.search.recall_cursor = None;
         self.mode = Mode::Normal;
         self.search.open = false;
         self.search.history_generation = self.search.history_generation.wrapping_add(1);
         self.search.history_loading = false;
         self.search.results_locked = false;
+    }
+
+    /// AC-007-31：↑ 回忆更早的最近查询（仅空 query 编辑态）。
+    fn search_recall_older(&mut self) -> Vec<Cmd> {
+        let rec: Vec<String> = self.query_history.recent().map(String::from).collect();
+        if rec.is_empty() {
+            return vec![];
+        }
+        // 起始或顶部：取最近一条；已在游标：往更早走。
+        let cur = self.search.recall_cursor;
+        let next = cur.map(|c| c + 1).unwrap_or(0);
+        if next >= rec.len() {
+            return vec![]; // 已到最旧（顶部停留）
+        }
+        self.search.recall_cursor = Some(next);
+        self.search.query = rec[next].clone();
+        self.recompute_window_matches();
+        self.search.history_error = None;
+        vec![]
+    }
+
+    /// AC-007-31：↓ 回到更新的查询（越过最新则清空回手动输入）。
+    fn search_recall_newer(&mut self) -> Vec<Cmd> {
+        let Some(cur) = self.search.recall_cursor else {
+            return vec![];
+        };
+        if cur == 0 {
+            self.search.recall_cursor = None;
+            self.search.query.clear();
+            self.search.window_matches.clear();
+            return vec![];
+        }
+        let rec: Vec<String> = self.query_history.recent().map(String::from).collect();
+        if let Some(q) = rec.get(cur - 1) {
+            self.search.recall_cursor = Some(cur - 1);
+            self.search.query = q.clone();
+            self.recompute_window_matches();
+        }
+        vec![]
     }
 
     // ---------- REQ-006 Sidebar 行光标与视图态（FR-006-02，D-034） ----------
@@ -9740,5 +9824,49 @@ mod tests {
         );
         assert_eq!(s.mode, Mode::Normal);
         assert!(!s.export.visible);
+    }
+
+    // ---------- REQ-007 V0.4 搜索历史（AC-007-31） ----------
+
+    #[test]
+    fn search_history_records_on_close_and_recalls_ac007_31() {
+        let mut s = AppState::default();
+        // 模拟两轮搜索提交（关闭即记录）。
+        s.open_search();
+        s.search.query = "/c deploy".into();
+        s.recompute_window_matches();
+        s.close_search();
+        s.open_search();
+        s.search.query = "agent".into();
+        s.recompute_window_matches();
+        s.close_search();
+        assert_eq!(s.query_history.len(), 2);
+        // 空 query 编辑态 ↑ 回看最近（agent）→ 更早（/c deploy）。
+        s.open_search();
+        let cmds = s.handle_command(crate::input::Command::PickerUp);
+        assert!(cmds.is_empty());
+        assert_eq!(s.search.query, "agent");
+        let _ = s.handle_command(crate::input::Command::PickerUp);
+        assert_eq!(s.search.query, "/c deploy");
+        // ↓ 回新 → 再 ↓ 越界清空。
+        let _ = s.handle_command(crate::input::Command::PickerDown);
+        assert_eq!(s.search.query, "agent");
+        let _ = s.handle_command(crate::input::Command::PickerDown);
+        assert_eq!(s.search.query, "", "越过最新清空");
+        assert!(s.search.recall_cursor.is_none());
+        // 非空 query 时 ↑ 不回忆（保持输入语义）。
+        s.search.query = "deploy".into();
+        let _ = s.handle_command(crate::input::Command::PickerUp);
+        assert_eq!(s.search.query, "deployk", "非空 ↑ 保持既有 'k' 输入语义");
+    }
+
+    #[test]
+    fn search_history_empty_no_recall_and_unchanged_semantics() {
+        let mut s = AppState::default();
+        s.open_search();
+        let cmds = s.handle_command(crate::input::Command::PickerUp);
+        assert!(cmds.is_empty());
+        assert_eq!(s.search.query, "", "无历史不回忆");
+        s.close_search();
     }
 }

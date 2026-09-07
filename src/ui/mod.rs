@@ -90,7 +90,17 @@ pub fn render(frame: &mut Frame<'_>, app: &AppState) {
             app.image_frame.as_ref(),
         );
     } else {
-        chat::render(frame, center_body, app);
+        // REQ-007 AC-007-29：timeline 缩略条（config 开启时 Chat 顶部一行）。
+        if app.show_timeline {
+            chat::render_timeline_strip(frame, center_body, app);
+            let body_area = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(1), Constraint::Min(1)])
+                .split(center_body);
+            chat::render(frame, body_area[1], app);
+        } else {
+            chat::render(frame, center_body, app);
+        }
     }
 
     if let Some(details) = areas.details {

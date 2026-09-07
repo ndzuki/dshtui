@@ -94,6 +94,53 @@ fn draw_lines(
     frame.render_widget(paragraph, area);
 }
 
+/// REQ-007 AC-007-29：timeline 缩略条（markers → 单字符图例）。`show_timeline`
+/// 开启时渲染在 Chat 顶部一行；markers 由 AppState 从本地窗口事件投影。
+/// 图例：`u`=user、`a`=assistant、`t`=tool；光标以 `>` 高亮。纯本地渲染，
+/// 无远端读取。
+pub fn render_timeline_strip(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
+    if !app.show_timeline || !app.timeline.show {
+        return;
+    }
+    use crate::model::timeline::TimelineMarkerKind as K;
+    let markers = &app.timeline.markers;
+    if markers.is_empty() {
+        return;
+    }
+    let mut spans: Vec<ratatui::text::Span<'static>> = Vec::new();
+    spans.push(ratatui::text::Span::styled(
+        " ⏱ ",
+        ratatui::style::Style::default().fg(Color::DarkGray),
+    ));
+    for (i, m) in markers.iter().enumerate() {
+        let ch = match m.kind {
+            K::User => "u",
+            K::Assistant => "a",
+            K::Tool => "t",
+        };
+        let style = if i == app.timeline.cursor {
+            ratatui::style::Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            ratatui::style::Style::default().fg(match m.kind {
+                K::User => Color::Cyan,
+                K::Assistant => Color::Green,
+                K::Tool => Color::Yellow,
+            })
+        };
+        spans.push(ratatui::text::Span::styled(ch.to_string(), style));
+    }
+    let line = ratatui::text::Line::from(spans);
+    let strip = Paragraph::new(line).block(
+        TuiBlock::default()
+            .borders(Borders::BOTTOM)
+            .border_style(Style::default().fg(Color::DarkGray)),
+    );
+    frame.render_widget(strip, area);
+}
+
 /// 窗口全部行：durable 块（markdown 块可多行）+ 乐观回显行。默认宽度 80
 /// （无上下文渲染）；`render`/`render_window` 用真实宽度走
 /// `window_lines_with_width`。
@@ -814,5 +861,33 @@ mod tests {
             .map(|c| c.fg)
             .expect("U 前缀存在");
         assert_eq!(red_fg, ratatui::style::Color::Rgb(255, 0, 0));
+    }
+
+    #[test]
+    fn timeline_strip_renders_markers_when_enabled_ac007_29() {
+        use crate::app::AppState;
+        let mut app = AppState::default();
+        app.show_timeline = true;
+        app.timeline.show = true;
+        use crate::model::timeline::TimelineMarkerKind as K;
+        app.timeline
+            .rebuild(&[K::User, K::Assistant, K::Tool, K::Assistant]);
+        let backend = TestBackend::new(60, 3);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_timeline_strip(frame, frame.area(), &app))
+            .unwrap();
+        let text = rendered_text(&terminal);
+        assert!(text.contains("⏱"), "时间图标, text={text}");
+        assert!(text.contains("ua"), "user+assistant 图例, text={text}");
+        assert!(text.contains("t"), "tool 图例, text={text}");
+        // 关闭时不渲染。
+        app.timeline.show = false;
+        let backend = TestBackend::new(60, 3);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_timeline_strip(frame, frame.area(), &app))
+            .unwrap();
+        assert!(!rendered_text(&terminal).contains("⏱"));
     }
 }

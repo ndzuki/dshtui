@@ -338,6 +338,11 @@ async fn run_connected(eff: Effective, token: String, client: DshClient) -> Resu
     app.set_cache_budget(eff.perf.cache_bytes);
     // REQ-005：详情列宽从 `[ui].details_width_cells` 注入（默认 45）。
     app.details_width_cells = eff.ui.details_width_cells;
+    // REQ-007 AC-007-29：timeline 开关（`[ui].show_timeline`，默认关）。
+    app.show_timeline = eff.ui.show_timeline;
+    if app.show_timeline {
+        app.timeline.show = true;
+    }
     // REQ-007：主题/palette 从 `[ui] theme/palette` 注入（AC-007-20）；非法
     // 覆盖只警告不崩溃。
     let palette_warnings = app.apply_palette_config(&eff.ui.theme, &eff.ui.palette);

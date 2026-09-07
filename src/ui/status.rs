@@ -220,6 +220,18 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         if let Some(model) = model_display {
             spans.push(Span::raw(format!(" {model}")));
         }
+        // REQ-007 AC-007-26：plan-mode chip（官方 plan 投影仅 active/pending，
+        // ADR-008 只读；缺字段 → 不显示）。
+        if let Some((active, pending)) = projections.plan() {
+            let text = if active {
+                " ◉plan"
+            } else if pending {
+                " plan…"
+            } else {
+                " plan-off"
+            };
+            spans.push(Span::styled(text, Style::default().fg(Color::Blue)));
+        }
         // REQ-007 AC-007-11：goal 状态 chip（官方 goal 投影，ADR-008；缺字段
         // → 不显示，TUI 不自算）。
         if let Some(goal) = projections.goal() {
@@ -699,5 +711,28 @@ mod tests {
             !rendered.contains("[s]停止"),
             "idle 不显示停止提示, text={rendered}"
         );
+    }
+    #[test]
+    fn plan_chip_shows_when_projection_active_ac007_26() {
+        let mut app = crate::app::AppState::default();
+        let sid = crate::api::types::SessionId("s-p".into());
+        app.active_session = Some(sid.clone());
+        let w = app.sessions.touch(&sid.0, 50);
+        let _ = w.apply(crate::model::Incoming::Snapshot {
+            cursor: None,
+            records: vec![],
+            has_more: false,
+            projections: Some(serde_json::json!({
+                "running": false,
+                "plan": {"active": true, "pending": false}
+            })),
+        });
+        let backend = ratatui::backend::TestBackend::new(120, 3);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render(frame, frame.area(), &app))
+            .unwrap();
+        let text = rendered_text(&terminal);
+        assert!(text.contains("◉plan"), "plan active chip, text={text}");
     }
 }
