@@ -366,10 +366,10 @@ pub enum WorkspaceOperation {
         workspace_id: crate::api::types::WorkspaceId,
     },
     /// `workspace/insert_session_before`（移动当前会话到目标 workspace 末尾；
-    /// None=移出分组）。
+    /// 目标 workspace 必填——wire 无「移出分组」端点）。
     MoveSession {
         session_id: SessionId,
-        target_workspace: Option<crate::api::types::WorkspaceId>,
+        target_workspace: crate::api::types::WorkspaceId,
     },
 }
 
@@ -1707,11 +1707,18 @@ impl AppState {
                         Some("部分审批失败（已保留）：列表 [r] 重试失败项 / [q] 退出".to_string());
                 } else {
                     // 队列全空 → 关闭弹窗恢复先前模式（AC-003 单条行为不变）。
+                    // 单条路径最常见的 toast 此刻弹窗已关不可见：转状态条
+                    // notice（Step 7 ① approval.toast 死数据修复），并清残留
+                    // 防下次打开带出陈旧文案。
+                    let closing_toast = self.approval.toast.take();
                     self.approval.event = None;
                     self.approval.visible = false;
                     self.approval.waiting_hint = false;
                     self.approval.batch_allow = false;
                     self.approval.list_open = false;
+                    if let Some(text) = closing_toast {
+                        self.notice = Some(text);
+                    }
                     self.mode = self.approval.prev_mode;
                 }
                 batch_cmds
@@ -1896,12 +1903,9 @@ impl AppState {
                 }
                 self.model_catalog.phase = CatalogPhase::Error;
                 let code = error.code();
-                let msg = format!("模型目录加载失败: {error}");
-                self.model_catalog.load_error = Some(if code.is_empty() {
-                    msg
-                } else {
-                    format!("{msg}（error.code={code}）")
-                });
+                // code() 各变体均非空（envelope.rs）；统一含 code 展示。
+                self.model_catalog.load_error =
+                    Some(format!("模型目录加载失败: {error}（error.code={code}）"));
                 // 权限错误不自动重试（只记录，不置 last_error 干扰重连提示）；
                 // 网络断开走既有重连（既有 open follow 流驱动）。
                 if error.class() == ErrorClass::PermissionDenied {
@@ -3113,6 +3117,19 @@ impl AppState {
                     vec![]
                 }
             }
+            // REQ-006：INSERT Tab 呼出命令面板（预填当前 `/` 斜杠命令词，
+            // FR-006-03 基础补全；Esc 回 composer 保留草稿）。
+            C::ComposerTabComplete => {
+                if self.mode != Mode::Insert || !self.composer.visible {
+                    return vec![];
+                }
+                let prefix = self.draft_slash_command_prefix();
+                if prefix.is_empty() {
+                    self.notice = Some("Tab 补全：先输入 / 开头的斜杠命令名".to_string());
+                    return vec![];
+                }
+                self.open_command_palette_with_query(prefix)
+            }
             // REQ-006：`gv` 循环侧栏视图（本地态，AC-006-03/11 无写）。
             C::CycleSidebarView => {
                 if self.mode == Mode::Normal {
@@ -3776,8 +3793,15 @@ impl AppState {
     /// `:` 打开命令面板：重置输入态；有活动会话则拉取远端斜杠命令表
     /// （fetch-once：已拉取重开复用不重拉）。
     fn open_command_palette(&mut self) -> Vec<Cmd> {
+        self.open_command_palette_with_query(String::new())
+    }
+
+    /// 打开命令面板并预填 query（composer Tab 补全 / `:` 均走此；前缀以
+    /// `/` 开头时命中远端斜杠命令候选）。
+    fn open_command_palette_with_query(&mut self, query: String) -> Vec<Cmd> {
         self.mode = Mode::CommandPalette;
         self.command_palette.reset_for_open();
+        self.command_palette.query = query;
         let mut cmds = Vec::new();
         if !self.command_palette.remote_fetched && self.active_session.is_some() {
             cmds.push(Cmd::FetchRemoteCommands);
@@ -3785,11 +3809,17 @@ impl AppState {
         cmds
     }
 
-    /// q/Esc 关闭命令面板。
+    /// q/Esc 关闭命令面板：从 composer Tab 进入时回 INSERT（草稿保留，
+    /// 下次 Enter 仍是发送 prompt）；否则回 NORMAL。
     fn close_command_palette(&mut self) {
         self.command_palette.visible = false;
         self.command_palette.executing = false;
-        self.mode = Mode::Normal;
+        self.command_palette.stage = None;
+        if self.composer.visible {
+            self.mode = Mode::Insert;
+        } else {
+            self.mode = Mode::Normal;
+        }
     }
 
     /// j/k 移动候选光标。
@@ -3850,7 +3880,12 @@ impl AppState {
                 | PaletteAction::DeleteWorkspace => self.palette_begin_operation(action),
                 action => {
                     self.command_palette.visible = false;
-                    self.mode = Mode::Normal;
+                    // 从 composer Tab 进入时 Local 动作后回 INSERT（草稿保留）。
+                    self.mode = if self.composer.visible {
+                        Mode::Insert
+                    } else {
+                        Mode::Normal
+                    };
                     match action {
                         PaletteAction::ModelCatalog => self.open_model_catalog(),
                         PaletteAction::CycleSidebarView => {
@@ -4038,7 +4073,7 @@ impl AppState {
                 }
                 Some(WorkspaceOperation::MoveSession {
                     session_id,
-                    target_workspace: Some(crate::api::types::WorkspaceId(text)),
+                    target_workspace: crate::api::types::WorkspaceId(text),
                 })
             }
         };
@@ -4470,6 +4505,27 @@ impl AppState {
             }
         }
         vec![]
+    }
+
+    /// 提取 composer 当前行光标处「/ 开头的斜杠命令词」（Tab 补全预填前缀；
+    /// 非 / 开头 → 空）。
+    fn draft_slash_command_prefix(&self) -> String {
+        let Some(draft) = self.draft.as_ref() else {
+            return String::new();
+        };
+        // 光标前到行首的文本（多行时取当前行，光标未在行首/行中则取
+        // 光标前最近一个空白边界；基础版：仅当行首是 / 且光标后无空格）。
+        let before_cursor: String = draft.text.chars().take(draft.cursor).collect();
+        let current_line = before_cursor.rsplit('\n').next().unwrap_or("");
+        let line = current_line.trim_start();
+        if !line.starts_with('/') {
+            return String::new();
+        }
+        // 光标前不含空白 → 是可补全词（含 / 本身）。
+        if current_line.contains(' ') {
+            return String::new();
+        }
+        current_line.trim().to_string()
     }
 
     fn composer_history_next(&mut self) -> Vec<Cmd> {

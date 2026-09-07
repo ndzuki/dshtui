@@ -28,10 +28,18 @@ pub async fn list(
     )
     .await?;
     match value {
-        serde_json::Value::Array(items) => Ok(items
-            .into_iter()
-            .filter_map(|v| serde_json::from_value::<CommandDescriptor>(v).ok())
-            .collect()),
+        // 命令表动态注册：个别描述符形状未知时容忍跳过（不崩），但记日志
+        // 保证可观测（不静默）。
+        serde_json::Value::Array(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for v in items {
+                match serde_json::from_value::<CommandDescriptor>(v) {
+                    Ok(desc) => out.push(desc),
+                    Err(e) => tracing::warn!(error = %e, "commands/list 一条描述符解析失败，跳过"),
+                }
+            }
+            Ok(out)
+        }
         other => Err(ClientError::Protocol(format!(
             "commands/list 响应形状异常（期望数组，得到 {}）",
             serde_json::to_string(&other).unwrap_or_default()

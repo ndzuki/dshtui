@@ -145,6 +145,8 @@ pub enum Command {
     // ---------- REQ-006 命令面板（FR-006-03） ----------
     /// NORMAL `:`：打开命令面板（本地命令 + 斜杠命令）。
     OpenCommandPalette,
+    /// INSERT 中 `Tab`：呼出命令面板并预填当前 `/` 斜杠命令词（补全）。
+    ComposerTabComplete,
 }
 
 /// Stateful decoder for multi-key Normal-mode commands such as `gg`.
@@ -410,6 +412,9 @@ impl KeyDecoder {
             // REQ-003 AC-003-10：INSERT 中 ↑/↓ 输入历史（全局最近 50 条）。
             KeyCode::Up => Some(Command::HistoryPrev),
             KeyCode::Down => Some(Command::HistoryNext),
+            // REQ-006 FR-006-03：INSERT 中 Tab 呼出命令面板（预填当前
+            // `/` 斜杠命令词，Notes/04 §3.2 命令/路径补全）。
+            KeyCode::Tab => Some(Command::ComposerTabComplete),
             _ => None,
         }
     }

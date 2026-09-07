@@ -1840,3 +1840,43 @@ fn colon_opens_command_palette_and_mode_keys_filter_execute_ac006_04() {
     assert_eq!(app.mode, Mode::Normal);
     assert!(!app.command_palette.visible);
 }
+
+#[test]
+fn insert_tab_opens_palette_with_slash_prefix_and_esc_returns_composer_ac006_04() {
+    use dshtui::api::types::SessionId;
+    // 打开 composer（有活动会话 + 草稿 `/pl`）。
+    let mut app = AppState::default();
+    app.handle_command(Command::OpenSession(SessionId("s1".into())));
+    app.handle_command(Command::InsertMode);
+    assert_eq!(app.mode, Mode::Insert);
+    assert!(app.composer.visible);
+    // 输入 `/pl` 作为斜杠命令词。
+    for c in ['/', 'p', 'l'] {
+        app.handle_command(Command::PickerInput(c.to_string()));
+    }
+    // Tab → 打开命令面板预填 `/pl`。
+    let mut d = KeyDecoder::new();
+    assert_eq!(
+        d.decode(InputMode::Insert, key(KeyCode::Tab)),
+        Some(Command::ComposerTabComplete)
+    );
+    app.handle_command(Command::ComposerTabComplete);
+    assert_eq!(app.mode, Mode::CommandPalette, "Tab 打开命令面板");
+    assert!(app.command_palette.visible);
+    assert_eq!(app.command_palette.query, "/pl", "预填斜杠前缀");
+    // Esc → 回 composer（草稿保留）。
+    app.handle_command(Command::ClosePicker);
+    assert_eq!(app.mode, Mode::Insert, "Esc 回 composer");
+    assert!(app.composer.visible);
+    let draft = app.draft.as_ref().unwrap();
+    assert_eq!(draft.text, "/pl", "草稿保留");
+    // 非 / 开头（如普通消息）Tab → 提示不打开面板。
+    app.handle_command(Command::PickerBackspace);
+    app.handle_command(Command::PickerBackspace);
+    app.handle_command(Command::PickerBackspace);
+    app.handle_command(Command::PickerInput("hello".into()));
+    let cmds = app.handle_command(Command::ComposerTabComplete);
+    assert!(cmds.is_empty());
+    assert!(app.notice.as_deref().unwrap().contains("Tab 补全"));
+    assert_eq!(app.mode, Mode::Insert, "无斜杠词不离开 composer");
+}

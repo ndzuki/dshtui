@@ -705,10 +705,15 @@ async fn execute_one(
                 return;
             };
             // 目标会话 = 当前活动会话（模型选择是会话级，next 对该会话生效）。
+            // reducer（model_catalog_submit）已 guard 无活动会话不发本命令；
+            // 此处兜底仍走 AppEvent 保持单写者（不直改 AppState）。
             let Some(session_id) = app.active_session.clone() else {
-                app.model_catalog.last_error_code = Some("no-active-session".into());
-                app.model_catalog.load_error =
-                    Some("无打开的会话：先用 f/o 打开会话再切换模型".into());
+                let event = AppEvent::ModelSelectFailed {
+                    error: ClientError::Protocol(
+                        "无打开的会话：先用 f/o 打开会话再切换模型".into(),
+                    ),
+                };
+                commands.extend(app.handle(event));
                 return;
             };
             let event = match dshtui::api::session::select_model(
@@ -873,19 +878,16 @@ async fn execute_one(
                 WorkspaceOperation::MoveSession {
                     session_id,
                     target_workspace,
-                } => {
-                    let wid = target_workspace.map(|w| w.0).unwrap_or_default();
-                    workspace::insert_session_before(
-                        &client.http,
-                        &client.base,
-                        &wid,
-                        &session_id.0,
-                        None,
-                    )
-                    .await
-                    .map(|_| OpOutcome::Ack)
-                    .map_err(|e| ("move session".to_string(), e))
-                }
+                } => workspace::insert_session_before(
+                    &client.http,
+                    &client.base,
+                    &target_workspace.0,
+                    &session_id.0,
+                    None,
+                )
+                .await
+                .map(|_| OpOutcome::Ack)
+                .map_err(|e| ("move session".to_string(), e)),
             };
             let event = match result {
                 Ok(outcome) => AppEvent::WorkspaceOpDone {
