@@ -1262,6 +1262,11 @@ impl AppState {
         if self.search.open {
             self.recompute_window_matches();
         }
+        // REQ-005：轨迹搜索索引随事件流窗口变化重建（流式过滤中新到事件立
+        // 即进命中，AC-005-05「过滤即时」；借用分离见 traj_index_rebuild）。
+        if self.traj.filter.open && self.mode == Mode::Trajectory {
+            self.traj_index_rebuild();
+        }
         let len = blocks.len();
         if self.cursor_block >= len {
             self.cursor_block = len.saturating_sub(1);
@@ -2354,12 +2359,41 @@ impl AppState {
 
     fn move_traj_cursor(&mut self, down: bool) {
         let len = self.traj_view_len();
+        let before = self.traj.cursor;
         if down {
             self.traj.cursor = (self.traj.cursor + 1).min(len.saturating_sub(1));
         } else {
             self.traj.cursor = self.traj.cursor.saturating_sub(1);
         }
-        // 详情开时选中行不随列表滚动变化（详情锚点锁定）。
+        // REQ-005 §5「选行变化即重建，source 锚点防串」：详情开着且选中行
+        // 变化（focus 切回 Center 后移动光标）→ 详情随新行重建刷新（source
+        // seq/kind 同步防串错）。
+        if self.traj.detail_open && self.traj.cursor != before {
+            self.rebuild_traj_detail();
+        }
+    }
+
+    /// 按当前选中行重建详情（若行可详查）。
+    fn rebuild_traj_detail(&mut self) {
+        let detail = {
+            let Some(window) = self.active_traj_window() else {
+                return;
+            };
+            let view = window.view(&self.traj.fold);
+            let Some(row) = view.get(self.traj.cursor) else {
+                return;
+            };
+            detail_for(row, window)
+        };
+        self.traj.detail = detail.filter(|_| self.traj.detail_open);
+        if self.traj.detail.is_none() {
+            // 新行不可详查：关闭详情子层回列表。
+            self.traj.detail_open = false;
+            self.traj.detail_scroll = 0;
+            self.focus = Focus::Center;
+        } else {
+            self.traj.detail_scroll = 0;
+        }
     }
 
     fn toggle_traj_fold(&mut self) {

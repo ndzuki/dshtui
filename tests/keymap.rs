@@ -1319,3 +1319,67 @@ fn trajectory_reconnect_snapshot_no_dup_and_gap_fill_ac005_08() {
     let seqs: Vec<u64> = w.raw_rows().map(|r| r.seq().0).collect();
     assert_eq!(seqs, (1..=7).collect::<Vec<_>>(), "缺口补齐、无重复无空洞");
 }
+
+#[test]
+fn trajectory_open_detail_refreshes_on_cursor_move_ac005_03() {
+    // Spec 审查 (c)1 修复：详情开着时（Ctrl+w 切回 Center）移动光标 →
+    // 详情随新选中行重建（REQ-005 §5「选行变化即重建，source 锚点防串」）。
+    // traj_app 记录：0 turn/start 1 step/start 2 assistant 3 tool/call
+    // 4 tool/result 5 step/end 6 turn/end。
+    let mut app = traj_app();
+    app.handle_command(Command::ToggleTrajectory);
+    app.traj.cursor = 3; // tool/call（c1 bash）
+    app.handle_command(Command::OpenDetail);
+    assert!(app.traj.detail_open);
+    assert_eq!(
+        app.traj.detail.as_ref().unwrap().source_kind,
+        dshtui::model::TrajKind::ToolCall
+    );
+    // 切回 Center 焦点（Ctrl+w 三向）再下移光标到 tool/result 行。
+    app.handle_command(Command::CycleFocus); // Details -> Sidebar
+    app.handle_command(Command::CycleFocus); // Sidebar -> Center
+    assert_eq!(app.focus, dshtui::app::Focus::Center);
+    app.handle_command(Command::MoveDown); // 到 tool/result (view idx 4)
+    assert_eq!(app.traj.cursor, 4);
+    // 详情应刷新为 tool/result（非旧 tool/call 详情滞留）。
+    let detail = app.traj.detail.as_ref().expect("详情仍开");
+    assert_eq!(
+        detail.source_kind,
+        dshtui::model::TrajKind::ToolResult,
+        "详情随新选中行重建"
+    );
+    assert_eq!(detail.source_seq, dshtui::api::types::SessionSeq(5));
+    // 移到不可详查行（step/end idx 5）→ 详情关闭回列表。
+    app.handle_command(Command::MoveDown);
+    assert!(!app.traj.detail_open, "不可详查行关闭详情");
+    assert_eq!(app.focus, dshtui::app::Focus::Center);
+}
+
+#[test]
+fn trajectory_search_index_updates_on_stream_append_ac005_05() {
+    // Spec 审查 (a)2 修复：轨迹搜索索引随事件流窗口变化重建——过滤中输入时
+    // 新到事件立即进命中（AC-005-05「过滤即时」）。
+    let mut app = traj_app();
+    app.handle_command(Command::ToggleTrajectory);
+    app.handle_command(Command::StartSearch);
+    app.handle_command(Command::PickerInput("done".to_string()));
+    assert_eq!(app.traj_search_index.query("done").len(), 1, "既有命中");
+    // 流式 append：新 tool/result（message 含 "done"）。
+    let sid = SessionId("sess-traj".into());
+    app.handle(AppEvent::FollowEvent {
+        session_id: sid.clone(),
+        event: dshtui::api::types::SessionWireEvent {
+            event_type: "tool/result".into(),
+            seq: Some(dshtui::api::types::SessionSeq(8)),
+            time: Some(8),
+            request_id: None,
+            ignorable: None,
+            source_event_seqs: None,
+            surface_op: None,
+            data: Some(serde_json::json!({"callId": "c2", "message": "done again"})),
+        },
+    });
+    // 新行立即进过滤命中（window_changed → traj_index_rebuild）。
+    let hits = app.traj_search_index.query("done");
+    assert_eq!(hits.len(), 2, "新到事件立即进命中: {hits:?}");
+}
