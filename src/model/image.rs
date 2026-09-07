@@ -157,11 +157,46 @@ pub struct ImageViewState {
     pub pager: Option<ImagePager>,
 }
 
-/// 计算图片组（同一消息内连续 Image 块的 run）：返回 (run_start, total,
-/// current_index)。
+/// Compute the image group (contiguous `Image` blocks in one message):
+/// returns `(run_start, total, current_index)`.
+///
+/// The run is located by **attachment_id** when given (same-seq siblings from
+/// one multi-image event are distinct blocks — REQ-004 AC-004-01 emits one
+/// `Image` per nested reference, all sharing the host event `seq`), falling
+/// back to `seq` for the legacy single-image path.
 pub fn image_run_of(blocks: &[Block], seq: SessionSeq) -> Option<(usize, usize, usize)> {
+    image_run_locate(blocks, None, Some(seq))
+}
+
+/// Locate the run containing the block with `attachment_id` (same-seq sibling
+/// disambiguation — the ImageView pager anchors by attachment, AC-007-30).
+pub fn image_run_by_attachment(
+    blocks: &[Block],
+    attachment_id: &str,
+) -> Option<(usize, usize, usize)> {
+    image_run_locate(blocks, Some(attachment_id), None)
+}
+
+fn image_run_locate(
+    blocks: &[Block],
+    attachment_id: Option<&str>,
+    seq: Option<SessionSeq>,
+) -> Option<(usize, usize, usize)> {
     let is_img = |b: &Block| matches!(b, Block::Image { .. });
-    let pos = blocks.iter().position(|b| b.seq() == seq && is_img(b))?;
+    let pos = blocks.iter().position(|b| {
+        if !is_img(b) {
+            return false;
+        }
+        if let Some(att) = attachment_id {
+            return crate::model::image::image_block_of(b)
+                .and_then(|r| r.attachment_id.map(|a| a.0))
+                .is_some_and(|a| a == att);
+        }
+        if let Some(s) = seq {
+            return b.seq() == s;
+        }
+        false
+    })?;
     let mut start = pos;
     while start > 0 && is_img(&blocks[start - 1]) {
         start -= 1;
@@ -288,6 +323,37 @@ mod tests {
             event_type: String::new(),
             raw: serde_json::Value::Null,
         };
+    }
+
+    #[test]
+    fn image_run_by_attachment_disambiguates_same_seq_siblings_ac007_30() {
+        use crate::api::types::SessionSeq as Seq;
+        // 官方多图消息 = 一个 host 事件 seq=7 携带两张图（REQ-004 AC-004-01：
+        // 逐 image 引用产出独立 Image 块、共享 host seq）。
+        let img = |att: &str| Block::Image {
+            seq: Seq(7),
+            attachment_id: Some(att.to_string()),
+            name: None,
+            dims: None,
+        };
+        let blocks = vec![
+            Block::UserMessage {
+                seq: Seq(7),
+                content: "图：".into(),
+                time: None,
+            },
+            img("a1"),
+            img("a2"),
+            img("a3"),
+        ];
+        // seq 定位只能落到组内第一块（同 seq 无法区分）。
+        assert_eq!(image_run_of(&blocks, Seq(7)), Some((1, 3, 0)));
+        // attachment 定位到各自正确下标（AC-007-30 pager 锚点）。
+        assert_eq!(image_run_by_attachment(&blocks, "a1"), Some((1, 3, 0)));
+        assert_eq!(image_run_by_attachment(&blocks, "a2"), Some((1, 3, 1)));
+        assert_eq!(image_run_by_attachment(&blocks, "a3"), Some((1, 3, 2)));
+        // 未知附件 → None。
+        assert_eq!(image_run_by_attachment(&blocks, "zz"), None);
     }
 
     #[test]

@@ -205,6 +205,31 @@ impl SubagentViewState {
         walk(&self.roots, 0, &mut out);
         out
     }
+
+    /// Update one node's activity (roots or any expanded level) after an
+    /// interruptByParent receipt (AC-007-09: running → stopped on success).
+    /// Returns true when the node was found and updated.
+    pub fn set_activity(&mut self, id: &str, activity: &str) -> bool {
+        fn find<'a>(nodes: &'a mut [SubagentNode], id: &str, out: &mut Vec<&'a mut SubagentNode>) {
+            for n in nodes {
+                if n.id == id {
+                    out.push(n);
+                    return;
+                }
+                if let Some(ch) = n.children.as_mut() {
+                    find(ch, id, out);
+                }
+            }
+        }
+        let mut found = Vec::new();
+        find(&mut self.roots, id, &mut found);
+        if let Some(node) = found.pop() {
+            node.activity = activity.to_string();
+            true
+        } else {
+            false
+        }
+    }
 }
 
 /// Borrow of one flattened row with its depth (rendering indent).

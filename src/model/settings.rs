@@ -11,11 +11,41 @@ pub struct SettingsRow {
     pub key: String,
     pub namespace: String,
     pub value_display: String,
+    /// Original scalar value — used to coerce the edited text back to the
+    /// key's real JSON type (bool/number/string) on commit (AC-007-16
+    /// round-trip; e.g. `ui-theme.fontSize` is a number, not a string).
+    pub original: Option<serde_json::Value>,
     /// Whether this row carries a user override (base vs user).
     pub user_set: bool,
     pub secret: bool,
     /// namespace revision (CAS token for the whole-namespace write).
     pub revision: u64,
+}
+
+/// Coerce raw edited text back to the original scalar JSON type. Falls back
+/// to String when the text cannot parse as the original type (never fails —
+/// the server still does strict validation and reports `error.code`).
+pub fn coerce_edit(original: &serde_json::Value, text: &str) -> serde_json::Value {
+    match original {
+        serde_json::Value::Bool(_) => match text.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" | "on" => serde_json::Value::Bool(true),
+            "false" | "0" | "no" | "off" => serde_json::Value::Bool(false),
+            _ => serde_json::Value::String(text.to_string()),
+        },
+        serde_json::Value::Number(_) => {
+            if let Ok(n) = text.trim().parse::<i64>() {
+                serde_json::Value::Number(n.into())
+            } else if let Ok(f) = text.trim().parse::<f64>() {
+                serde_json::Value::from(f)
+            } else {
+                serde_json::Value::String(text.to_string())
+            }
+        }
+        serde_json::Value::Null
+        | serde_json::Value::String(_)
+        | serde_json::Value::Array(_)
+        | serde_json::Value::Object(_) => serde_json::Value::String(text.to_string()),
+    }
 }
 
 /// Settings panel state.
@@ -101,6 +131,7 @@ pub fn flatten_namespace_rows(
             key: key.clone(),
             namespace: ns.to_string(),
             value_display: display,
+            original: Some(v.clone()),
             user_set: user_obj.map(|u| u.contains_key(k)).unwrap_or(false),
             secret: is_secret,
             revision,
@@ -169,5 +200,31 @@ mod tests {
         assert!(!s.loading);
         s.move_selection(9);
         assert_eq!(s.selected, 0, "clamp 到 len-1");
+    }
+
+    #[test]
+    fn coerce_edit_preserves_bool_number_string_types_ac007_16() {
+        use serde_json::Value;
+        // number key (ui-theme.fontSize)。
+        assert_eq!(
+            coerce_edit(&json!(14), "18"),
+            Value::Number(18.into()),
+            "数字键编辑后仍为 number"
+        );
+        assert_eq!(
+            coerce_edit(&json!(14.5), "15"),
+            Value::Number(15.into()),
+            "float 编辑按数字"
+        );
+        // bool key (ui-conversation.busyEnter)。
+        assert_eq!(coerce_edit(&json!(true), "false"), Value::Bool(false));
+        assert_eq!(coerce_edit(&json!(true), "yes"), Value::Bool(true));
+        // string key 原样。
+        assert_eq!(
+            coerce_edit(&json!("dark"), "light"),
+            Value::String("light".into())
+        );
+        // 无法按原类型解析 → 回落 String（server strict 校验负责报错）。
+        assert_eq!(coerce_edit(&json!(14), "abc"), Value::String("abc".into()));
     }
 }

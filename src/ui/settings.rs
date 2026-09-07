@@ -164,6 +164,7 @@ mod tests {
                 key: "locale.preference".into(),
                 namespace: "locale".into(),
                 value_display: "zh-CN".into(),
+                original: Some(serde_json::Value::String("zh-CN".into())),
                 user_set: true,
                 secret: false,
                 revision: 7,

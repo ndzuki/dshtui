@@ -1177,6 +1177,8 @@ async fn execute_one(
             }
         }
         // ---------- REQ-007：会话导出（AC-007-17） ----------
+        // Background 下载（不阻塞帧循环）：每 chunk 上报进度 + 检查取消令牌
+        // （Esc 置位 → 任务中止并清理临时文件 → ExportCancelled 回执）。
         Cmd::ExportSession { session_id, path } => {
             let Some(client) = client.as_ref() else {
                 let event = AppEvent::ExportFailed {
@@ -1185,20 +1187,36 @@ async fn execute_one(
                 commands.extend(app.handle(event));
                 return;
             };
-            match dshtui::api::export::download_export(
-                &client.http,
-                &client.base,
-                &session_id,
-                &path,
-            )
-            .await
-            {
-                Ok(receipt) => commands.extend(app.handle(AppEvent::ExportDone {
-                    bytes: receipt.bytes,
-                    path: receipt.final_path,
-                })),
-                Err(error) => commands.extend(app.handle(AppEvent::ExportFailed { error })),
-            }
+            app.export_cancel.store(false, Ordering::Relaxed);
+            let http = client.http.clone();
+            let base = client.base.clone();
+            let cancel = app.export_cancel.clone();
+            let tx = event_tx.clone();
+            tokio::spawn(async move {
+                let mut progress = |bytes: u64| {
+                    let _ = tx.try_send(AppEvent::ExportProgress { bytes });
+                };
+                let is_cancelled = || cancel.load(Ordering::Relaxed);
+                let result = dshtui::api::export::download_export_progress(
+                    &http,
+                    &base,
+                    &session_id,
+                    &path,
+                    &mut progress,
+                    is_cancelled,
+                )
+                .await;
+                let cancelled = cancel.load(Ordering::Relaxed);
+                let event = match result {
+                    Ok(receipt) => AppEvent::ExportDone {
+                        bytes: receipt.bytes,
+                        path: receipt.final_path,
+                    },
+                    Err(_) if cancelled => AppEvent::ExportCancelled,
+                    Err(error) => AppEvent::ExportFailed { error },
+                };
+                let _ = tx.send(event).await;
+            });
         }
         // ---------- REQ-007：settings / skills（AC-007-15~19） ----------
         Cmd::FetchSettingsDescribe => {
@@ -1309,12 +1327,33 @@ async fn execute_one(
                             .map_err(|e| ("create".into(), e))
                     }
                     GoalMutation::Edit { objective } => {
-                        // goals/edit(agentId, ref, request{objective})（typert 实读）。
-                        let _ = objective;
-                        Err((
-                            "edit".into(),
-                            ClientError::Protocol("goals/edit 暂未接线".into()),
-                        ))
+                        // goals/edit(agentId, ref, request)（typert 实读 0.1.2-rc.1：
+                        // 三平铺参数 agentId/ref/request{objective?,maxGoalRounds?}，CAS revision）。
+                        let ref_ = dshtui::api::types::GoalRef {
+                            id: app
+                                .goals
+                                .goal
+                                .as_ref()
+                                .map(|g| g.id.clone())
+                                .unwrap_or_default(),
+                            revision: app.goals.sent_revision.unwrap_or(0),
+                        };
+                        let max_goal_rounds =
+                            app.goals.goal.as_ref().and_then(|g| g.max_goal_rounds);
+                        let req = dshtui::api::types::CreateGoalRequest {
+                            objective,
+                            max_goal_rounds,
+                        };
+                        dshtui::api::goals::edit(
+                            &client.http,
+                            &client.base,
+                            &agent_id.0,
+                            &ref_,
+                            &req,
+                        )
+                        .await
+                        .map(Some)
+                        .map_err(|e| ("edit".into(), e))
                     }
                     GoalMutation::Pause => {
                         let ref_ = dshtui::api::types::GoalRef {

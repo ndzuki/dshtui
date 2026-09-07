@@ -30,13 +30,35 @@ pub struct ExportReceipt {
 /// `GET {base}/api/session.export` — stream the official ZIP to `path`.
 /// `include_descendants` defaults true (subagent logs + media). Writes to
 /// `path.tmp-<pid>` first then atomically renames (same filesystem; never
-/// leaves a half-written file at the destination).
+/// leaves a half-written file at the destination). Convenience wrapper
+/// (no progress / never cancels) — see `download_export_progress`.
 pub async fn download_export(
     http: &reqwest::Client,
     base: &str,
     session_id: &str,
     path: &Path,
 ) -> Result<ExportReceipt, ClientError> {
+    download_export_progress(http, base, session_id, path, &mut |_| {}, || false).await
+}
+
+/// Streaming variant with per-chunk progress + cooperative cancellation.
+/// `on_progress` is invoked with the total bytes streamed so far; when
+/// `is_cancelled()` turns true the download aborts, the tmp file is removed
+/// and `ClientError::Transport("导出已取消")` is returned (AC-007-17: 中途
+/// 取消/断网不产生半成品且可重试幂等). Generic callback bounds keep the
+/// returned future `Send` (spawned from the main loop).
+pub async fn download_export_progress<F, C>(
+    http: &reqwest::Client,
+    base: &str,
+    session_id: &str,
+    path: &Path,
+    on_progress: &mut F,
+    is_cancelled: C,
+) -> Result<ExportReceipt, ClientError>
+where
+    F: FnMut(u64) + Send,
+    C: Fn() -> bool + Send,
+{
     let url = format!(
         "{}/api/session.export?sessionId={}&includeDescendants=true",
         base.trim_end_matches('/'),
@@ -80,25 +102,41 @@ pub async fn download_export(
         ))
     })?;
     let mut bytes: u64 = 0;
-    loop {
-        let chunk = resp
-            .chunk()
-            .await
-            .map_err(|e| ClientError::Transport(format!("导出流读取失败: {e}")))?;
-        match chunk {
-            Some(c) => {
-                out.write_all(&c)
-                    .await
-                    .map_err(|e| ClientError::Transport(format!("导出写入失败: {e}")))?;
-                bytes += c.len() as u64;
+    let mut cancelled = false;
+    let stream_result: Result<(), ClientError> = async {
+        loop {
+            if is_cancelled() {
+                cancelled = true;
+                return Err(ClientError::Transport("导出已取消".into()));
             }
-            None => break,
+            let chunk = resp
+                .chunk()
+                .await
+                .map_err(|e| ClientError::Transport(format!("导出流读取失败: {e}")))?;
+            match chunk {
+                Some(c) => {
+                    out.write_all(&c)
+                        .await
+                        .map_err(|e| ClientError::Transport(format!("导出写入失败: {e}")))?;
+                    bytes += c.len() as u64;
+                    on_progress(bytes);
+                }
+                None => break,
+            }
         }
+        out.flush()
+            .await
+            .map_err(|e| ClientError::Transport(format!("导出 flush 失败: {e}")))?;
+        Ok(())
     }
-    out.flush()
-        .await
-        .map_err(|e| ClientError::Transport(format!("导出 flush 失败: {e}")))?;
+    .await;
     drop(out);
+    let _ = cancelled;
+    if let Err(e) = stream_result {
+        // 中断/取消/断网：删除临时文件，目标路径不留半成品（AC-007-17）。
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        return Err(e);
+    }
     tokio::fs::rename(&tmp_path, path)
         .await
         .map_err(|e| ClientError::Transport(format!("导出落盘 rename 失败: {e}")))?;

@@ -65,7 +65,7 @@ pub use session::{
     ApplyEffect, Block, Incoming, PackedChunks, PendingEcho, PendingEchoStatus, SessionStore,
     TranscriptWindow, TurnOutlineItem,
 };
-pub use settings::{flatten_namespace_rows, SettingsPanelState, SettingsRow};
+pub use settings::{coerce_edit, flatten_namespace_rows, SettingsPanelState, SettingsRow};
 pub use skills::SkillsCatalogState;
 pub use subagent::{
     lineage_breadcrumbs, LineageCrumb, SubagentNode, SubagentNodeRef, SubagentViewState,

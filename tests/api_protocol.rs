@@ -1439,6 +1439,64 @@ async fn goals_create_pause_clear_agent_id_and_cas_args() {
 }
 
 #[tokio::test]
+async fn goals_edit_three_flat_args_with_cas_and_objective() {
+    use dshtui::api::types::{CreateGoalRequest, GoalRef};
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let seen: std::sync::Arc<std::sync::Mutex<Vec<(String, Value)>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen2 = seen.clone();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let request = read_request(&mut socket).await;
+        let body: Value = serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        seen2.lock().unwrap().push((
+            body["method"].as_str().unwrap().to_string(),
+            body["payload"]["args"].clone(),
+        ));
+        let rpc_id = body["rpcId"].as_str().unwrap().to_string();
+        write_json_response(
+            &mut socket,
+            json!({
+                "type": "server-response", "rpcId": rpc_id,
+                "result": {"ok": true, "value": {"goal": {
+                    "id": "g1", "revision": 4, "objective": "新目标",
+                    "phase": "active"
+                }}}
+            }),
+        )
+        .await;
+    });
+    let http = reqwest::Client::new();
+    let base = format!("http://{addr}");
+    let edited = dshtui::api::goals::edit(
+        &http,
+        &base,
+        "agent-1",
+        &GoalRef {
+            id: "g1".into(),
+            revision: 3,
+        },
+        &CreateGoalRequest {
+            objective: "新目标".into(),
+            max_goal_rounds: Some(5),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(edited.objective, "新目标");
+    assert_eq!(edited.revision, 4);
+    server.await.unwrap();
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen[0].0, "goals/edit");
+    assert_eq!(seen[0].1["agentId"], "agent-1");
+    assert_eq!(seen[0].1["ref"]["id"], "g1");
+    assert_eq!(seen[0].1["ref"]["revision"], 3, "CAS revision 随请求上送");
+    assert_eq!(seen[0].1["request"]["objective"], "新目标");
+    assert_eq!(seen[0].1["request"]["maxGoalRounds"], 5);
+}
+
+#[tokio::test]
 async fn settings_describe_and_update_with_expected_revision_cas() {
     use dshtui::api::types::{SettingsNamespaceView, SettingsPathOpView};
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1731,8 +1789,140 @@ async fn export_downloads_official_route_and_streams_to_file() {
     server.await.unwrap();
 }
 
+#[tokio::test]
+async fn export_stream_error_cleans_up_tmp_and_leaves_no_half_product() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut raw = Vec::new();
+        let mut buf = [0_u8; 2048];
+        loop {
+            let n = socket.read(&mut buf).await.unwrap();
+            raw.extend_from_slice(&buf[..n]);
+            if raw.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+        // 头声明大 Content-Length 但只写一半就断连 → reqwest chunk() 报 stream error。
+        socket
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/zip\r\nContent-Length: 100000\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        socket.write_all(b"PK\x03\x04partial").await.unwrap();
+        socket.flush().await.unwrap();
+        // 直接 drop 断连。
+    });
+    let http = reqwest::Client::new();
+    let tmp = std::env::temp_dir().join(format!("dshtui-export-fail-{}", std::process::id()));
+    let target = tmp.join("session-export.zip");
+    let _ = std::fs::create_dir_all(&tmp);
+    let result =
+        dshtui::api::export::download_export(&http, &format!("http://{addr}"), "sess-1", &target)
+            .await;
+    assert!(result.is_err(), "断流必须报错");
+    assert!(!target.exists(), "目标路径不留半成品");
+    let tmp_name = format!("session-export.zip.tmp-{}", std::process::id());
+    assert!(!tmp.join(tmp_name).exists(), "临时文件已清理: tmp leak");
+    let _ = std::fs::remove_dir_all(&tmp);
+    server.await.unwrap();
+}
+
 fn body_len() -> u64 {
     b"PK\x03\x04export-bytes".len() as u64
+}
+
+#[tokio::test]
+async fn export_progress_reports_bytes_and_cancel_aborts_clean() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        // 接受两条连接：①成功流 ②取消路径（客户端会提前断开）。
+        for _ in 0..2 {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            let mut raw = Vec::new();
+            let mut buf = [0_u8; 4096];
+            while let Ok(n) = socket.read(&mut buf).await {
+                if n == 0 {
+                    break;
+                }
+                raw.extend_from_slice(&buf[..n]);
+                if raw.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            // 分多段发（50×100=5000 字节），让 progress 回调被触发。
+            if socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/zip\r\nContent-Length: 5000\r\n\r\n",
+                )
+                .await
+                .is_err()
+            {
+                continue;
+            }
+            for _ in 0..50 {
+                if socket.write_all(&[0u8; 100]).await.is_err() {
+                    break; // 客户端已断开（取消路径）。
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            let _ = socket.flush().await;
+        }
+    });
+    let http = reqwest::Client::new();
+    let tmp = std::env::temp_dir().join(format!("dshtui-export-cancel-{}", std::process::id()));
+    let target = tmp.join("session-export.zip");
+    let _ = std::fs::create_dir_all(&tmp);
+    let cancel = AtomicBool::new(false);
+    let mut reported: Vec<u64> = Vec::new();
+    let result = dshtui::api::export::download_export_progress(
+        &http,
+        &format!("http://{addr}"),
+        "sess-1",
+        &target,
+        &mut |b| reported.push(b),
+        || cancel.load(Ordering::Relaxed),
+    )
+    .await;
+    assert!(result.is_ok(), "不取消时应成功: {result:?}");
+    assert!(!reported.is_empty(), "进度回调已触发");
+    assert!(reported.windows(2).all(|w| w[1] >= w[0]), "bytes 单调递增");
+    assert!(target.exists(), "文件落盘");
+    // 取消路径：置位令牌 → 中止 + 清理 tmp + 可识别错误。
+    // （用新 client 避免连接池复用已被服务端关闭的首条连接。）
+    let http2 = reqwest::Client::new();
+    let tmp2 = std::env::temp_dir().join(format!("dshtui-export-cancel2-{}", std::process::id()));
+    let target2 = tmp2.join("session-export.zip");
+    let _ = std::fs::create_dir_all(&tmp2);
+    let cancel2 = AtomicBool::new(true);
+    let result2 = dshtui::api::export::download_export_progress(
+        &http2,
+        &format!("http://{addr}"),
+        "sess-1",
+        &target2,
+        &mut |_| {},
+        || cancel2.load(Ordering::Relaxed),
+    )
+    .await;
+    assert!(result2.is_err(), "取消必须中止");
+    assert!(!target2.exists(), "取消不留半成品");
+    let err = result2.err().unwrap();
+    let msg = format!("{err}");
+    assert!(msg.contains("导出已取消"), "取消错误串稳定: {msg}");
+    let tmp_name = format!("session-export.zip.tmp-{}", std::process::id());
+    assert!(
+        !tmp2.join(&tmp_name).exists() && !tmp.join(&tmp_name).exists(),
+        "临时文件均清理"
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
+    let _ = std::fs::remove_dir_all(&tmp2);
+    server.await.unwrap();
 }
 
 #[test]

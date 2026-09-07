@@ -36,6 +36,30 @@ pub async fn create(
     parse_ref("goals/create", value)
 }
 
+/// `goals/edit` — update the singleton goal's objective/rounds (CAS via
+/// `ref.revision`). Wire shape (typert.remote-client 0.1.2-rc.1):
+/// `edit(agentId, ref, request)` — agentId + ref + request are three flat
+/// JSON params (`EditGoalRequest{objective?, maxGoalRounds?}`), unlike the
+/// single-`request`-nested create.
+pub async fn edit(
+    http: &reqwest::Client,
+    base: &str,
+    agent_id: &str,
+    ref_: &GoalRef,
+    request: &CreateGoalRequest,
+) -> Result<GoalSnapshot, ClientError> {
+    let req = serde_json::to_value(request)
+        .map_err(|e| ClientError::Protocol(format!("goals/edit 参数序列化失败: {e}")))?;
+    let value = unary(
+        http,
+        base,
+        "goals/edit",
+        serde_json::json!({ "agentId": agent_id, "ref": ref_, "request": req }),
+    )
+    .await?;
+    parse_snapshot("goals/edit", value)
+}
+
 /// `goals/pause` — pause the singleton goal.
 pub async fn pause(
     http: &reqwest::Client,
