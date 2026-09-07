@@ -1011,3 +1011,246 @@ fn trajectory_row_id_stable_across_prepend_and_toggle() {
     let _ = w.toggle_group(&mut fold, turn_id);
     assert!(fold.is_collapsed(GroupId::Turn(1)));
 }
+
+// ============================================================================
+// REQ-005 Step 2 详情数据（Seam = detail_for(row, window) 纯函数，无 IO，
+// 计划 Step 2 测试 Seam 行）。验收：AC-005-03/10/11/15。
+// ============================================================================
+
+/// 带显式毫秒 time 的轨迹记录（详情 timing 推导测试用）。
+fn traj_record_at(
+    seq: u64,
+    event_type: &str,
+    data: serde_json::Value,
+    time: i64,
+) -> SessionHistoryRecord {
+    let mut e = traj_event(seq, event_type, data);
+    e.time = Some(time);
+    SessionHistoryRecord::Event { event: e }
+}
+
+/// 标准小窗口：turn 1 step 1 完整工具链（step/start→assistant→tool/call→
+/// tool/result），供详情推导。时间显式拉开（step 2s、assistant 3s、call
+/// 4s、result 7s）以断言 time_seconds 推导。
+fn detail_window_with(
+    error: Option<serde_json::Value>,
+    meta: Option<serde_json::Value>,
+) -> TrajectoryWindow {
+    const T: i64 = 1_700_000_000_000;
+    let mut w = TrajectoryWindow::new(200);
+    let mut records = vec![
+        traj_record_at(1, "turn/start", serde_json::json!({"turn": 1}), T + 1000),
+        traj_record_at(
+            2,
+            "step/start",
+            serde_json::json!({"turn": 1, "step": 1, "reason": "max"}),
+            T + 2000,
+        ),
+        traj_record_at(
+            3,
+            "assistant/message",
+            serde_json::json!({"turn": 1, "step": 1, "content": "先看看", "usage": {"input": 100, "output": 50, "cacheRead": 10, "cacheWrite": 5, "think": 20}}),
+            T + 3000,
+        ),
+        traj_record_at(
+            4,
+            "tool/call",
+            serde_json::json!({"turn": 1, "step": 1, "callId": "c1", "name": "bash", "arguments": "{\"command\":\"grep -r x /tmp\"}"}),
+            T + 4000,
+        ),
+    ];
+    let mut result = serde_json::json!({
+        "turn": 1, "step": 1, "callId": "c1",
+        "message": "3 处命中"
+    });
+    if let Some(e) = error {
+        result["error"] = e;
+    }
+    if let Some(m) = meta {
+        result["meta"] = m;
+    }
+    records.push(traj_record_at(5, "tool/result", result, T + 7000));
+    w.apply(TrajIncoming::Snapshot {
+        cursor: None,
+        records,
+        has_more: true,
+        projections: None,
+    });
+    w
+}
+
+#[test]
+fn detail_for_tool_call_aggregates_args_result_usage_timing_ac005_03() {
+    use dshtui::model::trajectory::detail_for;
+    // AC-005-03：tool/call 详情含 args（原始 JSON 格式化）/result/usage
+    // （同 step assistant 推导）/timing（事件 time 推导）。
+    let w = detail_window_with(None, None);
+    let call = w
+        .raw_rows()
+        .find(|r| r.kind() == TrajKind::ToolCall)
+        .cloned()
+        .unwrap();
+    let detail = detail_for(&call, &w).expect("tool/call 行可开详情");
+    assert_eq!(detail.source_kind, TrajKind::ToolCall);
+    assert_eq!(detail.source_seq, SessionSeq(4));
+    // arguments 原始 JSON 字符串 → 格式化 JSON（含换行缩进）。
+    let args = detail.args_text.expect("args 存在");
+    assert!(args.contains("\"command\""), "args 格式化: {args}");
+    // result 聚合：同 callId 的 tool/result message。
+    assert_eq!(detail.result_text.as_deref(), Some("3 处命中"));
+    // usage = 同 step assistant/message.usage（无 per-tool，推导标注）。
+    let usage = detail.usage.as_ref().expect("usage 同 step 推导");
+    assert_eq!(usage.input, Some(100));
+    assert_eq!(usage.output, Some(50));
+    assert_eq!(usage.cache_read, Some(10));
+    assert_eq!(usage.cache_write, Some(5));
+    assert_eq!(usage.think, Some(20));
+    // timing：started_at=call.time、completed=result.time、step_start=
+    // step/start.time、first_token=assistant.time（T=1_700_000_000_000）。
+    const T: i64 = 1_700_000_000_000;
+    let timing = detail.timing.as_ref().expect("timing 事件 time 推导");
+    assert_eq!(timing.started_at, Some(T + 4000));
+    assert_eq!(timing.completed, Some(T + 7000));
+    assert_eq!(timing.step_start, Some(T + 2000));
+    assert_eq!(timing.first_token, Some(T + 3000));
+    assert_eq!(
+        timing.time_seconds,
+        Some(3.0),
+        "completed - started = 3000ms"
+    );
+}
+
+#[test]
+fn detail_for_tool_result_keeps_error_alongside_and_diff_ac005_10() {
+    use dshtui::model::trajectory::detail_for;
+    // AC-005-10：tool/result 无 meta（无 diff）→ diff=None（UI 降级「无 diff」
+    // 不崩溃）；error 与 result 并列展示。
+    let w = detail_window_with(
+        Some(serde_json::json!({"name": "ExitCode", "code": "exit-1"})),
+        None,
+    );
+    let result = w
+        .raw_rows()
+        .find(|r| r.kind() == TrajKind::ToolResult)
+        .cloned()
+        .unwrap();
+    let detail = detail_for(&result, &w).expect("tool/result 行可开详情");
+    assert!(detail.result_text.as_deref().is_some());
+    let err = detail.error.as_ref().expect("error 并列展示");
+    assert_eq!(err.name, "ExitCode");
+    assert_eq!(err.code, "exit-1");
+    assert!(detail.diff.is_none(), "无 meta → 无 diff（降级不崩溃）");
+    // 有 meta 但无 diff 键 → 同样 None。
+    let w2 = detail_window_with(None, Some(serde_json::json!({"other": 1})));
+    let result2 = w2
+        .raw_rows()
+        .find(|r| r.kind() == TrajKind::ToolResult)
+        .cloned()
+        .unwrap();
+    assert!(
+        detail_for(&result2, &w2).unwrap().diff.is_none(),
+        "meta 无 diff 键 → 无 diff"
+    );
+    // 有 meta.diff → Some（工具私有载荷，dsh-tool-fs 口径）。
+    let w3 = detail_window_with(None, Some(serde_json::json!({"diff": "--- a/1\n+++ b/1"})));
+    let result3 = w3
+        .raw_rows()
+        .find(|r| r.kind() == TrajKind::ToolResult)
+        .cloned()
+        .unwrap();
+    let d3 = detail_for(&result3, &w3).unwrap();
+    assert_eq!(
+        d3.diff.as_deref(),
+        Some("--- a/1\n+++ b/1"),
+        "meta.diff 原样文本"
+    );
+}
+
+#[test]
+fn detail_usage_timing_missing_shows_none_ac005_15() {
+    use dshtui::model::trajectory::detail_for;
+    // AC-005-15：usage/timing 缺省 → None（UI 显示 —，不崩溃不编造）。
+    let mut w = TrajectoryWindow::new(200);
+    w.apply(TrajIncoming::Snapshot {
+        cursor: None,
+        records: vec![
+            traj_record(1, "turn/start", serde_json::json!({"turn": 1})),
+            // assistant 无 usage、无 time 字段。
+            {
+                let mut e = traj_event(
+                    2,
+                    "assistant/message",
+                    serde_json::json!({"turn": 1, "step": 1, "content": "hi"}),
+                );
+                e.time = None;
+                SessionHistoryRecord::Event { event: e }
+            },
+        ],
+        has_more: true,
+        projections: None,
+    });
+    let asst = w
+        .raw_rows()
+        .find(|r| r.kind() == TrajKind::AssistantMessage)
+        .cloned()
+        .unwrap();
+    let detail = detail_for(&asst, &w).expect("assistant 行可开详情");
+    assert!(detail.usage.is_none(), "无 usage → 缺省 —");
+    assert!(detail.timing.is_none(), "无 time 推导 → 缺省 —");
+}
+
+#[test]
+fn detail_for_non_detail_rows_returns_none() {
+    use dshtui::model::trajectory::detail_for;
+    let w = detail_window_with(None, None);
+    for kind in [
+        TrajKind::TurnStart,
+        TrajKind::StepStart,
+        TrajKind::UserMessage,
+        TrajKind::Compaction,
+        TrajKind::Unknown,
+    ] {
+        let row = w.raw_rows().find(|r| r.kind() == kind).cloned();
+        if let Some(row) = row {
+            assert!(detail_for(&row, &w).is_none(), "{kind:?} 行不提供详情");
+        }
+    }
+}
+
+#[test]
+fn detail_yank_text_is_args_plus_result_plain_text_ac005_11() {
+    use dshtui::model::trajectory::detail_for;
+    // AC-005-11：复制目标 = args/result 纯文本（内存拼装、不落盘，落盘性由
+    // 纯函数无 IO 保证；走 REQ-003 yank 后端链）。
+    let w = detail_window_with(None, None);
+    let call = w
+        .raw_rows()
+        .find(|r| r.kind() == TrajKind::ToolCall)
+        .cloned()
+        .unwrap();
+    let detail = detail_for(&call, &w).unwrap();
+    let yanked = detail.yank_text().expect("args/result 存在可复制");
+    assert!(
+        yanked.contains("grep -r x"),
+        "args 纯文本进复制目标: {yanked}"
+    );
+    assert!(
+        yanked.contains("3 处命中"),
+        "result 纯文本进复制目标: {yanked}"
+    );
+    // 只有 args（无 result）也成立。
+    let mut w2 = TrajectoryWindow::new(200);
+    w2.apply(TrajIncoming::Snapshot {
+        cursor: None,
+        records: vec![traj_record(
+            1,
+            "tool/call",
+            serde_json::json!({"turn": 1, "step": 1, "callId": "c9", "name": "bash", "arguments": "{\"command\":\"ls\"}"}),
+        )],
+        has_more: true,
+        projections: None,
+    });
+    let call2 = w2.raw_rows().next().cloned().unwrap();
+    let detail2 = detail_for(&call2, &w2).unwrap();
+    assert!(detail2.yank_text().is_some(), "仅 args 也可复制");
+}

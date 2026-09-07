@@ -143,8 +143,9 @@ pub enum TrajectoryRow {
         call_id: Option<String>,
         is_error: bool,
         summary: String,
-        /// `tool/result.meta` 存在（工具私有 diff 唯一来源，AC-005-10）。
-        meta_has_diff: bool,
+        /// `tool/result.meta` 原始载荷（工具私有 diff 唯一来源，AC-005-10；
+        /// 保留原文供 TrajectoryDetail.diff 提取，`meta_has_diff()` 派生）。
+        meta: Option<Value>,
         error: Option<TrajError>,
     },
     RequestHeader {
@@ -320,13 +321,15 @@ impl TrajectoryRow {
     }
 
     pub fn meta_has_diff(&self) -> bool {
-        matches!(
-            self,
-            TrajectoryRow::ToolResult {
-                meta_has_diff: true,
-                ..
-            }
-        )
+        matches!(self, TrajectoryRow::ToolResult { meta: Some(_), .. })
+    }
+
+    /// `tool/result.meta` 原始载荷（详情 diff 提取源）。
+    pub fn meta(&self) -> Option<&Value> {
+        match self {
+            TrajectoryRow::ToolResult { meta, .. } => meta.as_ref(),
+            _ => None,
+        }
     }
 
     pub fn error(&self) -> Option<&TrajError> {
@@ -948,7 +951,7 @@ fn row_from_event(ev: &SessionWireEvent, seq: SessionSeq, id: u64) -> Trajectory
             call_id: get_str("callId").or_else(|| get_str("id")),
             is_error: parse_error().is_some(),
             summary: get_str("message").unwrap_or_default(),
-            meta_has_diff: data.get("meta").is_some_and(|m| !m.is_null()),
+            meta: data.get("meta").cloned().filter(|m| !m.is_null()),
             error: parse_error(),
         },
         "request/header" => TrajectoryRow::RequestHeader {
@@ -1036,4 +1039,274 @@ impl TrajectoryStore {
         self.order.push_back(id.to_string());
         self.windows.get_mut(id).expect("刚插入")
     }
+}
+
+// ============================================================================
+// TrajectoryDetail —— 详情面板字段（REQ-005 §5 字段表，D-24=A；官方
+// `dsh-client-ui-trajectory` `TrajectoryCellProps`/`AssistantMetricDetail`
+// 实读命名映射 [验证]）。构建为纯函数 `detail_for(row, window)`，无 IO：
+// 详情/复制内容不落盘、不进日志明文（R8/`06 §9`，AC-005-11）。
+// ============================================================================
+
+/// timing 字段（事件 `time` 推导，`[未验证]` 推导源由 UI 层标注，AC-005-15；
+/// 参考官方 trajectory `AssistantMetricDetail` 的
+/// stepStart/firstToken/completedTime 推导）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct TrajTiming {
+    /// 详情锚点行自身 time（毫秒）。
+    pub started_at: Option<i64>,
+    /// completed - started_at（秒，推导；无 completed 时为 None）。
+    pub time_seconds: Option<f64>,
+    /// 同 step 的 step/start.time。
+    pub step_start: Option<i64>,
+    /// 同 step 的 assistant/message.time（首个 token 推导近似）。
+    pub first_token: Option<i64>,
+    /// 同 callId 的 tool/result.time（或同 step 的 step/end.time）。
+    pub completed: Option<i64>,
+}
+
+/// 详情面板数据（source_seq/source_kind 锚点防串详情；选行变化即重建）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct TrajectoryDetail {
+    pub source_seq: SessionSeq,
+    pub source_kind: TrajKind,
+    /// 面板标题（如 `tool/call bash` / `tool/result` / `assistant`）。
+    pub title: String,
+    /// tool/call `arguments` 格式化 JSON（`y` 复制目标，D-24）。
+    pub args_text: Option<String>,
+    /// tool/result `message` 文本（assistant 行 = 消息摘要）。
+    pub result_text: Option<String>,
+    /// tool/result.error（与 result 并列展示，AC-005-03 含错误展示）。
+    pub error: Option<TrajError>,
+    /// `tool/result.meta` 内 diff（仅存在时；否则 UI 显示「无 diff」，
+    /// AC-005-10）。
+    pub diff: Option<String>,
+    /// 同 step `assistant/message.usage` 推导（无 per-tool；`[未验证]`）。
+    pub usage: Option<TrajUsage>,
+    /// 事件 `time` 推导（`[未验证]`）。
+    pub timing: Option<TrajTiming>,
+    /// 原始块顺序展示（assistant = [摘要]；tool 行空，V0.3 不逐块）。
+    pub source_blocks: Vec<String>,
+}
+
+impl TrajectoryDetail {
+    /// 复制目标 = args/result 纯文本（AC-005-11；不落盘，由纯函数无 IO
+    /// 保证；执行链走 REQ-003 yank 后端 arboard→OSC52→tmux）。
+    pub fn yank_text(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        if let Some(args) = &self.args_text {
+            parts.push(args.clone());
+        }
+        if let Some(result) = &self.result_text {
+            if !parts.is_empty() {
+                parts.push("\n\n".to_string());
+            }
+            parts.push(result.clone());
+        }
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.concat())
+        }
+    }
+}
+
+/// 行 → 详情。仅 ToolCall/ToolResult/AssistantMessage 提供详情（REQ §4/
+/// AC-005-15）；其余行返回 None。
+///
+/// 同 step / 同 callId 的聚合数据从窗口行序列推导（`[未验证]` 口径）：
+/// - ToolCall：args + 同 callId ToolResult（result/error/diff）+ 同 step
+///   usage/timing；
+/// - ToolResult：result/error/diff + 同 step usage/timing；
+/// - AssistantMessage：摘要 + usage + timing（completed = 同 step
+///   step/end.time，无则 None）。
+pub fn detail_for(row: &TrajectoryRow, window: &TrajectoryWindow) -> Option<TrajectoryDetail> {
+    match row {
+        TrajectoryRow::ToolCall {
+            seq,
+            turn,
+            step,
+            time,
+            name,
+            args_raw,
+            call_id,
+            ..
+        } => {
+            let result = window
+                .raw_rows()
+                // 只匹配同 callId 的 tool/result（排除 call 行自身：其
+                // callId 相同且窗口序更前）。
+                .find(|r| r.kind() == TrajKind::ToolResult && same_call(r, call_id.as_deref()))
+                .cloned();
+            let usage = window
+                .raw_rows()
+                .find(|r| same_step(r, *turn, *step) && r.kind() == TrajKind::AssistantMessage)
+                .and_then(|r| r.usage().cloned());
+            Some(TrajectoryDetail {
+                source_seq: *seq,
+                source_kind: TrajKind::ToolCall,
+                title: format!("tool/call {}", name.as_deref().unwrap_or("tool")),
+                args_text: args_raw.as_ref().map(format_args_json),
+                result_text: result.as_ref().and_then(|r| match r {
+                    TrajectoryRow::ToolResult { summary, .. } => Some(summary.clone()),
+                    _ => None,
+                }),
+                error: result.as_ref().and_then(|r| r.error().cloned()),
+                diff: result.as_ref().and_then(extract_diff),
+                usage,
+                timing: timing_for(
+                    *time,
+                    window,
+                    *turn,
+                    *step,
+                    result.as_ref().and_then(|r| r.time()),
+                ),
+                source_blocks: Vec::new(),
+            })
+        }
+        TrajectoryRow::ToolResult {
+            seq,
+            turn,
+            step,
+            time,
+            call_id,
+            summary,
+            error,
+            meta,
+            ..
+        } => {
+            let usage = window
+                .raw_rows()
+                .find(|r| same_step(r, *turn, *step) && r.kind() == TrajKind::AssistantMessage)
+                .and_then(|r| r.usage().cloned());
+            let completed = *time;
+            Some(TrajectoryDetail {
+                source_seq: *seq,
+                source_kind: TrajKind::ToolResult,
+                title: format!("tool/result {}", call_id.as_deref().unwrap_or(""))
+                    .trim_end()
+                    .to_string(),
+                args_text: None,
+                result_text: Some(summary.clone()),
+                error: error.clone(),
+                diff: meta.as_ref().and_then(extract_diff_from_value),
+                usage,
+                timing: timing_for(*time, window, *turn, *step, completed),
+                source_blocks: Vec::new(),
+            })
+        }
+        TrajectoryRow::AssistantMessage {
+            seq,
+            turn,
+            step,
+            time,
+            summary,
+            usage,
+            ..
+        } => {
+            let completed = window
+                .raw_rows()
+                .find(|r| same_step(r, *turn, *step) && r.kind() == TrajKind::StepEnd)
+                .and_then(|r| r.time());
+            Some(TrajectoryDetail {
+                source_seq: *seq,
+                source_kind: TrajKind::AssistantMessage,
+                title: "assistant".to_string(),
+                args_text: None,
+                result_text: (!summary.is_empty()).then(|| summary.clone()),
+                error: None,
+                diff: None,
+                usage: usage.clone(),
+                timing: timing_for(*time, window, *turn, *step, completed),
+                source_blocks: if summary.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![summary.clone()]
+                },
+            })
+        }
+        _ => None,
+    }
+}
+
+fn same_call(row: &TrajectoryRow, call_id: Option<&str>) -> bool {
+    match call_id {
+        Some(id) => row.call_id() == Some(id),
+        None => false,
+    }
+}
+
+fn same_step(row: &TrajectoryRow, turn: Option<u64>, step: Option<u64>) -> bool {
+    row.turn() == turn && row.step() == step
+}
+
+/// tool/result.meta 内 diff 提取（`[未验证]` 口径：仅 meta.diff 键；字符串
+/// 原样、对象/数组 JSON 文本化；无 diff 键 → None =「无 diff」降级）。
+fn extract_diff(row: &TrajectoryRow) -> Option<String> {
+    match row {
+        TrajectoryRow::ToolResult { meta, .. } => meta.as_ref().and_then(extract_diff_from_value),
+        _ => None,
+    }
+}
+
+fn extract_diff_from_value(meta: &Value) -> Option<String> {
+    let diff = meta.get("diff")?;
+    match diff {
+        Value::String(s) => Some(s.clone()),
+        Value::Null => None,
+        other => Some(format_json(other)),
+    }
+}
+
+/// tool/call `arguments` 格式化：对象/数组 pretty JSON；字符串原样（模型
+/// 原始 JSON 字符串——若可解析为 JSON 再 pretty，否则保留原文）。
+pub fn format_args_json(v: &Value) -> String {
+    match v {
+        Value::String(s) => match serde_json::from_str::<Value>(s) {
+            Ok(parsed) if !parsed.is_null() => format_json(&parsed),
+            _ => s.clone(),
+        },
+        other => format_json(other),
+    }
+}
+
+fn format_json(v: &Value) -> String {
+    match serde_json::to_string_pretty(v) {
+        Ok(pretty) => pretty,
+        Err(_) => v.to_string(),
+    }
+}
+
+/// timing 推导（`[未验证]`）：step_start = 同 step step/start.time；
+/// first_token = 同 step assistant/message.time；completed 由调用方传入
+/// （tool/call = 同 callId result.time；assistant = 同 step step/end.time）。
+fn timing_for(
+    started_at: Option<i64>,
+    window: &TrajectoryWindow,
+    turn: Option<u64>,
+    step: Option<u64>,
+    completed: Option<i64>,
+) -> Option<TrajTiming> {
+    if started_at.is_none() && completed.is_none() {
+        return None;
+    }
+    let step_start = window
+        .raw_rows()
+        .find(|r| same_step(r, turn, step) && r.kind() == TrajKind::StepStart)
+        .and_then(|r| r.time());
+    let first_token = window
+        .raw_rows()
+        .find(|r| same_step(r, turn, step) && r.kind() == TrajKind::AssistantMessage)
+        .and_then(|r| r.time());
+    let time_seconds = match (started_at, completed) {
+        (Some(s), Some(c)) if c >= s => Some((c - s) as f64 / 1000.0),
+        _ => None,
+    };
+    Some(TrajTiming {
+        started_at,
+        time_seconds,
+        step_start,
+        first_token,
+        completed,
+    })
 }

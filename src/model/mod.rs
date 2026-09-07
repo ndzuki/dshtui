@@ -25,6 +25,10 @@ pub use session::{
     ApplyEffect, Block, Incoming, PackedChunks, PendingEcho, PendingEchoStatus, SessionStore,
     TranscriptWindow, TurnOutlineItem,
 };
+pub use trajectory::{
+    detail_for, FoldState, GroupId, RowId, TrajEffect, TrajError, TrajIncoming, TrajKind,
+    TrajTiming, TrajUsage, TrajectoryDetail, TrajectoryRow, TrajectoryStore, TrajectoryWindow,
+};
 pub use workspace::{WorkspaceMeta, WorkspaceStore};
 pub use yank::{
     block_plain_text, block_yank_target, selection_text, VisualMode, VisualSelection, YankBackend,
