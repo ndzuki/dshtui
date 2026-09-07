@@ -800,6 +800,106 @@ async fn execute_one(
                 };
             commands.extend(app.handle(event));
         }
+        // ---------- REQ-006：workspace/session 写操作执行（FR-006-02 操作半） ----------
+        Cmd::WorkspaceOp { request_id, op } => {
+            use dshtui::app::{OpOutcome, WorkspaceOperation};
+            let Some(client) = client.as_ref() else {
+                let event = AppEvent::WorkspaceOpFailed {
+                    request_id,
+                    op_name: op.label().to_string(),
+                    error: ClientError::Transport("未连接（dsh web 不可达）".into()),
+                };
+                commands.extend(app.handle(event));
+                return;
+            };
+            let result: Result<OpOutcome, (String, ClientError)> = match op {
+                WorkspaceOperation::ForkSession { session_id } => {
+                    dshtui::api::session::fork(&client.http, &client.base, &session_id, None)
+                        .await
+                        .map(|v| OpOutcome::ForkCreated {
+                            session_id: v.session_id,
+                        })
+                        .map_err(|e| ("fork session".to_string(), e))
+                }
+                WorkspaceOperation::RenameSession { session_id, title } => {
+                    dshtui::api::session::rename(&client.http, &client.base, &session_id, &title)
+                        .await
+                        .map(|_| OpOutcome::Ack)
+                        .map_err(|e| ("rename session".to_string(), e))
+                }
+                WorkspaceOperation::ArchiveSession { session_id } => {
+                    workspace::archive_session(&client.http, &client.base, &session_id.0)
+                        .await
+                        .map(|_| OpOutcome::Ack)
+                        .map_err(|e| ("archive session".to_string(), e))
+                }
+                WorkspaceOperation::NewWorkspace { path } => {
+                    workspace::create_workspace(&client.http, &client.base, &path)
+                        .await
+                        .map(|raw| {
+                            let id = raw
+                                .get("workspace")
+                                .and_then(|w| {
+                                    w.get("workspaceId")
+                                        .or_else(|| w.get("id"))
+                                        .and_then(|v| v.as_str())
+                                })
+                                .or_else(|| {
+                                    raw.get("workspaceId")
+                                        .or_else(|| raw.get("id"))
+                                        .and_then(|v| v.as_str())
+                                })
+                                .unwrap_or("")
+                                .to_string();
+                            OpOutcome::WorkspaceCreated { workspace_id: id }
+                        })
+                        .map_err(|e| ("new workspace".to_string(), e))
+                }
+                WorkspaceOperation::RenameWorkspace {
+                    workspace_id,
+                    title,
+                } => {
+                    workspace::rename_workspace(&client.http, &client.base, &workspace_id.0, &title)
+                        .await
+                        .map(|_| OpOutcome::Ack)
+                        .map_err(|e| ("rename workspace".to_string(), e))
+                }
+                WorkspaceOperation::DeleteWorkspace { workspace_id } => {
+                    workspace::delete_workspace(&client.http, &client.base, &workspace_id.0)
+                        .await
+                        .map(|_| OpOutcome::Ack)
+                        .map_err(|e| ("delete workspace".to_string(), e))
+                }
+                WorkspaceOperation::MoveSession {
+                    session_id,
+                    target_workspace,
+                } => {
+                    let wid = target_workspace.map(|w| w.0).unwrap_or_default();
+                    workspace::insert_session_before(
+                        &client.http,
+                        &client.base,
+                        &wid,
+                        &session_id.0,
+                        None,
+                    )
+                    .await
+                    .map(|_| OpOutcome::Ack)
+                    .map_err(|e| ("move session".to_string(), e))
+                }
+            };
+            let event = match result {
+                Ok(outcome) => AppEvent::WorkspaceOpDone {
+                    request_id,
+                    outcome,
+                },
+                Err((op_name, error)) => AppEvent::WorkspaceOpFailed {
+                    request_id,
+                    op_name,
+                    error,
+                },
+            };
+            commands.extend(app.handle(event));
+        }
         Cmd::OpenExternal { target } => {
             // 仅用户显式触发才调用系统 open（REQ-003 §3 安全边界）。
             match open::that(&target) {

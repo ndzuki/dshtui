@@ -314,7 +314,8 @@ pub struct EffortPick {
     pub cursor: usize,
 }
 
-/// 命令面板候选的动作类型（REQ-006 FR-006-03 / D-035）。
+/// 命令面板候选的动作类型（REQ-006 FR-006-03 / D-035 + FR-006-02 操作半）。
+/// workspace/session 操作项进入 palette 输入/确认子阶段（Step 6）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaletteAction {
     /// ≡ `M` 打开模型目录。
@@ -327,8 +328,107 @@ pub enum PaletteAction {
     ExpandAll,
     /// 新建会话（`session/create`，空 workspace；成功刷新列表）。
     NewSession,
-    /// 关闭命令面板并打开模型目录已含；`help` 打开帮助。
+    /// `help` 打开帮助。
     Help,
+    /// 会话操作（目标 = active_session）。
+    ForkSession,
+    RenameSession,
+    ArchiveSession,
+    /// workspace 操作（目标 = sidebar 光标行 workspace；无则提示）。
+    NewWorkspace,
+    RenameWorkspace,
+    DeleteWorkspace,
+    /// 移动会话到目标 workspace（输入 workspace id / 空 = 未分组）。
+    MoveSession,
+}
+
+/// 会话/workspace 写操作（REQ-006 FR-006-02 操作半；wire 端点 Step 1 已封装）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum WorkspaceOperation {
+    /// `session/fork`（atSeq=None：当前头部 fork）。
+    ForkSession { session_id: SessionId },
+    /// `session/rename`。
+    RenameSession {
+        session_id: SessionId,
+        title: String,
+    },
+    /// `workspace/archiveSession`（归档=删除当前会话，web 按钮语义）。
+    ArchiveSession { session_id: SessionId },
+    /// `workspace/create`（path）。
+    NewWorkspace { path: String },
+    /// `workspace/rename`。
+    RenameWorkspace {
+        workspace_id: crate::api::types::WorkspaceId,
+        title: String,
+    },
+    /// `workspace/delete`（危险）。
+    DeleteWorkspace {
+        workspace_id: crate::api::types::WorkspaceId,
+    },
+    /// `workspace/insert_session_before`（移动当前会话到目标 workspace 末尾；
+    /// None=移出分组）。
+    MoveSession {
+        session_id: SessionId,
+        target_workspace: Option<crate::api::types::WorkspaceId>,
+    },
+}
+
+impl WorkspaceOperation {
+    /// 操作名（通知/错误文案与单飞去重键）。
+    pub fn label(&self) -> &'static str {
+        match self {
+            WorkspaceOperation::ForkSession { .. } => "fork session",
+            WorkspaceOperation::RenameSession { .. } => "rename session",
+            WorkspaceOperation::ArchiveSession { .. } => "archive session",
+            WorkspaceOperation::NewWorkspace { .. } => "new workspace",
+            WorkspaceOperation::RenameWorkspace { .. } => "rename workspace",
+            WorkspaceOperation::DeleteWorkspace { .. } => "delete workspace",
+            WorkspaceOperation::MoveSession { .. } => "move session",
+        }
+    }
+
+    /// 是否为破坏性操作（archive/delete 需二次确认）。
+    pub fn dangerous(&self) -> bool {
+        matches!(
+            self,
+            WorkspaceOperation::ArchiveSession { .. } | WorkspaceOperation::DeleteWorkspace { .. }
+        )
+    }
+}
+
+/// palette 操作子阶段（Step 6）：参数输入 / 破坏性二次确认。
+#[derive(Debug, Clone, PartialEq)]
+pub enum PaletteStage {
+    /// 文本参数输入（重命名标题/新建 workspace path/移动目标）。
+    Input {
+        prompt: &'static str,
+        kind: OpArgKind,
+    },
+    /// 破坏性确认（`y` 执行 / 其它键取消）。
+    ConfirmDanger {
+        label: String,
+        op: WorkspaceOperation,
+    },
+}
+
+/// 参数输入类型（决定提交后的操作构建）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpArgKind {
+    RenameSession,
+    NewWorkspace,
+    RenameWorkspace,
+    MoveSession,
+}
+
+/// 写操作回执（`workspace/*`/`session/*` 成功后的 apply 载荷）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum OpOutcome {
+    /// 无需特别处理的成功（rename/archive/delete/move）。
+    Ack,
+    /// fork 返回新会话 id（成功后打开）。
+    ForkCreated { session_id: String },
+    /// workspace/create 返回 id（刷新 workspace follow 对账）。
+    WorkspaceCreated { workspace_id: String },
 }
 
 /// 命令面板候选条目（本地动作 / 远端斜杠命令 / V0.4 占位）。
@@ -367,10 +467,15 @@ pub struct CommandPaletteState {
     pub remote_fetched: bool,
     /// `commands/execute` 单飞（同一行只提交一次，AC-006-12/15 同源）。
     pub executing: bool,
+    /// Step 6 操作子阶段（参数输入 / 破坏性确认；None=命令列表）。
+    pub stage: Option<PaletteStage>,
+    /// workspace/session 写操作在途（request_id + label；requestId 幂等，
+    /// AC-006-12——重复/迟到响应不重复 apply）。
+    pub op_inflight: Option<(String, &'static str)>,
 }
 
 impl CommandPaletteState {
-    /// 打开即重置为初态（保留远端缓存供重开复用；query/结果清空）。
+    /// 打开即重置为初态（保留远端缓存供重开复用；query/结果/stage 清空）。
     pub fn reset_for_open(&mut self) {
         self.visible = true;
         self.query.clear();
@@ -378,6 +483,25 @@ impl CommandPaletteState {
         self.last_error_code = None;
         self.last_result = None;
         self.executing = false;
+        self.stage = None;
+        self.op_inflight = None;
+    }
+
+    /// 进入参数输入子阶段（清空 query 作为输入缓冲）。
+    pub fn begin_input(&mut self, kind: OpArgKind, prompt: &'static str) {
+        self.stage = Some(PaletteStage::Input { prompt, kind });
+        self.query.clear();
+        self.selection = 0;
+        self.last_result = None;
+        self.last_error_code = None;
+    }
+
+    /// 进入破坏性二次确认。
+    pub fn begin_confirm(&mut self, op: WorkspaceOperation) {
+        let label = op.label().to_string();
+        self.stage = Some(PaletteStage::ConfirmDanger { label, op });
+        self.last_result = None;
+        self.last_error_code = None;
     }
 
     /// 内置本地命令 + V0.4 占位（D-035 映射清单；workspace/session 操作项由
@@ -413,6 +537,42 @@ impl CommandPaletteState {
                 label: "help",
                 desc: "键位帮助（?）",
                 action: PaletteAction::Help,
+            },
+            // ---------- REQ-006 workspace/session 操作（FR-006-02 操作半） ----------
+            CommandPaletteItem::Local {
+                label: "fork session",
+                desc: "复制当前会话为分支（成功后打开）",
+                action: PaletteAction::ForkSession,
+            },
+            CommandPaletteItem::Local {
+                label: "rename session",
+                desc: "重命名当前会话",
+                action: PaletteAction::RenameSession,
+            },
+            CommandPaletteItem::Local {
+                label: "archive session",
+                desc: "归档当前会话（危险，二次确认）",
+                action: PaletteAction::ArchiveSession,
+            },
+            CommandPaletteItem::Local {
+                label: "move session",
+                desc: "移动当前会话到目标 workspace",
+                action: PaletteAction::MoveSession,
+            },
+            CommandPaletteItem::Local {
+                label: "new workspace",
+                desc: "新建 workspace（输入路径）",
+                action: PaletteAction::NewWorkspace,
+            },
+            CommandPaletteItem::Local {
+                label: "rename workspace",
+                desc: "重命名光标所在 workspace",
+                action: PaletteAction::RenameWorkspace,
+            },
+            CommandPaletteItem::Local {
+                label: "delete workspace",
+                desc: "删除光标所在 workspace（危险，二次确认）",
+                action: PaletteAction::DeleteWorkspace,
             },
             CommandPaletteItem::V04 {
                 label: "settings",
@@ -769,6 +929,18 @@ pub enum AppEvent {
     SessionCreateFailed {
         error: ClientError,
     },
+    // ---------- REQ-006 workspace/session 操作回执（FR-006-02 操作半） ----------
+    /// 写操作成功（requestId 校验：与在途不一致 = 重复/迟到响应，不 apply）。
+    WorkspaceOpDone {
+        request_id: String,
+        outcome: OpOutcome,
+    },
+    /// 写操作失败（requestId 匹配才置错；本地不漂移，AC-006-10）。
+    WorkspaceOpFailed {
+        request_id: String,
+        op_name: String,
+        error: ClientError,
+    },
 }
 
 /// Orchestration commands emitted by the reducer (executed by the run loop).
@@ -879,6 +1051,12 @@ pub enum Cmd {
     },
     /// `session/create` 新建会话（Step 5 `new session` 命令）。
     CreateSession,
+    /// workspace/session 写操作（FR-006-02 操作半；requestId 幂等——
+    /// 重复/迟到响应不重复 apply，AC-006-12）。
+    WorkspaceOp {
+        request_id: String,
+        op: WorkspaceOperation,
+    },
 }
 
 #[derive(Debug)]
@@ -1817,6 +1995,72 @@ impl AppState {
                 }
                 vec![]
             }
+            // ---------- REQ-006 workspace/session 操作回执（FR-006-02） ----------
+            AppEvent::WorkspaceOpDone {
+                request_id,
+                outcome,
+            } => {
+                // requestId 幂等（AC-006-12）：与在途不匹配 = 重复/迟到响应，
+                // 不重复 apply。
+                let Some((inflight_id, label)) = self.command_palette.op_inflight.clone() else {
+                    return vec![];
+                };
+                if inflight_id != request_id {
+                    tracing::debug!(request_id, "workspace op 重复/迟到响应忽略（幂等）");
+                    return vec![];
+                }
+                self.command_palette.op_inflight = None;
+                match outcome {
+                    OpOutcome::ForkCreated { session_id } => {
+                        // fork 成功：打开新会话（web 列表经重拉一致）。
+                        let sid = SessionId(session_id.clone());
+                        self.notice = Some(format!("已创建分支会话 {session_id}"));
+                        self.list_loaded = false;
+                        let mut cmds = vec![Cmd::LoadSessionList { cursor: None }];
+                        cmds.extend(self.open_session(sid));
+                        cmds
+                    }
+                    OpOutcome::WorkspaceCreated { workspace_id } => {
+                        self.notice = Some(format!("已新建 workspace {workspace_id}"));
+                        // workspace/follow 增量对账；重拉会话列表确保一致。
+                        self.list_loaded = false;
+                        vec![Cmd::LoadSessionList { cursor: None }]
+                    }
+                    OpOutcome::Ack => {
+                        self.notice = Some(format!("操作成功: {label}（web 端同步中）"));
+                        // 本地列表不经手改（不漂移）；重拉会话列表与 web 对账
+                        // （AC-006-02 操作后 web 立即可见一致）。
+                        self.list_loaded = false;
+                        vec![Cmd::LoadSessionList { cursor: None }]
+                    }
+                }
+            }
+            AppEvent::WorkspaceOpFailed {
+                request_id,
+                op_name,
+                error,
+            } => {
+                // 仅当与在途匹配才落错（迟到失败不覆盖新状态）。
+                if self
+                    .command_palette
+                    .op_inflight
+                    .as_ref()
+                    .is_some_and(|(rid, _)| *rid == request_id)
+                {
+                    self.command_palette.op_inflight = None;
+                    let code = error.code();
+                    self.command_palette.last_error_code = Some(code);
+                    self.command_palette.last_result = Some(format!("{op_name} 失败: {error}"));
+                    // AC-006-10：本地列表不漂移（未收到成功前不改本地）；
+                    // 权限错误不自动重试。
+                    if error.class() == ErrorClass::PermissionDenied {
+                        tracing::error!(error = %error, "{op_name} 权限不足");
+                    } else {
+                        tracing::warn!(error = %error, "{op_name} 失败");
+                    }
+                }
+                vec![]
+            }
         }
     }
 
@@ -2512,9 +2756,16 @@ impl AppState {
                     }
                     vec![]
                 }
-                // REQ-006：命令面板 q/Esc 关闭。
+                // REQ-006：命令面板 q/Esc——输入/确认子阶段先取消回列表，
+                // 无子阶段才关闭面板。
                 Mode::CommandPalette => {
-                    self.close_command_palette();
+                    if self.command_palette.stage.is_some() {
+                        self.command_palette.stage = None;
+                        self.command_palette.query.clear();
+                        self.command_palette.selection = 0;
+                    } else {
+                        self.close_command_palette();
+                    }
                     vec![]
                 }
             },
@@ -3572,6 +3823,13 @@ impl AppState {
     /// Enter：执行选中候选（本地动作 → reducer 直执行；远端 → Cmd 单飞；
     /// V0.4 → 面板提示不执行）。
     fn command_palette_confirm(&mut self) -> Vec<Cmd> {
+        // 操作子阶段优先：参数输入提交 / 破坏性确认执行。
+        if let Some(stage) = self.command_palette.stage.clone() {
+            return match stage {
+                PaletteStage::Input { kind, .. } => self.palette_stage_input_commit(kind),
+                PaletteStage::ConfirmDanger { op, .. } => self.palette_send_op(op),
+            };
+        }
         let Some(item) = self
             .command_palette
             .filtered()
@@ -3581,41 +3839,58 @@ impl AppState {
             return vec![];
         };
         match item {
-            CommandPaletteItem::Local { action, .. } => {
-                self.command_palette.visible = false;
-                self.mode = Mode::Normal;
-                match action {
-                    PaletteAction::ModelCatalog => self.open_model_catalog(),
-                    PaletteAction::CycleSidebarView => {
-                        self.sidebar_view.cycle();
-                        self.clamp_sidebar_cursor();
-                        self.notice = Some(format!(
-                            "视图: group={} order={}",
-                            self.sidebar_view.group_by.as_str(),
-                            self.sidebar_view.order_by.as_str()
-                        ));
-                        vec![]
-                    }
-                    PaletteAction::CollapseAll => {
-                        self.sidebar_view.collapse_all(&self.workspaces);
-                        self.clamp_sidebar_cursor();
-                        vec![]
-                    }
-                    PaletteAction::ExpandAll => {
-                        self.sidebar_view.expand_all();
-                        self.clamp_sidebar_cursor();
-                        vec![]
-                    }
-                    PaletteAction::NewSession => {
-                        // 关闭面板（保持 NORMAL）再发 create；结果事件返回。
-                        vec![Cmd::CreateSession]
-                    }
-                    PaletteAction::Help => {
-                        self.help_open = true;
-                        vec![]
+            CommandPaletteItem::Local { action, .. } => match action {
+                // workspace/session 操作：留在面板（输入/确认子阶段或直接发）。
+                PaletteAction::ForkSession
+                | PaletteAction::RenameSession
+                | PaletteAction::ArchiveSession
+                | PaletteAction::MoveSession
+                | PaletteAction::NewWorkspace
+                | PaletteAction::RenameWorkspace
+                | PaletteAction::DeleteWorkspace => self.palette_begin_operation(action),
+                action => {
+                    self.command_palette.visible = false;
+                    self.mode = Mode::Normal;
+                    match action {
+                        PaletteAction::ModelCatalog => self.open_model_catalog(),
+                        PaletteAction::CycleSidebarView => {
+                            self.sidebar_view.cycle();
+                            self.clamp_sidebar_cursor();
+                            self.notice = Some(format!(
+                                "视图: group={} order={}",
+                                self.sidebar_view.group_by.as_str(),
+                                self.sidebar_view.order_by.as_str()
+                            ));
+                            vec![]
+                        }
+                        PaletteAction::CollapseAll => {
+                            self.sidebar_view.collapse_all(&self.workspaces);
+                            self.clamp_sidebar_cursor();
+                            vec![]
+                        }
+                        PaletteAction::ExpandAll => {
+                            self.sidebar_view.expand_all();
+                            self.clamp_sidebar_cursor();
+                            vec![]
+                        }
+                        PaletteAction::NewSession => {
+                            // 关闭面板（保持 NORMAL）再发 create；结果事件返回。
+                            vec![Cmd::CreateSession]
+                        }
+                        PaletteAction::Help => {
+                            self.help_open = true;
+                            vec![]
+                        }
+                        PaletteAction::ForkSession
+                        | PaletteAction::RenameSession
+                        | PaletteAction::ArchiveSession
+                        | PaletteAction::MoveSession
+                        | PaletteAction::NewWorkspace
+                        | PaletteAction::RenameWorkspace
+                        | PaletteAction::DeleteWorkspace => unreachable!("上方已处理"),
                     }
                 }
-            }
+            },
             CommandPaletteItem::Remote { name, .. } => {
                 // 单飞：同一命令行只提交一次（AC-006-12/13）。
                 if self.command_palette.executing {
@@ -3639,6 +3914,175 @@ impl AppState {
                 vec![]
             }
         }
+    }
+
+    /// 操作项开始：目标校验 → 无参操作直接发（返回其 Cmd）/ 需参数进入输入
+    /// 子阶段（返回空）/ 危险操作先确认。
+    fn palette_begin_operation(&mut self, action: PaletteAction) -> Vec<Cmd> {
+        // 校验目标是否存在（会话操作 → active_session；workspace 操作 →
+        // sidebar 光标 workspace）。
+        match action {
+            PaletteAction::ForkSession
+            | PaletteAction::RenameSession
+            | PaletteAction::ArchiveSession
+            | PaletteAction::MoveSession => {
+                if self.active_session.is_none() {
+                    self.command_palette.last_result = Some("无活动会话：先用 f/o 打开会话".into());
+                    return vec![];
+                }
+            }
+            PaletteAction::NewWorkspace => {}
+            PaletteAction::RenameWorkspace | PaletteAction::DeleteWorkspace => {
+                if self.palette_workspace_target().is_none() {
+                    self.command_palette.last_result =
+                        Some("请先将侧栏光标移到 workspace 或其会话".into());
+                    return vec![];
+                }
+            }
+            _ => unreachable!(),
+        }
+        match action {
+            PaletteAction::ForkSession => {
+                // 无参直接发（fork 当前活动会话）。
+                let op = WorkspaceOperation::ForkSession {
+                    session_id: self.active_session.clone().unwrap(),
+                };
+                self.palette_execute_op(op)
+            }
+            PaletteAction::ArchiveSession => {
+                let op = WorkspaceOperation::ArchiveSession {
+                    session_id: self.active_session.clone().unwrap(),
+                };
+                // dangerous → 进入确认（返回空）。
+                self.palette_execute_op(op)
+            }
+            PaletteAction::DeleteWorkspace => {
+                let wid = self.palette_workspace_target().unwrap();
+                let op = WorkspaceOperation::DeleteWorkspace { workspace_id: wid };
+                // dangerous → 进入确认（返回空）。
+                self.palette_execute_op(op)
+            }
+            PaletteAction::RenameSession => {
+                self.command_palette
+                    .begin_input(OpArgKind::RenameSession, "会话新标题");
+                vec![]
+            }
+            PaletteAction::MoveSession => {
+                self.command_palette
+                    .begin_input(OpArgKind::MoveSession, "目标 workspace id");
+                vec![]
+            }
+            PaletteAction::NewWorkspace => {
+                self.command_palette
+                    .begin_input(OpArgKind::NewWorkspace, "workspace 路径");
+                vec![]
+            }
+            PaletteAction::RenameWorkspace => {
+                self.command_palette
+                    .begin_input(OpArgKind::RenameWorkspace, "workspace 新标题");
+                vec![]
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    /// 参数输入子阶段 Enter：按类型构建操作并执行（危险操作先进确认）。
+    fn palette_stage_input_commit(&mut self, kind: OpArgKind) -> Vec<Cmd> {
+        let text = self.command_palette.query.trim().to_string();
+        let op = match kind {
+            OpArgKind::RenameSession => {
+                let Some(session_id) = self.active_session.clone() else {
+                    self.command_palette.last_result = Some("无活动会话：先用 f/o 打开会话".into());
+                    return vec![];
+                };
+                if text.is_empty() {
+                    self.command_palette.last_result = Some("标题不能为空".into());
+                    return vec![];
+                }
+                Some(WorkspaceOperation::RenameSession {
+                    session_id,
+                    title: text,
+                })
+            }
+            OpArgKind::NewWorkspace => {
+                if text.is_empty() {
+                    self.command_palette.last_result = Some("路径不能为空".into());
+                    return vec![];
+                }
+                Some(WorkspaceOperation::NewWorkspace { path: text })
+            }
+            OpArgKind::RenameWorkspace => {
+                if text.is_empty() {
+                    self.command_palette.last_result = Some("标题不能为空".into());
+                    return vec![];
+                }
+                let Some(workspace_id) = self.palette_workspace_target() else {
+                    self.command_palette.last_result =
+                        Some("请先将侧栏光标移到 workspace 或其会话".into());
+                    return vec![];
+                };
+                Some(WorkspaceOperation::RenameWorkspace {
+                    workspace_id,
+                    title: text,
+                })
+            }
+            OpArgKind::MoveSession => {
+                let Some(session_id) = self.active_session.clone() else {
+                    self.command_palette.last_result = Some("无活动会话：先用 f/o 打开会话".into());
+                    return vec![];
+                };
+                // wire 无「移出分组」端点：目标 workspace 必填（可空提示已改）。
+                if text.is_empty() {
+                    self.command_palette.last_result = Some("目标 workspace id 不能为空".into());
+                    return vec![];
+                }
+                Some(WorkspaceOperation::MoveSession {
+                    session_id,
+                    target_workspace: Some(crate::api::types::WorkspaceId(text)),
+                })
+            }
+        };
+        let Some(op) = op else {
+            return vec![];
+        };
+        self.palette_execute_op(op)
+    }
+
+    /// 目标 workspace = sidebar 光标行（header 或会话所属）。
+    fn palette_workspace_target(&self) -> Option<crate::api::types::WorkspaceId> {
+        use crate::model::SidebarRow as Row;
+        match self.sidebar_cursor_row()? {
+            Row::WorkspaceHeader { id, .. } => Some(id),
+            Row::Session(id) => self
+                .workspaces
+                .sessions
+                .get(&id)
+                .and_then(|m| m.workspace.clone()),
+        }
+    }
+
+    /// 执行写操作：危险 → 二次确认阶段；否则直接发（requestId 单飞）。
+    fn palette_execute_op(&mut self, op: WorkspaceOperation) -> Vec<Cmd> {
+        if self.command_palette.op_inflight.is_some() {
+            self.command_palette.last_result = Some("有操作在途，请等待完成后再试".into());
+            return vec![];
+        }
+        if op.dangerous() {
+            self.command_palette.begin_confirm(op);
+            return vec![];
+        }
+        self.palette_send_op(op)
+    }
+
+    /// 真正发送写操作 Cmd（requestId 幂等单飞，AC-006-12）。
+    fn palette_send_op(&mut self, op: WorkspaceOperation) -> Vec<Cmd> {
+        let request_id = crate::api::types::mint_request_id();
+        let label = op.label();
+        self.command_palette.op_inflight = Some((request_id.clone(), label));
+        self.command_palette.stage = None;
+        self.command_palette.last_result = None;
+        self.command_palette.last_error_code = None;
+        vec![Cmd::WorkspaceOp { request_id, op }]
     }
 
     fn search_input(&mut self, text: &str) -> Vec<Cmd> {
@@ -6331,5 +6775,213 @@ mod tests {
             .iter()
             .any(|c| matches!(c, Cmd::LoadSessionList { .. })));
         assert!(s.notice.as_deref().unwrap().contains("s-new"));
+    }
+
+    // ---------- REQ-006 workspace/session 操作（FR-006-02 操作半） ----------
+
+    fn select_palette_item(s: &mut AppState, query: &str) -> usize {
+        s.handle_command(C::OpenCommandPalette);
+        s.handle_command(C::PickerInput(query.into()));
+        let idx = s
+            .command_palette
+            .filtered()
+            .iter()
+            .position(|i| matches!(i, CommandPaletteItem::Local { label, .. } if *label == query))
+            .expect("候选存在");
+        s.command_palette.selection = idx;
+        idx
+    }
+
+    #[test]
+    fn op_fork_requires_active_session_and_dispatches() {
+        let mut s = AppState::default();
+        // 无活动会话 → 提示不发。
+        select_palette_item(&mut s, "fork session");
+        assert!(s.handle_command(C::PickerConfirm).is_empty());
+        assert!(s
+            .command_palette
+            .last_result
+            .as_deref()
+            .unwrap()
+            .contains("无活动会话"));
+        // 有活动会话 → fork 直接发（无参数）。
+        s.handle_command(C::ClosePicker);
+        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        select_palette_item(&mut s, "fork session");
+        let cmds = s.handle_command(C::PickerConfirm);
+        let Cmd::WorkspaceOp { request_id, op } = &cmds[0] else {
+            panic!("预期 WorkspaceOp, cmds={cmds:?}")
+        };
+        assert_eq!(
+            op,
+            &WorkspaceOperation::ForkSession {
+                session_id: SessionId("s1".into())
+            }
+        );
+        assert!(!request_id.is_empty());
+        assert_eq!(
+            s.command_palette.op_inflight.as_ref().unwrap().0,
+            *request_id,
+            "requestId 单飞在途"
+        );
+    }
+
+    #[test]
+    fn op_rename_session_input_stage_then_dispatch() {
+        let mut s = AppState::default();
+        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        select_palette_item(&mut s, "rename session");
+        assert!(s.handle_command(C::PickerConfirm).is_empty());
+        // 进入输入子阶段。
+        assert!(matches!(
+            s.command_palette.stage,
+            Some(PaletteStage::Input {
+                kind: OpArgKind::RenameSession,
+                ..
+            })
+        ));
+        // 空标题拒绝。
+        assert!(s.handle_command(C::PickerConfirm).is_empty());
+        assert!(s
+            .command_palette
+            .last_result
+            .as_deref()
+            .unwrap()
+            .contains("不能为空"));
+        // 输入标题 → Enter 提交。
+        s.handle_command(C::PickerInput("新标题".into()));
+        let cmds = s.handle_command(C::PickerConfirm);
+        let Cmd::WorkspaceOp { op, .. } = &cmds[0] else {
+            panic!("cmds={cmds:?}")
+        };
+        assert_eq!(
+            op,
+            &WorkspaceOperation::RenameSession {
+                session_id: SessionId("s1".into()),
+                title: "新标题".into()
+            }
+        );
+    }
+
+    #[test]
+    fn op_archive_danger_requires_confirm_then_sends_ac006_02() {
+        let mut s = AppState::default();
+        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        select_palette_item(&mut s, "archive session");
+        assert!(s.handle_command(C::PickerConfirm).is_empty());
+        // 进入 ConfirmDanger（未发送）。
+        assert!(matches!(
+            s.command_palette.stage,
+            Some(PaletteStage::ConfirmDanger { .. })
+        ));
+        assert!(s.command_palette.op_inflight.is_none(), "确认前不发送");
+        // Esc 取消（不执行、面板回列表）。
+        s.handle_command(C::ClosePicker);
+        assert!(s.command_palette.stage.is_none());
+        assert!(s.command_palette.visible);
+        // 再次进入并 Enter 确认 → 发送。
+        select_palette_item(&mut s, "archive session");
+        assert!(s.handle_command(C::PickerConfirm).is_empty());
+        let cmds = s.handle_command(C::PickerConfirm);
+        let Cmd::WorkspaceOp { op, .. } = &cmds[0] else {
+            panic!("确认后应发送, cmds={cmds:?}")
+        };
+        assert!(
+            matches!(op, WorkspaceOperation::ArchiveSession { session_id } if session_id.0 == "s1")
+        );
+    }
+
+    #[test]
+    fn op_success_ack_refreshes_and_failure_keeps_local_no_drift_ac006_10() {
+        let mut s = AppState::default();
+        s.command_palette.op_inflight = Some((String::from("req-1"), "rename session"));
+        let cmds = s.handle(AppEvent::WorkspaceOpDone {
+            request_id: "req-1".into(),
+            outcome: OpOutcome::Ack,
+        });
+        assert!(cmds
+            .iter()
+            .any(|c| matches!(c, Cmd::LoadSessionList { .. })));
+        assert!(s.command_palette.op_inflight.is_none());
+        // 失败：error.code 显示、不自动重试、本地不漂移。
+        s.command_palette.op_inflight = Some((String::from("req-2"), "archive session"));
+        let cmds = s.handle(AppEvent::WorkspaceOpFailed {
+            request_id: "req-2".into(),
+            op_name: "archive session".into(),
+            error: ClientError::Remote {
+                code: "PERMISSION_DENIED".into(),
+                message: "denied".into(),
+                class: ErrorClass::PermissionDenied,
+            },
+        });
+        assert!(cmds.is_empty(), "失败不发刷新/重试, cmds={cmds:?}");
+        assert_eq!(
+            s.command_palette.last_error_code.as_deref(),
+            Some("PERMISSION_DENIED")
+        );
+        assert!(s
+            .command_palette
+            .last_result
+            .as_deref()
+            .unwrap()
+            .contains("archive session 失败"));
+        assert!(
+            s.command_palette.op_inflight.is_none(),
+            "在途清除（可重试）"
+        );
+    }
+
+    #[test]
+    fn op_duplicate_or_late_response_is_idempotent_ac006_12() {
+        let mut s = AppState::default();
+        s.command_palette.op_inflight = Some((String::from("req-1"), "rename session"));
+        // 第一次成功 apply（清在途）。
+        let first = s.handle(AppEvent::WorkspaceOpDone {
+            request_id: "req-1".into(),
+            outcome: OpOutcome::Ack,
+        });
+        assert_eq!(first.len(), 1, "第一次刷新列表");
+        assert!(
+            s.notice.as_deref().unwrap().contains("操作成功"),
+            "第一次 apply 设 notice"
+        );
+        let notice_before = s.notice.clone();
+        // 重复响应（同 request_id 迟到重放）→ 在途已清 → 不 apply。
+        let dup = s.handle(AppEvent::WorkspaceOpDone {
+            request_id: "req-1".into(),
+            outcome: OpOutcome::ForkCreated {
+                session_id: "s-new".into(),
+            },
+        });
+        assert!(dup.is_empty(), "重复响应不重复 apply（不重开 fork）");
+        assert_eq!(s.notice, notice_before, "迟到响应不覆盖 notice");
+        assert!(
+            !matches!(
+                s.active_session.as_ref(),
+                Some(x) if x.0 == "s-new"
+            ),
+            "迟到 fork 不打开新会话"
+        );
+    }
+
+    #[test]
+    fn op_fork_success_opens_new_session() {
+        let mut s = AppState::default();
+        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.command_palette.op_inflight = Some((String::from("req-9"), "fork session"));
+        let cmds = s.handle(AppEvent::WorkspaceOpDone {
+            request_id: "req-9".into(),
+            outcome: OpOutcome::ForkCreated {
+                session_id: "s-fork".into(),
+            },
+        });
+        assert!(cmds.iter().any(|c| {
+            matches!(c, Cmd::OpenFollow { session_id, .. } if session_id.0 == "s-fork")
+        }));
+        assert_eq!(
+            s.active_session.as_ref().map(|x| x.0.as_str()),
+            Some("s-fork"),
+            "fork 成功打开新会话"
+        );
     }
 }
