@@ -95,30 +95,26 @@ mod tests {
         .unwrap();
         assert_eq!(v.session_id, "s1");
         assert_eq!(v.label, "部署排查");
-        assert_eq!(v.same_workspace, true);
+        assert!(v.same_workspace);
         assert_eq!(v.mention, "@[部署排查](dsh-session:s1)");
     }
 
     #[test]
     fn array_parser_tolerates_wrappers_and_bad_rows() {
         // bare array
-        let v: Vec<FileReferenceCandidate> = parse_array(
-            serde_json::json!([{"path": "a.rs", "kind": "file"}]),
-            "t",
-        )
-        .unwrap();
+        let v: Vec<FileReferenceCandidate> =
+            parse_array(serde_json::json!([{"path": "a.rs", "kind": "file"}]), "t").unwrap();
         assert_eq!(v.len(), 1);
         // wrapper
-        let v: Vec<FileReferenceCandidate> =
-            parse_array(serde_json::json!({"items": [{"path": "b.rs", "kind": "file"}]}), "t")
-                .unwrap();
-        assert_eq!(v.len(), 1);
-        // bad row skipped, not fatal
         let v: Vec<FileReferenceCandidate> = parse_array(
-            serde_json::json!([{"path": "c.rs"}, {"kind": 5}]),
+            serde_json::json!({"items": [{"path": "b.rs", "kind": "file"}]}),
             "t",
         )
         .unwrap();
+        assert_eq!(v.len(), 1);
+        // bad row skipped, not fatal
+        let v: Vec<FileReferenceCandidate> =
+            parse_array(serde_json::json!([{"path": "c.rs"}, {"kind": 5}]), "t").unwrap();
         assert_eq!(v.len(), 1);
         // empty tolerated
         let v: Vec<FileReferenceCandidate> = parse_array(serde_json::json!({}), "t").unwrap();

@@ -73,8 +73,9 @@ pub async fn interrupt_by_parent(
         }),
     )
     .await?;
-    serde_json::from_value(value)
-        .map_err(|e| ClientError::Protocol(format!("subagents/interruptByParent 响应形状异常: {e}")))
+    serde_json::from_value(value).map_err(|e| {
+        ClientError::Protocol(format!("subagents/interruptByParent 响应形状异常: {e}"))
+    })
 }
 
 #[cfg(test)]
@@ -110,7 +111,11 @@ mod tests {
         assert!(cat.parent_available);
         match &cat.entries[0] {
             crate::api::types::SubagentListEntry::Child {
-                id, activity, has_children, mode, label,
+                id,
+                activity,
+                has_children,
+                mode,
+                label,
             } => {
                 assert_eq!(id, "c1");
                 assert_eq!(activity, "running");

@@ -240,7 +240,9 @@ fn block_lines(
             spans.push(Span::raw(single_line(content)));
             vec![Line::from(spans)]
         }
-        Block::AssistantMessage { seq, chunks, time } => {
+        Block::AssistantMessage {
+            seq, chunks, time, ..
+        } => {
             push_time(&mut spans, *time);
             let running = chunks.rows.is_empty();
             if running {

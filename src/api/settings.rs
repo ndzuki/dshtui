@@ -16,9 +16,7 @@
 use serde_json::Value;
 
 use super::envelope::ClientError;
-use super::types::{
-    SettingsDescribeValue, SettingsNamespaceView, SettingsPathOpView,
-};
+use super::types::{SettingsDescribeValue, SettingsNamespaceView, SettingsPathOpView};
 use super::unary;
 
 /// `settings/describe` — namespaces, schemas, current values and revisions.
@@ -166,7 +164,12 @@ mod tests {
         );
         assert_eq!(args["ns"], "locale");
         assert_eq!(args["expectedRevision"], 3);
-        let args = json_with_expected("settings/mutate", "locale", None, serde_json::json!({"ops": []}));
+        let args = json_with_expected(
+            "settings/mutate",
+            "locale",
+            None,
+            serde_json::json!({"ops": []}),
+        );
         assert!(args.get("expectedRevision").is_none(), "None 不上送");
     }
 }

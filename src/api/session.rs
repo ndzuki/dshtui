@@ -399,4 +399,3 @@ pub fn parse_jobs(value: &Value) -> Vec<super::types::SessionJob> {
     }
     out
 }
-

@@ -115,10 +115,7 @@ fn parse_ref(method: &str, value: Value) -> Result<GoalRef, ClientError> {
 /// Tolerant goal-view parser: prefer `{goal:{...}}` projection shape; accept a
 /// bare GoalSnapshot as fallback (shape `[未验证]`; contract smoke locks it).
 fn parse_snapshot(method: &str, value: Value) -> Result<GoalSnapshot, ClientError> {
-    let inner = value
-        .get("goal")
-        .cloned()
-        .unwrap_or_else(|| value.clone());
+    let inner = value.get("goal").cloned().unwrap_or_else(|| value.clone());
     serde_json::from_value(inner)
         .map_err(|e| ClientError::Protocol(format!("{method} 响应形状异常: {e}")))
 }
@@ -130,8 +127,8 @@ mod tests {
 
     #[test]
     fn goal_ref_and_phase_round_trip() {
-        let r: GoalRef = serde_json::from_value(serde_json::json!({"id": "g1", "revision": 3}))
-            .unwrap();
+        let r: GoalRef =
+            serde_json::from_value(serde_json::json!({"id": "g1", "revision": 3})).unwrap();
         assert_eq!(r.id, "g1");
         assert_eq!(r.revision, 3);
         let p: GoalPhase = serde_json::from_str("\"paused\"").unwrap();
@@ -164,8 +161,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(wrapped.id, "g1");
-        let bare: GoalRef = parse_ref("goals/clear", serde_json::json!({"id": "g1"}))
-            .unwrap();
+        let bare: GoalRef = parse_ref("goals/clear", serde_json::json!({"id": "g1"})).unwrap();
         assert_eq!(bare.revision, 0, "缺 revision 容忍为 0");
     }
 }

@@ -1252,7 +1252,9 @@ async fn subagents_list_flat_args_and_typed_catalog() {
     assert_eq!(cat.entries.len(), 2);
     assert!(cat.parent_available);
     match &cat.entries[0] {
-        SubagentListEntry::Child { id, activity, mode, .. } => {
+        SubagentListEntry::Child {
+            id, activity, mode, ..
+        } => {
             assert_eq!(id, "c1");
             assert_eq!(activity, "running");
             assert_eq!(mode.as_deref(), Some("continuable"));
@@ -1297,7 +1299,9 @@ async fn subagents_prompt_nests_request_and_returns_message_id() {
             parent_session_id: "parent-1".into(),
             child_session_id: "c1".into(),
             mode: "continuable".into(),
-            content: vec![PromptContentPart::Text { text: "继续".into() }],
+            content: vec![PromptContentPart::Text {
+                text: "继续".into(),
+            }],
         },
     )
     .await
@@ -1388,7 +1392,10 @@ async fn goals_create_pause_clear_agent_id_and_cas_args() {
         &http,
         &base,
         "agent-1",
-        &CreateGoalRequest { objective: "交付".into(), max_goal_rounds: None },
+        &CreateGoalRequest {
+            objective: "交付".into(),
+            max_goal_rounds: None,
+        },
     )
     .await
     .unwrap();
@@ -1398,7 +1405,10 @@ async fn goals_create_pause_clear_agent_id_and_cas_args() {
         &http,
         &base,
         "agent-1",
-        &GoalRef { id: "g1".into(), revision: 1 },
+        &GoalRef {
+            id: "g1".into(),
+            revision: 1,
+        },
     )
     .await
     .unwrap();
@@ -1407,7 +1417,10 @@ async fn goals_create_pause_clear_agent_id_and_cas_args() {
         &http,
         &base,
         "agent-1",
-        &GoalRef { id: "g1".into(), revision: 2 },
+        &GoalRef {
+            id: "g1".into(),
+            revision: 2,
+        },
     )
     .await
     .unwrap();
@@ -1630,9 +1643,9 @@ async fn feedback_put_nests_cas_fields_and_lists() {
                     write_json_response(
                         &mut socket,
                         json!({"type": "server-response", "rpcId": rpc_id,
-                               "result": {"ok": true, "value": {
-                                   "items": [{"messageId": "m1", "rating": "positive"}]
-                               }}}),
+                        "result": {"ok": true, "value": {
+                            "items": [{"messageId": "m1", "rating": "positive"}]
+                        }}}),
                     )
                     .await;
                 }
@@ -1655,7 +1668,9 @@ async fn feedback_put_nests_cas_fields_and_lists() {
     .await
     .unwrap();
     assert_eq!(put["accepted"], true);
-    let list = dshtui::api::feedback::list(&http, &base, "sess-1").await.unwrap();
+    let list = dshtui::api::feedback::list(&http, &base, "sess-1")
+        .await
+        .unwrap();
     assert_eq!(list.len(), 1);
     assert_eq!(list[0].rating, "positive");
     server.await.unwrap();
@@ -1679,7 +1694,9 @@ async fn export_downloads_official_route_and_streams_to_file() {
         }
         let head = String::from_utf8_lossy(&raw).into_owned();
         assert!(
-            head.starts_with("GET /api/session.export?sessionId=sess-1&includeDescendants=true HTTP/1.1"),
+            head.starts_with(
+                "GET /api/session.export?sessionId=sess-1&includeDescendants=true HTTP/1.1"
+            ),
             "head={head}"
         );
         // 模拟流式 ZIP 响应体（两段，验证逐 chunk 落盘）。
@@ -1699,24 +1716,14 @@ async fn export_downloads_official_route_and_streams_to_file() {
     // 测试自建独立目录（进程内 /tmp 同一会话可见；结束清理）。
     let tmp = std::env::temp_dir().join(format!("dshtui-export-test-{}", std::process::id()));
     let target = tmp.join("session-export.zip");
-    let receipt = dshtui::api::export::download_export(
-        &http,
-        &format!("http://{addr}"),
-        "sess-1",
-        &target,
-    )
-    .await
-    .unwrap();
+    let receipt =
+        dshtui::api::export::download_export(&http, &format!("http://{addr}"), "sess-1", &target)
+            .await
+            .unwrap();
     assert_eq!(receipt.bytes, body_len());
     assert!(target.exists(), "目标文件落盘");
-    let tmp_name = format!(
-        "session-export.zip.tmp-{}",
-        std::process::id()
-    );
-    assert!(
-        !tmp.join(tmp_name).exists(),
-        "临时文件已改名不残留"
-    );
+    let tmp_name = format!("session-export.zip.tmp-{}", std::process::id());
+    assert!(!tmp.join(tmp_name).exists(), "临时文件已改名不残留");
     let data = std::fs::read(&target).unwrap();
     assert_eq!(&data, b"PK\x03\x04export-bytes");
     // 清理临时目录（测试自建，会话内清理）。
@@ -1738,19 +1745,31 @@ fn control_jobs_parse_baseline_replacement_and_tolerates_bad_rows() {
     ]));
     assert_eq!(jobs.len(), 2);
     assert_eq!(jobs[0].id, "j1");
-    assert_eq!(jobs[0].status, Some(dshtui::api::types::SessionJobStatus::Running));
-    assert_eq!(jobs[1].status, Some(dshtui::api::types::SessionJobStatus::Completed));
+    assert_eq!(
+        jobs[0].status,
+        Some(dshtui::api::types::SessionJobStatus::Running)
+    );
+    assert_eq!(
+        jobs[1].status,
+        Some(dshtui::api::types::SessionJobStatus::Completed)
+    );
 
     // baseline per-session object + wrapper
     let jobs = dshtui::api::session::parse_jobs(&json!({
         "sess-1": [{"id": "j1", "kind": "k", "label": "l", "status": "stopping"}]
     }));
     assert_eq!(jobs.len(), 1);
-    assert_eq!(jobs[0].status, Some(dshtui::api::types::SessionJobStatus::Stopping));
+    assert_eq!(
+        jobs[0].status,
+        Some(dshtui::api::types::SessionJobStatus::Stopping)
+    );
     let jobs = dshtui::api::session::parse_jobs(&json!({
         "items": [{"id": "j3", "kind": "k", "label": "l", "status": "failed"}]
     }));
-    assert_eq!(jobs[0].status, Some(dshtui::api::types::SessionJobStatus::Failed));
+    assert_eq!(
+        jobs[0].status,
+        Some(dshtui::api::types::SessionJobStatus::Failed)
+    );
 
     // bad row skipped, never fatal; empty tolerated
     let jobs = dshtui::api::session::parse_jobs(&json!([
@@ -1758,7 +1777,10 @@ fn control_jobs_parse_baseline_replacement_and_tolerates_bad_rows() {
         {"id": 42}
     ]));
     assert_eq!(jobs.len(), 1);
-    assert_eq!(jobs[0].status, Some(dshtui::api::types::SessionJobStatus::Killed));
+    assert_eq!(
+        jobs[0].status,
+        Some(dshtui::api::types::SessionJobStatus::Killed)
+    );
     assert!(dshtui::api::session::parse_jobs(&json!({})).is_empty());
     assert!(dshtui::api::session::parse_jobs(&json!(null)).is_empty());
 }

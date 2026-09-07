@@ -73,9 +73,12 @@ pub async fn download_export(
         }
         None => std::path::PathBuf::from(&tmp_name),
     };
-    let mut out = tokio::fs::File::create(&tmp_path)
-        .await
-        .map_err(|e| ClientError::Transport(format!("创建临时导出文件失败（{}）: {e}", tmp_path.display())))?;
+    let mut out = tokio::fs::File::create(&tmp_path).await.map_err(|e| {
+        ClientError::Transport(format!(
+            "创建临时导出文件失败（{}）: {e}",
+            tmp_path.display()
+        ))
+    })?;
     let mut bytes: u64 = 0;
     loop {
         let chunk = resp

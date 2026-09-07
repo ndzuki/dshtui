@@ -897,7 +897,7 @@ pub struct SkillListValue {
 }
 
 /// One skill entry.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SkillEntry {
     #[serde(default)]
@@ -997,7 +997,7 @@ pub enum SessionJobStatus {
 }
 
 /// One `SessionJob` (from control baseline.jobs / `jobs` replacement frames).
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionJob {
     #[serde(default)]
@@ -1015,7 +1015,6 @@ pub struct SessionJob {
     #[serde(default)]
     pub finished_at: Option<i64>,
 }
-
 
 #[cfg(test)]
 mod tests {
