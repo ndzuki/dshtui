@@ -1093,6 +1093,13 @@ pub struct AppState {
     pub draft: Option<DraftState>,
     /// Cross-session draft registry (memory only, LRU 20).
     pub drafts: DraftRegistry,
+    /// REQ-007 AC-007-22 / ADR-010: draft persistence switches + dirty flag.
+    /// `drafts_enabled=false` degrades to the memory registry (REQ-003
+    /// semantics); the main loop flushes on `take_draft_dirty()`.
+    pub drafts_enabled: bool,
+    /// 持久化目标路径（main 注入 `default_state_path()`）；None = 不落盘。
+    pub drafts_path: Option<std::path::PathBuf>,
+    draft_dirty: bool,
     /// Global input history (↑/↓, ≤50, memory only).
     pub history: InputHistory,
     /// 搜索 overlay + 窗口索引（随窗口重建）。
@@ -1195,6 +1202,9 @@ impl Default for AppState {
             composer: ComposerState::default(),
             draft: None,
             drafts: DraftRegistry::new(20),
+            drafts_enabled: true,
+            drafts_path: None,
+            draft_dirty: false,
             history: InputHistory::new(50),
             search: SearchState::default(),
             search_index: SearchIndex::new(),
@@ -1323,6 +1333,53 @@ impl AppState {
         };
         self.palette = crate::ui::theme::Palette::build(next, &self.palette_overrides);
         self.notice = Some(format!("主题: {next}"));
+    }
+
+    // ---------- REQ-007 V0.4 draft persistence (AC-007-22/ADR-010) ----------
+
+    /// Mark the draft registry dirty so the main loop flushes drafts.toml.
+    fn mark_drafts_dirty(&mut self) {
+        if self.drafts_enabled {
+            self.draft_dirty = true;
+        }
+    }
+
+    /// Take the dirty flag (main loop polls it each iteration and flushes).
+    pub fn take_draft_dirty(&mut self) -> bool {
+        let dirty = self.draft_dirty;
+        self.draft_dirty = false;
+        dirty
+    }
+
+    /// Snapshot the registry into the on-disk DraftStore table.
+    pub fn draft_store_snapshot(&self) -> crate::model::DraftStore {
+        let mut store = crate::model::DraftStore::default();
+        for sid in self.drafts.session_ids() {
+            if let Some(d) = self.drafts.get(&sid) {
+                store.set(&sid.0, &d.text);
+            }
+        }
+        store
+    }
+
+    /// Seed the in-memory registry from a persisted DraftStore (startup /
+    /// restore). Empty store → no-op (memory semantics unchanged).
+    pub fn seed_drafts_from_store(&mut self, store: crate::model::DraftStore) {
+        for (sid, text) in store.drafts {
+            if !text.is_empty() {
+                self.drafts.set(DraftState {
+                    text,
+                    cursor: 0,
+                    bound_session: SessionId(sid),
+                });
+            }
+        }
+    }
+
+    /// Clear all persisted + in-memory drafts (startup `[drafts].clear`).
+    pub fn clear_all_drafts(&mut self) {
+        self.drafts.clear_all();
+        self.draft_dirty = true;
     }
 
     // ---------- reducer ----------
@@ -1569,6 +1626,7 @@ impl AppState {
                             cursor: 0,
                             bound_session: session_id.clone(),
                         });
+                        self.mark_drafts_dirty();
                     }
                     self.last_error = Some(
                         "steer 不可用（轮次已结束或 agent 未运行），草稿已保留，可改为排队发送"
@@ -2279,6 +2337,7 @@ impl AppState {
         self.composer.steer = false;
         if let Some(d) = self.draft.as_ref() {
             self.drafts.set(d.clone());
+            self.mark_drafts_dirty();
         }
     }
 
@@ -2353,6 +2412,7 @@ impl AppState {
         self.composer.active_session = None;
         // 发送后清空该会话草稿（AC-003-11）+ 记入输入历史（AC-003-10）。
         self.drafts.clear(&sid);
+        self.mark_drafts_dirty();
         self.history.push(&text);
         self.history.reset_nav();
         let request_id = SessionRequestId(crate::api::types::mint_request_id());
@@ -4658,6 +4718,7 @@ impl AppState {
         // 会话切换：把编辑中的草稿存入注册表（D-20 跨会话保留，仅内存）。
         if let Some(d) = self.draft.take() {
             self.drafts.set(d);
+            self.mark_drafts_dirty();
         }
         if let Some(old_id) = self.image_view.attachment_id.clone() {
             self.image_cache.unpin(&old_id);
@@ -7217,5 +7278,83 @@ mod tests {
         s.command_palette.selection = idx;
         let _ = s.handle_command(C::PickerConfirm);
         assert!(!s.palette.is_light(), "来回切换");
+    }
+
+    // ---------- REQ-007 V0.4: draft persistence (AC-007-22/ADR-010) ----------
+
+    #[test]
+    fn draft_dirty_flags_and_snapshot_round_trip_ac007_22() {
+        let mut s = AppState {
+            drafts_enabled: true,
+            ..Default::default()
+        };
+        // 存草稿 → dirty。
+        s.drafts.set(DraftState {
+            text: "草稿A".into(),
+            cursor: 3,
+            bound_session: SessionId("s1".into()),
+        });
+        s.mark_drafts_dirty();
+        assert!(s.take_draft_dirty(), "变更后 dirty 置位");
+        assert!(!s.take_draft_dirty(), "取出即清");
+
+        // snapshot 到 store（session 键控）。
+        let store = s.draft_store_snapshot();
+        assert_eq!(store.get("s1"), Some("草稿A"));
+        assert!(store.get("s2").is_none());
+
+        // 空文本不落盘、store 往返 toml。
+        s.drafts.set(DraftState {
+            text: String::new(),
+            cursor: 0,
+            bound_session: SessionId("s1".into()),
+        });
+        let toml = s.draft_store_snapshot().to_toml().unwrap();
+        assert!(crate::model::DraftStore::from_toml(&toml)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn disabled_drafts_never_dirty_ac007_22() {
+        let mut s = AppState {
+            drafts_enabled: false,
+            ..Default::default()
+        };
+        s.mark_drafts_dirty();
+        assert!(!s.take_draft_dirty(), "disabled 不落盘（纯内存退化）");
+    }
+
+    #[test]
+    fn seed_and_clear_all_drafts_ac007_22() {
+        let mut store = crate::model::DraftStore::default();
+        store.set("s1", "草稿一");
+        store.set("s2", "草稿二");
+        let mut s = AppState::default();
+        s.seed_drafts_from_store(store);
+        assert!(s.drafts.get(&SessionId("s1".into())).is_some(), "启动恢复");
+        assert!(s.drafts.get(&SessionId("s2".into())).is_some());
+        // clear：内存全清 + dirty。
+        s.clear_all_drafts();
+        assert!(s.drafts.is_empty());
+        assert!(s.take_draft_dirty());
+    }
+
+    #[test]
+    fn draft_registry_clear_all_and_session_ids() {
+        let mut reg = crate::model::DraftRegistry::new(20);
+        reg.set(DraftState {
+            text: "a".into(),
+            cursor: 0,
+            bound_session: SessionId("s1".into()),
+        });
+        reg.set(DraftState {
+            text: "b".into(),
+            cursor: 0,
+            bound_session: SessionId("s2".into()),
+        });
+        assert_eq!(reg.session_ids().len(), 2);
+        reg.clear_all();
+        assert!(reg.is_empty());
     }
 }

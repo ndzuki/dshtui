@@ -344,6 +344,26 @@ async fn run_connected(eff: Effective, token: String, client: DshClient) -> Resu
     for w in &palette_warnings {
         eprintln!("警告: {w}");
     }
+    // REQ-007：草稿持久化接线（AC-007-22/ADR-010）——drafts.toml 路径注入 +
+    // 启动恢复/clear。
+    app.drafts_enabled = eff.drafts.enabled;
+    if app.drafts_enabled {
+        app.drafts_path = Some(dshtui::config::default_state_path());
+        if eff.drafts.clear {
+            // 启动清空：内存 + 落盘均清（空表立即写回）。
+            app.clear_all_drafts();
+            flush_drafts(&mut app);
+        } else if app.drafts_path.as_ref().is_some_and(|p| p.exists()) {
+            let path = app.drafts_path.clone().unwrap();
+            match std::fs::read_to_string(&path) {
+                Ok(raw) => match dshtui::model::DraftStore::from_toml(&raw) {
+                    Ok(store) => app.seed_drafts_from_store(store),
+                    Err(e) => eprintln!("警告: drafts.toml 解析失败，回退内存注册表: {e}"),
+                },
+                Err(e) => eprintln!("警告: drafts.toml 读取失败: {e}"),
+            }
+        }
+    }
     let mut decoder = KeyDecoder::new();
     let mut client = Some(client);
     let mut mux: Option<Mux> = None;
@@ -440,10 +460,31 @@ async fn run_connected(eff: Effective, token: String, client: DshClient) -> Resu
         while let Ok(event) = event_rx.try_recv() {
             commands.extend(app.handle(event));
         }
+        // REQ-007：草稿变更后主循环串行 flush（AC-007-22/ADR-010）。
+        if app.take_draft_dirty() {
+            flush_drafts(&mut app);
+        }
     }
     // REQ-004 退出清理：未入缓存的临时文件（缓存目录由 ImageCache Drop 清理）。
     app.cleanup_transient_files();
     Ok(())
+}
+
+/// REQ-007 AC-007-22：把内存草稿注册表 flush 到 drafts.toml（ADR-010 原子
+/// 写 0600）。best-effort：失败仅告警回退内存，不崩溃。
+fn flush_drafts(app: &mut AppState) {
+    let Some(path) = app.drafts_path.clone() else {
+        return;
+    };
+    let store = app.draft_store_snapshot();
+    match store.to_toml() {
+        Ok(toml_str) => {
+            if let Err(e) = dshtui::config::atomic_write_0600(&path, &toml_str) {
+                eprintln!("警告: drafts.toml 写入失败（草稿仍保留在内存）: {e}");
+            }
+        }
+        Err(e) => eprintln!("警告: drafts.toml 序列化失败: {e}"),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
