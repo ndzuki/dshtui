@@ -19,3 +19,8 @@ cache_bytes = 33554432           # 图片/历史缓存上限 32MB
 rss_target_mb = 80               # 超限触发 LRU 释放
 
 [keymap]                         # 默认内置，允许覆盖（后期）
+
+[monitor]                         # REQ-009 V0.3 Agent Town 监控面板
+addr = "http://127.0.0.1:8799"    # OTR agent-server 地址（默认仅连 loopback）
+poll_agents_ms = 2000             # /agents 轮询间隔
+poll_kb_ms = 30000                # /kb-stats 轮询间隔

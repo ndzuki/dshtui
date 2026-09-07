@@ -29,6 +29,10 @@ pub enum CliAction {
     Run,
     Help,
     Version,
+    /// `dshtui monitor [--addr …]`（REQ-009 V0.3 Agent Town 监控面板）。
+    Monitor {
+        addr: Option<String>,
+    },
 }
 
 /// Full structure of `~/.config/dshtui/config.toml` (Notes/02 §7 draft).
@@ -39,6 +43,7 @@ pub struct Config {
     pub ui: UiConfig,
     pub perf: PerfConfig,
     pub keymap: KeymapConfig,
+    pub monitor: MonitorConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -73,6 +78,18 @@ pub struct PerfConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct KeymapConfig {}
 
+/// `dshtui monitor` 配置段（REQ-009 §3 输入契约；D-29 直连 OTR agent-server）。
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct MonitorConfig {
+    /// agent-server 地址（默认 http://127.0.0.1:8799）。
+    pub addr: String,
+    /// `/agents` 轮询间隔。
+    pub poll_agents_ms: u64,
+    /// `/kb-stats` 轮询间隔。
+    pub poll_kb_ms: u64,
+}
+
 /// Effective merged config (CLI overrides file).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Effective {
@@ -80,10 +97,12 @@ pub struct Effective {
     pub token: Option<String>,
     pub ui: UiConfig,
     pub perf: PerfConfig,
+    pub monitor: MonitorConfig,
 }
 
 pub const DEFAULT_URL: &str = "http://127.0.0.1:3080";
 pub const DEFAULT_TOKEN_ENV: &str = "DSH_TOKEN";
+pub const DEFAULT_MONITOR_ADDR: &str = "http://127.0.0.1:8799";
 const DEFAULT_WINDOW_MESSAGES: usize = 200;
 const DEFAULT_PAGE_SIZE: usize = 50;
 const DEFAULT_TICK_MS: u64 = 33;
@@ -96,6 +115,10 @@ const DETAILS_WIDTH_CELLS_MAX: u16 = 60;
 /// 图片缓存预算默认 32MB（REQ-004 §3；pub 供 AppState 默认缓存构造）。
 pub const DEFAULT_CACHE_BYTES: u64 = 32 * 1024 * 1024;
 const DEFAULT_RSS_TARGET_MB: u64 = 80;
+/// `/agents` 轮询间隔默认 2s（FR-009-02）。
+const DEFAULT_POLL_AGENTS_MS: u64 = 2_000;
+/// `/kb-stats` 轮询间隔默认 30s（FR-009-02）。
+const DEFAULT_POLL_KB_MS: u64 = 30_000;
 
 impl Default for ServerConfig {
     fn default() -> Self {
@@ -125,6 +148,16 @@ impl Default for PerfConfig {
             page_size: DEFAULT_PAGE_SIZE,
             cache_bytes: DEFAULT_CACHE_BYTES,
             rss_target_mb: DEFAULT_RSS_TARGET_MB,
+        }
+    }
+}
+
+impl Default for MonitorConfig {
+    fn default() -> Self {
+        Self {
+            addr: DEFAULT_MONITOR_ADDR.to_string(),
+            poll_agents_ms: DEFAULT_POLL_AGENTS_MS,
+            poll_kb_ms: DEFAULT_POLL_KB_MS,
         }
     }
 }
@@ -178,11 +211,21 @@ impl Config {
             },
         };
 
+        // monitor：CLI `--addr` 覆盖配置文件 [monitor].addr（REQ-009 §3）。
+        let mut monitor = self.monitor.clone();
+        if let CliAction::Monitor {
+            addr: Some(addr), ..
+        } = &cli.action
+        {
+            monitor.addr = addr.clone();
+        }
+
         Ok(Effective {
             url,
             token,
             ui: self.ui.clone(),
             perf: self.perf.clone(),
+            monitor,
         })
     }
 
@@ -199,12 +242,20 @@ impl Config {
                 message: "perf.page_size 必须 > 0".to_string(),
             });
         }
+
         // REQ-005 §10：详情列宽 clamp 30–60（越界值收敛而非报错，配置无
         // 破坏性迁移；ui/layout split 亦 clamp 兜底）。
         self.ui.details_width_cells = self
             .ui
             .details_width_cells
             .clamp(DETAILS_WIDTH_CELLS_MIN, DETAILS_WIDTH_CELLS_MAX);
+
+        if self.monitor.poll_agents_ms == 0 || self.monitor.poll_kb_ms == 0 {
+            return Err(ConfigError::InvalidValue {
+                path: PathBuf::new(),
+                message: "monitor.poll_agents_ms / monitor.poll_kb_ms 必须 > 0".to_string(),
+            });
+        }
         Ok(self)
     }
 }
@@ -252,7 +303,8 @@ pub fn default_config_path() -> PathBuf {
 }
 
 /// Parse CLI args. `--token` accepts only an environment variable name; the
-/// secret never enters argv.
+/// secret never enters argv. `dshtui monitor [--addr …] [--log …]` 进入
+/// REQ-009 监控面板子命令。
 /// Compatible with the full argv form: the first argument not starting with
 /// `-` is treated as the program name and skipped (argv[0]).
 pub fn parse_cli<I: IntoIterator<Item = String>>(args: I) -> Result<Cli, String> {
@@ -263,6 +315,35 @@ pub fn parse_cli<I: IntoIterator<Item = String>>(args: I) -> Result<Cli, String>
         if !first.starts_with('-') {
             it.next();
         }
+    }
+    // `monitor` 位置参数（REQ-009 §3 CLI 输入契约）。
+    if it.peek().is_some_and(|a| a == "monitor") {
+        it.next();
+        let mut addr: Option<String> = None;
+        while let Some(arg) = it.next() {
+            match arg.as_str() {
+                "--help" | "-h" => cli.action = CliAction::Help,
+                "--version" | "-V" => cli.action = CliAction::Version,
+                "--addr" => {
+                    let v = it
+                        .next()
+                        .ok_or_else(|| "--addr 需要一个地址参数".to_string())?;
+                    addr = Some(v);
+                }
+                "--log" => {
+                    let v = it
+                        .next()
+                        .ok_or_else(|| "--log 需要一个文件路径参数".to_string())?;
+                    cli.log_file = Some(v);
+                }
+                other => return Err(format!("未知参数: {other}（--help 查看用法）")),
+            }
+        }
+        if matches!(cli.action, CliAction::Help | CliAction::Version) {
+            return Ok(cli);
+        }
+        cli.action = CliAction::Monitor { addr };
+        return Ok(cli);
     }
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -348,6 +429,7 @@ pub fn usage_text() -> String {
 dshtui {version} — 官方 dsh web Remote API 的 Rust TUI 客户端
 
 用法: dshtui [--url <url>] [--token <env-name>] [--log <file>] [--help] [--version]
+      dshtui monitor [--addr <agent-server>] [--log <file>]
 
 选项:
   --url <url>       dsh web 地址（默认 http://127.0.0.1:3080）
@@ -356,10 +438,20 @@ dshtui {version} — 官方 dsh web Remote API 的 Rust TUI 客户端
   -h, --help        显示本帮助
   -V, --version     显示版本
 
+子命令:
+  monitor           Agent Town 监控面板（REQ-009 V0.3）：直连本机 OTR agent-server，
+                    2s 轮询 /agents、30s 轮询 /kb-stats，kitty 终端渲染像素小镇。
+    --addr <url>    agent-server 地址（默认 {monitor_addr}）
+
+kitty 快捷键（可选，写入 ~/.config/kitty/kitty.conf）:
+  map ctrl+shift+a new_tab_with_cwd
+  map ctrl+shift+m launch --type=tab --cwd=current dshtui monitor
+
 token 来源优先级: --token <env> > 环境变量 {token_env} > 配置文件 > 交互粘贴
 ",
         version = env!("CARGO_PKG_VERSION"),
-        token_env = DEFAULT_TOKEN_ENV
+        token_env = DEFAULT_TOKEN_ENV,
+        monitor_addr = DEFAULT_MONITOR_ADDR
     )
 }
 
@@ -598,10 +690,111 @@ window_messages = 100
             token: Some("super-secret-token".into()),
             ui: UiConfig::default(),
             perf: PerfConfig::default(),
+            monitor: MonitorConfig::default(),
         };
         let s = redact_summary(&eff);
         assert!(!s.contains("super-secret-token"));
         assert!(s.contains("***"));
+    }
+
+    // ---------- REQ-009：monitor 子命令 CLI 与配置 ----------
+
+    #[test]
+    fn cli_parses_monitor_subcommand() {
+        let cli = parse_cli(["dshtui".to_string(), "monitor".into()]).unwrap();
+        assert_eq!(cli.action, CliAction::Monitor { addr: None });
+        assert_eq!(cli.log_file, None);
+    }
+
+    #[test]
+    fn cli_parses_monitor_with_addr_and_log() {
+        let cli = parse_cli([
+            "dshtui".to_string(),
+            "monitor".into(),
+            "--addr".into(),
+            "http://127.0.0.1:9000".into(),
+            "--log".into(),
+            "/tmp/mon.log".into(),
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.action,
+            CliAction::Monitor {
+                addr: Some("http://127.0.0.1:9000".into())
+            }
+        );
+        assert_eq!(cli.log_file.as_deref(), Some("/tmp/mon.log"));
+    }
+
+    #[test]
+    fn cli_monitor_rejects_unknown_arg() {
+        let err = parse_cli(["dshtui".to_string(), "monitor".into(), "--nope".into()]).unwrap_err();
+        assert!(err.contains("未知参数"), "err={err}");
+    }
+
+    #[test]
+    fn cli_monitor_missing_addr_value_fails() {
+        assert!(parse_cli(["dshtui".to_string(), "monitor".into(), "--addr".into()]).is_err());
+    }
+
+    #[test]
+    fn monitor_config_defaults_and_file_override() {
+        let cfg = Config::load(Some(std::path::Path::new("/nonexistent/dshtui.toml"))).unwrap();
+        assert_eq!(cfg.monitor.addr, DEFAULT_MONITOR_ADDR);
+        assert_eq!(cfg.monitor.poll_agents_ms, 2000);
+        assert_eq!(cfg.monitor.poll_kb_ms, 30_000);
+
+        let (_dir, path) = tmp_config(
+            r#"
+[monitor]
+addr = "http://127.0.0.1:8799"
+poll_agents_ms = 1000
+poll_kb_ms = 15000
+"#,
+        );
+        let cfg = Config::load(Some(&path)).unwrap();
+        assert_eq!(cfg.monitor.poll_agents_ms, 1000);
+        assert_eq!(cfg.monitor.poll_kb_ms, 15_000);
+    }
+
+    #[test]
+    fn monitor_cli_addr_overrides_config() {
+        let (_dir, path) = tmp_config("[monitor]\naddr = \"http://127.0.0.1:8888\"\n");
+        let cfg = Config::load(Some(&path)).unwrap();
+        let eff = cfg
+            .resolve(&Cli {
+                action: CliAction::Monitor {
+                    addr: Some("http://127.0.0.1:9999".into()),
+                },
+                ..Cli::default()
+            })
+            .unwrap();
+        assert_eq!(eff.monitor.addr, "http://127.0.0.1:9999");
+        // 无 CLI 覆盖时取配置文件。
+        let eff2 = cfg.resolve(&Cli::default()).unwrap();
+        assert_eq!(eff2.monitor.addr, "http://127.0.0.1:8888");
+    }
+
+    #[test]
+    fn validate_rejects_zero_monitor_poll() {
+        let (_dir, path) = tmp_config("[monitor]\npoll_agents_ms = 0\n");
+        assert!(matches!(
+            Config::load(Some(&path)),
+            Err(ConfigError::InvalidValue { .. })
+        ));
+        let (_dir2, path2) = tmp_config("[monitor]\npoll_kb_ms = 0\n");
+        assert!(matches!(
+            Config::load(Some(&path2)),
+            Err(ConfigError::InvalidValue { .. })
+        ));
+    }
+
+    #[test]
+    fn usage_text_mentions_monitor_and_kitty() {
+        let s = usage_text();
+        assert!(s.contains("monitor"), "usage 需含 monitor 子命令");
+        assert!(s.contains("kitty.conf"), "usage 需含 kitty 快捷键指引");
+        assert!(s.contains(DEFAULT_MONITOR_ADDR));
     }
 
     /// Test guard that saves and restores environment variables (failure

@@ -797,7 +797,7 @@ fn stale_attachment_failure_does_not_reconnect_active_session() {
     assert_eq!(app.conn, dshtui::app::ConnState::Ready);
 }
 
-// ============================================================================
+// =====================================================================
 // REQ-005 V0.3 Trajectory 键位矩阵（Seam = KeyDecoder.decode + AppState
 // handle_command；D-25/Notes/04 §3.6）。验收：AC-005-01/04/11。
 // ============================================================================
@@ -1490,4 +1490,101 @@ fn trajectory_goto_bottom_jumps_latest_and_no_page_ac005_07() {
         .view(&app.traj.fold)
         .len();
     assert_eq!(app.traj.cursor, len - 1, "光标跳列表底（最新）");
+}
+
+#[cfg(test)]
+mod monitor_keymap_tests {
+    use super::*;
+    use dshtui::input::{Command, InputMode, KeyDecoder};
+
+    fn key(code: KeyCode) -> Event {
+        Event::Key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    #[test]
+    fn monitor_mode_maps_vim_style_keys() {
+        let mut d = KeyDecoder::new();
+        assert_eq!(
+            d.decode(InputMode::Monitor, key(KeyCode::Char('j'))),
+            Some(Command::MoveDown)
+        );
+        assert_eq!(
+            d.decode(InputMode::Monitor, key(KeyCode::Char('k'))),
+            Some(Command::MoveUp)
+        );
+        assert_eq!(
+            d.decode(InputMode::Monitor, key(KeyCode::Char('G'))),
+            Some(Command::GotoBottom)
+        );
+        assert_eq!(
+            d.decode(InputMode::Monitor, key(KeyCode::Char('c'))),
+            Some(Command::MonitorOpenChat)
+        );
+        assert_eq!(
+            d.decode(InputMode::Monitor, key(KeyCode::Char('f'))),
+            Some(Command::MonitorCheer)
+        );
+        assert_eq!(
+            d.decode(InputMode::Monitor, key(KeyCode::Char('l'))),
+            Some(Command::MonitorLocate)
+        );
+        assert_eq!(
+            d.decode(InputMode::Monitor, key(KeyCode::Char('s'))),
+            Some(Command::MonitorStats)
+        );
+        assert_eq!(
+            d.decode(InputMode::Monitor, key(KeyCode::Char('/'))),
+            Some(Command::StartSearch)
+        );
+        assert_eq!(
+            d.decode(InputMode::Monitor, key(KeyCode::Char('?'))),
+            Some(Command::OpenHelp)
+        );
+        assert_eq!(
+            d.decode(InputMode::Monitor, key(KeyCode::Char('q'))),
+            Some(Command::Quit)
+        );
+        assert_eq!(
+            d.decode(InputMode::Monitor, key(KeyCode::Enter)),
+            Some(Command::OpenFocused)
+        );
+        assert_eq!(
+            d.decode(InputMode::Monitor, key(KeyCode::Esc)),
+            Some(Command::ClosePicker)
+        );
+        // 未映射键不产生命令（不误触）。
+        assert_eq!(d.decode(InputMode::Monitor, key(KeyCode::Char('z'))), None);
+    }
+
+    #[test]
+    fn monitor_gg_is_two_key_goto_top() {
+        let mut d = KeyDecoder::new();
+        assert_eq!(d.decode(InputMode::Monitor, key(KeyCode::Char('g'))), None);
+        assert_eq!(
+            d.decode(InputMode::Monitor, key(KeyCode::Char('g'))),
+            Some(Command::GotoTop)
+        );
+    }
+
+    #[test]
+    fn monitor_ctrl_c_quits_like_global_path() {
+        let mut d = KeyDecoder::new();
+        let ctrl_c = Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert_eq!(d.decode(InputMode::Monitor, ctrl_c), Some(Command::Quit));
+    }
+
+    #[test]
+    fn chat_app_ignores_monitor_commands() {
+        // 主界面 AppState 对 monitor 键位 no-op（两套状态机共存）。
+        let mut app = image_app(false);
+        for cmd in [
+            Command::MonitorOpenChat,
+            Command::MonitorStats,
+            Command::MonitorCheer,
+            Command::MonitorLocate,
+        ] {
+            let cmds = app.handle_command(cmd);
+            assert!(cmds.is_empty(), "Chat 上下文应忽略 monitor 命令");
+        }
+    }
 }

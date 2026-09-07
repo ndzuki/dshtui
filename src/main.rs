@@ -39,7 +39,9 @@ const LOAD_THROUGH_PAGE_SIZE: usize = 200;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    // parse_cli 兼容完整 argv 形式（自跳 argv[0]）——这里不预 skip，
+    // 否则 `dshtui monitor` 位置参数会被当作程序名二次跳过。
+    let args: Vec<String> = std::env::args().collect();
     let cli: Cli = match config::parse_cli(args) {
         Ok(c) => c,
         Err(e) => {
@@ -57,6 +59,7 @@ async fn main() -> ExitCode {
             return ExitCode::SUCCESS;
         }
         CliAction::Run => {}
+        CliAction::Monitor { .. } => {}
     }
 
     let log_path = cli
@@ -93,6 +96,23 @@ async fn main() -> ExitCode {
             "警告: 目标地址 {} 不是 loopback，认证 cookie 将发送到非本机地址，请确认这是你信任的服务器。",
             eff.url
         );
+    }
+
+    // REQ-009：`dshtui monitor` 子命令分派（独立事件循环，REQ-009 §5）。
+    if matches!(cli.action, CliAction::Monitor { .. }) {
+        if !config::is_loopback(&eff.monitor.addr) {
+            eprintln!(
+                "警告: agent-server 地址 {} 不是 loopback（REQ-009 §7 默认仅连本机回环）。",
+                eff.monitor.addr
+            );
+        }
+        return match dshtui::app::monitor::run(eff).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("错误: {e}");
+                ExitCode::from(1)
+            }
+        };
     }
 
     // FR-001-01: token may also be entered interactively (no echo, no history).

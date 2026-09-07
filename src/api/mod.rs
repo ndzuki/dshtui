@@ -9,6 +9,7 @@ pub mod approval;
 pub mod attachment;
 pub mod auth;
 pub mod envelope;
+pub mod monitor;
 pub mod mux;
 pub mod session;
 pub mod types;
