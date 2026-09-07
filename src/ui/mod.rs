@@ -10,6 +10,7 @@ pub mod image;
 pub mod image_view;
 pub mod layout;
 pub mod markdown;
+pub mod mention;
 pub mod model_catalog;
 pub mod monitor;
 pub mod outline;
@@ -107,6 +108,8 @@ pub fn render(frame: &mut Frame<'_>, app: &AppState) {
     model_catalog::render(frame, areas.center, app);
     // REQ-006：命令面板 overlay（`:` 打开）。
     command_palette::render(frame, areas.center, app);
+    // REQ-007：@ 提及（AC-007-23；命令面板之上）。
+    mention::render(frame, frame.area(), app);
     // FR-001-07：帮助 overlay 最后渲染，位于 picker 之上。
     render_help(frame, frame.area(), app);
 }

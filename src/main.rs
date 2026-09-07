@@ -487,6 +487,8 @@ async fn run_connected(eff: Effective, token: String, client: DshClient) -> Resu
                 Mode::ModelCatalog => InputMode::ModelCatalog,
                 // REQ-006：命令面板 overlay（`:` 打开）。
                 Mode::CommandPalette => InputMode::CommandPalette,
+                // REQ-007：@ 提及（AC-007-23）。
+                Mode::Mention => InputMode::Mention,
             };
             if let Some(command) = decoder.decode(mode, input) {
                 commands.extend(app.handle_command(command));
@@ -1010,6 +1012,67 @@ async fn execute_one(
         // 内联处理：此 arm 不应到达（run_connected 循环已拦截）。
         Cmd::ExternalEdit { .. } => {
             app.last_error = Some("外部编辑器需主循环内联处理".into());
+        }
+        // ---------- REQ-007：@ 提及两源拉取（AC-007-23） ----------
+        Cmd::FetchMentionCandidates {
+            generation,
+            agent_id,
+            query,
+        } => {
+            let Some(client) = client.as_ref() else {
+                let event = AppEvent::MentionCandidatesFailed {
+                    generation,
+                    error: ClientError::Transport("未连接（dsh web 不可达）".into()),
+                };
+                commands.extend(app.handle(event));
+                return;
+            };
+            let files = dshtui::api::references::file_references(
+                &client.http,
+                &client.base,
+                &agent_id,
+                &query,
+            )
+            .await;
+            let sessions = dshtui::api::references::session_candidates(
+                &client.http,
+                &client.base,
+                &agent_id,
+                &query,
+            )
+            .await;
+            // 任一源失败不阻塞另一源；两源皆失败才报错。
+            match (files, sessions) {
+                (Ok(files), Ok(sessions)) => {
+                    commands.extend(app.handle(AppEvent::MentionCandidates {
+                        generation,
+                        files,
+                        sessions,
+                    }));
+                }
+                (Err(fe), Err(se)) => {
+                    tracing::warn!(fe = %fe, se = %se, "@ 两源候选拉取均失败");
+                    let code = if fe.code() == "transport" { se } else { fe };
+                    commands.extend(app.handle(AppEvent::MentionCandidatesFailed {
+                        generation,
+                        error: code,
+                    }));
+                }
+                (Ok(files), Err(_)) => {
+                    commands.extend(app.handle(AppEvent::MentionCandidates {
+                        generation,
+                        files,
+                        sessions: Vec::new(),
+                    }));
+                }
+                (Err(_), Ok(sessions)) => {
+                    commands.extend(app.handle(AppEvent::MentionCandidates {
+                        generation,
+                        files: Vec::new(),
+                        sessions,
+                    }));
+                }
+            }
         }
         Cmd::SaveUiTheme { theme, palette } => {
             let result = dshtui::config::save_theme_config(config_path, &theme, &palette);

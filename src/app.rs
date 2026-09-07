@@ -69,6 +69,8 @@ pub enum Mode {
     /// 命令面板 overlay（REQ-006 FR-006-03，`:` 打开；ADR-007 独立模态，
     /// 不串 SEARCH）。
     CommandPalette,
+    /// @ 提及候选（REQ-007 AC-007-23；composer INSERT 内 `@` 触发）。
+    Mention,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -960,6 +962,18 @@ pub enum AppEvent {
         text: String,
         message: String,
     },
+    // ---------- REQ-007 V0.4 @ 提及（AC-007-23） ----------
+    /// `fileReferences/list` + `sessionReferenceResolver/candidates` 结果
+    /// （generation 守卫：stale 丢弃）。
+    MentionCandidates {
+        generation: u64,
+        files: Vec<crate::api::types::FileReferenceCandidate>,
+        sessions: Vec<crate::api::types::SessionReferenceMentionCandidate>,
+    },
+    MentionCandidatesFailed {
+        generation: u64,
+        error: ClientError,
+    },
 }
 
 /// Orchestration commands emitted by the reducer (executed by the run loop).
@@ -1089,6 +1103,13 @@ pub enum Cmd {
         tmp_path: std::path::PathBuf,
         editor: String,
     },
+    /// `@` 两源候选拉取（fileReferences + sessionReferenceResolver；
+    /// generation 单飞去重，AC-007-23）。
+    FetchMentionCandidates {
+        generation: u64,
+        agent_id: String,
+        query: String,
+    },
 }
 
 #[derive(Debug)]
@@ -1168,6 +1189,8 @@ pub struct AppState {
     pub keymap_override_lines: Vec<String>,
     /// REQ-007 AC-007-25：外部编辑器挂起/回填状态机（`edit with $EDITOR`）。
     pub external_edit: crate::model::ExternalEditState,
+    /// REQ-007 AC-007-23：@ 提及候选（files+sessions 两源）。
+    pub mention: crate::model::MentionState,
     page_guard: PageGuard,
     /// 模型目录 fetch 单飞 generation（REQ-006 FR-006-01）：打开时自增，
     /// stale 响应（overlay 已关/已重开）直接丢弃（模式 15 in-flight 去重）。
@@ -1255,6 +1278,7 @@ impl Default for AppState {
             palette_overrides: std::collections::BTreeMap::new(),
             keymap_override_lines: Vec::new(),
             external_edit: crate::model::ExternalEditState::default(),
+            mention: crate::model::MentionState::default(),
             page_guard: PageGuard::default(),
             catalog_generation: 0,
             want_backfill: false,
@@ -1483,6 +1507,124 @@ impl AppState {
             tmp_path: tmp,
             editor,
         }]
+    }
+
+    // ---------- REQ-007 V0.4 @ 提及（AC-007-23；model/mention + api/references） ----------
+
+    /// `@` 词边界判定：@ 前是空或空白（不在路径/单词中间）。
+    fn mention_boundary(draft: &str) -> bool {
+        draft
+            .chars()
+            .last()
+            .map(|c| c.is_whitespace())
+            .unwrap_or(true)
+    }
+
+    /// INSERT 输入 '@' → 激活提及（仅当词边界）。返回激活伴随的拉取命令
+    /// （空 = 未激活）。
+    pub fn maybe_activate_mention(&mut self) -> Vec<Cmd> {
+        if self.mention.active {
+            return vec![];
+        }
+        let boundary = self
+            .draft
+            .as_ref()
+            .map(|d| Self::mention_boundary(&d.text))
+            .unwrap_or(true);
+        if !boundary {
+            return vec![];
+        }
+        self.mention.activate();
+        self.mode = Mode::Mention;
+        self.request_mention_fetch()
+    }
+
+    /// 提及模态命令分流（模式接管：字符进 query、j/k 移动、Enter 回填、
+    /// Esc/q 关闭、Backspace）。
+    fn handle_mention_command(&mut self, cmd: crate::input::Command) -> Option<Vec<Cmd>> {
+        use crate::input::Command as C;
+        match cmd {
+            C::PickerInput(text) => {
+                let q = format!("{}{}", self.mention.query, text);
+                self.mention.set_query(q);
+                Some(self.request_mention_fetch())
+            }
+            C::PickerBackspace => {
+                self.mention.query.pop();
+                Some(self.request_mention_fetch())
+            }
+            C::PickerDown => {
+                self.mention.move_selection(1);
+                Some(vec![])
+            }
+            C::PickerUp => {
+                self.mention.move_selection(-1);
+                Some(vec![])
+            }
+            C::PickerConfirm => {
+                let candidate: Option<crate::model::MentionCandidate> = {
+                    let rows = self.mention.filtered();
+                    rows.get(self.mention.selected).map(|c| (*c).clone())
+                };
+                let Some(candidate) = candidate else {
+                    self.mention.deactivate();
+                    self.mode = Mode::Insert;
+                    return Some(vec![]);
+                };
+                self.mention.deactivate();
+                self.mode = Mode::Insert;
+                if let Some(d) = self.draft.as_mut() {
+                    if !d.text.is_empty() && !d.text.ends_with(' ') && !d.text.ends_with('@') {
+                        d.text.push(' ');
+                    }
+                    d.text.push_str(&candidate.insert);
+                    if !d.text.ends_with(' ') {
+                        d.text.push(' ');
+                    }
+                    d.cursor = d.text.chars().count();
+                }
+                self.notice = Some(format!("@ 已插入: {}", candidate.insert));
+                Some(vec![])
+            }
+            C::ClosePicker => {
+                self.mention.deactivate();
+                self.mode = Mode::Insert;
+                Some(vec![])
+            }
+            // 其它命令：关闭提及落回 INSERT，交由主 match 继续（返回 None）。
+            _ => None,
+        }
+    }
+
+    /// 请求两源候选（generation 单飞；active_session 为 agentId）。
+    fn request_mention_fetch(&mut self) -> Vec<Cmd> {
+        let Some(sid) = self.composer.active_session.clone() else {
+            return vec![];
+        };
+        let query = self.mention.query.clone();
+        self.mention.mark_loading();
+        let gen = self.mention.generation;
+        vec![Cmd::FetchMentionCandidates {
+            generation: gen,
+            agent_id: sid.0.clone(),
+            query,
+        }]
+    }
+
+    /// 两源结果回填（stale 丢弃）。
+    pub fn mention_candidates(
+        &mut self,
+        generation: u64,
+        files: Vec<crate::api::types::FileReferenceCandidate>,
+        sessions: Vec<crate::api::types::SessionReferenceMentionCandidate>,
+    ) {
+        self.mention.set_candidates(generation, files, sessions);
+    }
+
+    pub fn mention_candidates_failed(&mut self, generation: u64, error: &ClientError) {
+        if generation == self.mention.generation {
+            self.mention.fail(error.code());
+        }
     }
 
     /// 编辑器退出回执：成功 → 回填 composer 并恢复 INSERT；失败 → 保留原草稿
@@ -2326,6 +2468,19 @@ impl AppState {
                 self.external_edit_done(ok, &tmp_path, &text, &message);
                 vec![]
             }
+            // ---------- REQ-007 V0.4 @ 提及回执（AC-007-23） ----------
+            AppEvent::MentionCandidates {
+                generation,
+                files,
+                sessions,
+            } => {
+                self.mention_candidates(generation, files, sessions);
+                vec![]
+            }
+            AppEvent::MentionCandidatesFailed { generation, error } => {
+                self.mention_candidates_failed(generation, &error);
+                vec![]
+            }
         }
     }
 
@@ -2910,6 +3065,14 @@ impl AppState {
                 return cmds;
             }
         }
+        // REQ-007：@ 提及模态命令分流（AC-007-23；字符/导航/确认/关闭）。
+        // 返回 None = 提及已关闭且命令应交由既有 mode 路径继续处理。
+        if self.mode == Mode::Mention {
+            if let Some(cmds) = self.handle_mention_command(cmd.clone()) {
+                return cmds;
+            }
+            self.mode = Mode::Insert; // 落回 INSERT 后再走主 match
+        }
         match cmd {
             C::MoveDown
             | C::MoveUp
@@ -3035,6 +3198,9 @@ impl AppState {
                     }
                     vec![]
                 }
+                // REQ-007：@ 提及 Esc 已在 handle_mention_command 拦截
+                // （此 arm 不可达，保穷尽性）。
+                Mode::Mention => vec![],
             },
             C::PickerDown => {
                 if self.approval.list_open && self.mode == Mode::Approval {
@@ -3091,7 +3257,17 @@ impl AppState {
             }
             C::PickerInput(text) => {
                 if self.mode == Mode::Insert {
-                    self.composer_input(&text)
+                    // REQ-007：`@` 词边界触发提及候选（AC-007-23）。
+                    if text == "@" {
+                        let activation = self.maybe_activate_mention();
+                        if !activation.is_empty() {
+                            activation
+                        } else {
+                            self.composer_input(&text)
+                        }
+                    } else {
+                        self.composer_input(&text)
+                    }
                 } else if self.mode == Mode::Search {
                     self.search_input(&text)
                 } else if self.mode == Mode::ModelCatalog {
@@ -7635,5 +7811,130 @@ mod tests {
         assert!(s.last_error.as_deref().unwrap_or("").contains(":edit 失败"));
         assert_eq!(s.mode, Mode::Insert);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---------- REQ-007 V0.4 @ 提及（AC-007-23） ----------
+
+    #[test]
+    fn mention_activated_on_at_in_insert_ac007_23() {
+        let mut s = AppState::default();
+        let sid = SessionId("sess-m".into());
+        s.mode = Mode::Insert;
+        s.composer.visible = true;
+        s.composer.active_session = Some(sid.clone());
+        s.draft = Some(DraftState {
+            text: "去 ".into(),
+            cursor: 3,
+            bound_session: sid.clone(),
+        });
+        // @ 词边界 → 进入 Mention 并发拉取命令。
+        let cmds = s.handle_command(crate::input::Command::PickerInput("@".into()));
+        assert_eq!(s.mode, Mode::Mention, "进入提及模态");
+        assert!(s.mention.active);
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, Cmd::FetchMentionCandidates { .. })),
+            "激活即拉候选"
+        );
+        // 非词边界（@ 在单词中间）不触发。
+        s.mention.deactivate();
+        s.mode = Mode::Insert;
+        s.draft.as_mut().unwrap().text = "foo@".into();
+        s.handle_command(crate::input::Command::PickerInput("@".into()));
+        assert_eq!(s.mode, Mode::Insert, "非词边界 @ 是普通字符");
+    }
+
+    #[test]
+    fn mention_query_navigate_confirm_and_close_ac007_23() {
+        let mut s = AppState::default();
+        let sid = SessionId("sess-m".into());
+        s.mode = Mode::Insert;
+        s.composer.visible = true;
+        s.composer.active_session = Some(sid.clone());
+        s.draft = Some(DraftState {
+            text: "去 ".into(),
+            cursor: 3,
+            bound_session: sid.clone(),
+        });
+        s.handle_command(crate::input::Command::PickerInput("@".into()));
+        assert_eq!(s.mode, Mode::Mention);
+        // 字符进 query。
+        s.handle_command(crate::input::Command::PickerInput("s".into()));
+        assert_eq!(s.mention.query, "s");
+        // 候选回填（file + session 两源）。
+        s.mention.set_candidates(
+            s.mention.generation,
+            vec![crate::api::types::FileReferenceCandidate {
+                path: "src/api/mod.rs".into(),
+                kind: "file".into(),
+            }],
+            vec![crate::api::types::SessionReferenceMentionCandidate {
+                session_id: "s1".into(),
+                label: "部署".into(),
+                cwd: None,
+                same_workspace: true,
+                created_at: None,
+                mention: "@[部署](dsh-session:s1)".into(),
+            }],
+        );
+        assert_eq!(s.mention.filtered().len(), 2);
+        // j 移动 + Enter 回填第一候选（文件）——排序 file 在前。
+        s.handle_command(crate::input::Command::PickerDown);
+        s.handle_command(crate::input::Command::PickerUp);
+        let cmds = s.handle_command(crate::input::Command::PickerConfirm);
+        assert_eq!(s.mode, Mode::Insert, "确认回 INSERT");
+        assert!(!s.mention.active);
+        assert!(
+            s.draft
+                .as_ref()
+                .map(|d| d.text.as_str())
+                .unwrap_or("")
+                .contains("src/api/mod.rs"),
+            "文件候选回填 composer"
+        );
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn mention_esc_closes_back_to_insert_ac007_23() {
+        let mut s = AppState::default();
+        let sid = SessionId("sess-m".into());
+        s.mode = Mode::Insert;
+        s.composer.visible = true;
+        s.composer.active_session = Some(sid.clone());
+        s.draft = Some(DraftState {
+            text: "".into(),
+            cursor: 0,
+            bound_session: sid.clone(),
+        });
+        s.handle_command(crate::input::Command::PickerInput("@".into()));
+        assert_eq!(s.mode, Mode::Mention);
+        s.handle_command(crate::input::Command::ClosePicker);
+        assert_eq!(s.mode, Mode::Insert);
+        assert!(!s.mention.active);
+        assert!(s.composer.visible, "composer 保留");
+    }
+
+    #[test]
+    fn mention_fetch_failure_degrades_not_crash_ac007_23() {
+        let mut s = AppState::default();
+        let sid = SessionId("sess-m".into());
+        s.mode = Mode::Insert;
+        s.composer.visible = true;
+        s.composer.active_session = Some(sid.clone());
+        s.draft = Some(DraftState {
+            text: "".into(),
+            cursor: 0,
+            bound_session: sid.clone(),
+        });
+        s.handle_command(crate::input::Command::PickerInput("@".into()));
+        let gen = s.mention.generation;
+        let _ = s.handle(AppEvent::MentionCandidatesFailed {
+            generation: gen,
+            error: ClientError::Transport("断网".into()),
+        });
+        assert!(!s.mention.loading, "失败停 loading");
+        assert_eq!(s.mention.last_error_code.as_deref(), Some("transport"));
+        assert_eq!(s.mode, Mode::Mention, "失败不崩，可 Esc 手动输入");
     }
 }

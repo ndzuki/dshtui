@@ -38,6 +38,8 @@ pub enum InputMode {
     CommandPalette,
     /// REQ-009 V0.3：MONITOR 模式（`dshtui monitor` 独立键位表）。
     Monitor,
+    /// REQ-007 V0.4：@ 提及候选（composer INSERT 内 `@` 触发；AC-007-23）。
+    Mention,
 }
 
 /// Domain commands emitted by the input layer.
@@ -224,6 +226,7 @@ impl KeyDecoder {
             InputMode::ModelCatalog => self.model_catalog(key),
             InputMode::CommandPalette => self.command_palette(key),
             InputMode::Monitor => self.monitor(key),
+            InputMode::Mention => self.mention(key),
         }
     }
 
@@ -587,6 +590,27 @@ impl KeyDecoder {
         }
     }
 
+    /// REQ-007 @ 提及候选键位（AC-007-23）：普通字符进候选 query（本地即时
+    /// 过滤 + 两源异步拉取）、j/k/↑↓ 移动命中、Enter 回填、Esc/q 关闭回
+    /// INSERT、Backspace 删候选 query 字符。
+    fn mention(&mut self, key: KeyEvent) -> Option<Command> {
+        self.pending_g = false;
+        match key.code {
+            KeyCode::Esc => Some(Command::ClosePicker),
+            KeyCode::Char('q') if key.modifiers.is_empty() => Some(Command::ClosePicker),
+            KeyCode::Enter if key.modifiers.is_empty() => Some(Command::PickerConfirm),
+            KeyCode::Up => Some(Command::PickerUp),
+            KeyCode::Down => Some(Command::PickerDown),
+            KeyCode::Char('k') if key.modifiers.is_empty() => Some(Command::PickerUp),
+            KeyCode::Char('j') if key.modifiers.is_empty() => Some(Command::PickerDown),
+            KeyCode::Backspace => Some(Command::PickerBackspace),
+            KeyCode::Char(c) if key.modifiers.is_empty() => {
+                Some(Command::PickerInput(c.to_string()))
+            }
+            _ => None,
+        }
+    }
+
     /// REQ-009 MONITOR 键位（FR-009-04，vim 风格）：`j/k` 焦点、`gg/G` 首尾、
     /// `Enter` 详情、`c` 问答、`f` 加油、`l` 定位、`s` KB 统计、`/` 过滤、
     /// `q` 退出、`?` 帮助。Chat/Filter 输入态复用 Insert 语义（Esc/Enter/
@@ -925,7 +949,8 @@ fn mode_name_of(mode: InputMode) -> &'static str {
         | InputMode::Search
         | InputMode::TrajectoryFilter
         | InputMode::ModelCatalog
-        | InputMode::CommandPalette => "input(不可覆盖)",
+        | InputMode::CommandPalette
+        | InputMode::Mention => "input(不可覆盖)",
     }
 }
 
