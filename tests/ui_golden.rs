@@ -568,6 +568,27 @@ fn image_view_mode_shows_image_status_and_actions() {
     assert!(text.contains("加载中"), "text={text}");
 }
 
+#[test]
+fn image_view_pager_tag_renders_when_group_ac007_06() {
+    // 同消息多图（pager total=3, index 1）→ 标题 `(2/3)`。
+    let mut app = AppState::default();
+    app.conn = ConnState::Ready;
+    app.mode = dshtui::app::Mode::ImageView;
+    app.image_view.open_view(
+        SessionSeq(5),
+        dshtui::api::types::AttachmentId("att-y".into()),
+        Some("y.png".into()),
+        Some("10x20".into()),
+    );
+    app.image_view.set_pager(3, 1);
+    let backend = TestBackend::new(100, 12);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::render(frame, &app)).unwrap();
+    let text = rendered_text(&terminal);
+    assert!(text.contains("(2/3)"), "pager 标签, text={text}");
+    assert!(text.contains("y.png"), "text={text}");
+}
+
 // ============================================================================
 // REQ-005 V0.3 Trajectory UI golden（Seam = ratatui TestBackend + ui::render；
 // 计划 Step 5 测试 Seam 行）。验收：AC-005-01/02/03/06/10/15 渲染侧。

@@ -4174,6 +4174,12 @@ impl AppState {
         let Some(block) = self.focused_image_block() else {
             return vec![];
         };
+        self.open_image_block(block)
+    }
+
+    /// 打开指定图片块（聚焦图片 / 同消息 pager 共用）：组 pager 由当前窗口
+    /// 图片 run 计算（AC-007-06）。
+    fn open_image_block(&mut self, block: crate::model::ImageBlockRef) -> Vec<Cmd> {
         if self.mode == Mode::ImageView {
             // AC-004-08：不叠加第二个 ImageView。
             return vec![];
@@ -4190,6 +4196,22 @@ impl AppState {
         let Some(session_id) = self.active_session.clone() else {
             return vec![];
         };
+        // REQ-007：同消息组 pager（连续 Image 块 run；单图 = total 1）。
+        let (pager_total, pager_index) = self
+            .active_window()
+            .and_then(|w| crate::model::image::image_run_of(&w.block_snapshot(), block.seq))
+            .map(|(_start, total, index)| (total, index))
+            .unwrap_or((1, 0));
+        let open_view = |this: &mut Self| {
+            this.image_view.open_view(
+                block.seq,
+                att_id.clone(),
+                block.name.clone(),
+                block.dims.clone(),
+            );
+            this.image_view.set_pager(pager_total, pager_index);
+            this.mode = Mode::ImageView;
+        };
         match self.image_cache.acquire(&att_id) {
             crate::cache::image_cache::Acquire::Cached(entry) => {
                 if !self.kitty_capable {
@@ -4200,13 +4222,7 @@ impl AppState {
                     }];
                 }
                 self.image_cache.pin(&att_id);
-                self.image_view.open_view(
-                    block.seq,
-                    att_id.clone(),
-                    block.name.clone(),
-                    block.dims.clone(),
-                );
-                self.mode = Mode::ImageView;
+                open_view(self);
                 vec![Cmd::RenderCachedImage {
                     session_id,
                     attachment_id: att_id,
@@ -4230,13 +4246,7 @@ impl AppState {
                     }];
                 }
                 self.image_cache.pin(&att_id);
-                self.image_view.open_view(
-                    block.seq,
-                    att_id.clone(),
-                    block.name.clone(),
-                    block.dims.clone(),
-                );
-                self.mode = Mode::ImageView;
+                open_view(self);
                 vec![Cmd::FetchAttachment {
                     session_id,
                     attachment_id: att_id,
@@ -4245,6 +4255,48 @@ impl AppState {
                 }]
             }
         }
+    }
+
+    /// REQ-007 AC-007-06：同消息多图 pager 步进（`[`/`]`，ImageView 内）。
+    /// 关旧图（unpin + close）→ 定位同 run 内相邻 seq → 重开（复用既有
+    /// 缓存/拉取单飞管线）。
+    fn image_view_pager_step(&mut self, delta: i8) -> Vec<Cmd> {
+        if self.mode != Mode::ImageView {
+            return vec![];
+        }
+        let Some(cur_seq) = self.image_view.block_seq else {
+            return vec![];
+        };
+        let Some(window) = self.active_window() else {
+            return vec![];
+        };
+        let blocks = window.block_snapshot();
+        let Some((start, total, index)) = crate::model::image::image_run_of(&blocks, cur_seq)
+        else {
+            return vec![];
+        };
+        let next = index as isize + delta as isize;
+        if next < 0 || next as usize >= total {
+            return vec![]; // 组边界停留
+        }
+        let target_seq = blocks[start + next as usize].seq();
+        let Some(sibling) = blocks
+            .get(start + next as usize)
+            .and_then(crate::model::image::image_block_of)
+        else {
+            return vec![];
+        };
+        // 关旧图并推进 pager 状态到新块（open 会重算 pager）。同步单帧内
+        // 完成，先退 Normal 再走 open_image_block（其 ImageView 防叠加守卫
+        // 会误拦 pager 重开）。
+        if let Some(old) = self.image_view.attachment_id.clone() {
+            self.image_cache.unpin(&old);
+        }
+        self.image_view.close();
+        self.mode = Mode::Normal;
+        let cmds = self.open_image_block(sibling);
+        let _ = target_seq;
+        cmds
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4499,6 +4551,10 @@ impl AppState {
                 } else {
                     self.scroll(cmd)
                 }
+            }
+            C::ImageViewPager { delta } => {
+                // 仅 ImageView 模态有意义（pager 步进）。
+                self.image_view_pager_step(delta)
             }
             C::SubagentInterrupt => {
                 // 仅 subagent 模态上下文有意义（已在 handle_subagent_command
@@ -10337,5 +10393,95 @@ mod tests {
             s.message_action.last_error_code.as_deref(),
             Some("session/fork-unavailable")
         );
+    }
+
+    // ---------- REQ-007 V0.4 图片同消息 pager（AC-007-06/30） ----------
+
+    #[test]
+    fn image_pager_step_cycles_sibling_images_ac007_06() {
+        let mut s = AppState {
+            kitty_capable: true, // ImageView pager 仅 Kitty 路径
+            ..Default::default()
+        };
+        let sid = SessionId("sess-img".into());
+        s.active_session = Some(sid.clone());
+        // 会话窗口：连续 3 图（seq 10/11/12）。
+        let w = s.sessions.touch(&sid.0, 50);
+        let records = (10u64..=12)
+            .map(|seq| SessionHistoryRecord::Event {
+                event: SessionWireEvent {
+                    event_type: "image".into(),
+                    seq: Some(SessionSeq(seq)),
+                    time: None,
+                    request_id: None,
+                    ignorable: None,
+                    source_event_seqs: None,
+                    surface_op: None,
+                    data: Some(serde_json::json!({
+                        "attachmentId": format!("a{seq}"),
+                        "width": 8, "height": 8
+                    })),
+                },
+            })
+            .collect::<Vec<_>>();
+        let _ = w.apply(Incoming::Snapshot {
+            cursor: None,
+            records,
+            has_more: false,
+            projections: None,
+        });
+        // 打开中间图（seq 11）——直接置 view（fetch 路径由 execute_one 驱动，
+        // 这里仅验证 run/pager 计算与步进命令）。
+        s.image_cache.abort(&AttachmentId("a11".into()));
+        let blocks = s.active_window().unwrap().block_snapshot();
+        assert_eq!(blocks.len(), 3, "窗口 3 块: {blocks:?}");
+        assert!(
+            blocks
+                .iter()
+                .all(|b| matches!(b, crate::model::Block::Image { .. })),
+            "全为 Image: {blocks:?}"
+        );
+        let (start, total, index) =
+            crate::model::image::image_run_of(&blocks, SessionSeq(11)).unwrap();
+        assert_eq!((start, total, index), (0, 3, 1), "连续 3 图 run");
+        s.image_view
+            .open_view(SessionSeq(11), AttachmentId("a11".into()), None, None);
+        s.image_view.set_pager(total, index);
+        s.mode = Mode::ImageView;
+        // `]` → 步进到 seq 12。
+        let cmds = s.handle_command(crate::input::Command::ImageViewPager { delta: 1 });
+        assert_eq!(s.image_view.block_seq, Some(SessionSeq(12)), "步进到下一图");
+        assert_eq!(s.image_view.pager.as_ref().map(|p| p.index), Some(2));
+        // `[` → 回 seq 11。
+        let back_cmds = s.handle_command(crate::input::Command::ImageViewPager { delta: -1 });
+        assert_eq!(
+            s.image_view.block_seq,
+            Some(SessionSeq(11)),
+            "回 seq11 (cmds={back_cmds:?})"
+        );
+        // 真实循环中离开后 on_attachment_ready 对非目标会 abort+清 loading；
+        // 单测无 fetch 完成，模拟该清理再步进 12。
+        s.image_cache.abort(&AttachmentId("a12".into()));
+        s.image_loading.remove(&AttachmentId("a12".into()));
+        let _ = s.handle_command(crate::input::Command::ImageViewPager { delta: 1 });
+        assert_eq!(s.image_view.block_seq, Some(SessionSeq(12)), "再次步进 12");
+        // 组边界停留（seq 12 再 ] 不动）。
+        s.image_cache.abort(&AttachmentId("a11".into()));
+        s.image_loading.remove(&AttachmentId("a11".into()));
+        let _ = s.handle_command(crate::input::Command::ImageViewPager { delta: 1 });
+        assert_eq!(s.image_view.block_seq, Some(SessionSeq(12)), "组尾停留");
+        let _cmds = cmds;
+        let _ = back_cmds;
+    }
+
+    #[test]
+    fn image_pager_closed_and_no_pager_when_single_image() {
+        let mut s = AppState::default();
+        s.image_view
+            .open_view(SessionSeq(1), AttachmentId("a1".into()), None, None);
+        s.image_view.set_pager(1, 0);
+        assert!(s.image_view.pager.is_none() || s.image_view.pager.as_ref().unwrap().total == 1);
+        s.image_view.close();
+        assert!(s.image_view.pager.is_none());
     }
 }

@@ -133,6 +133,15 @@ pub struct ImageViewError {
     pub message: String,
 }
 
+/// REQ-007 AC-007-06/30：同消息多图 pager（additive，仅 Kitty ImageView）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImagePager {
+    /// 同一消息内连续图片块总数。
+    pub total: usize,
+    /// 当前图在组内下标（0-based）。
+    pub index: usize,
+}
+
 /// ImageView 状态（REQ-004 §5 字段表；仅 Kitty 渲染态出现）。
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ImageViewState {
@@ -144,6 +153,24 @@ pub struct ImageViewState {
     pub dims: Option<String>,
     pub phase: ImageViewPhase,
     pub error: Option<ImageViewError>,
+    /// REQ-007：同消息多图 pager（Some = 组内可 [ ] 切换；None = 单图）。
+    pub pager: Option<ImagePager>,
+}
+
+/// 计算图片组（同一消息内连续 Image 块的 run）：返回 (run_start, total,
+/// current_index)。
+pub fn image_run_of(blocks: &[Block], seq: SessionSeq) -> Option<(usize, usize, usize)> {
+    let is_img = |b: &Block| matches!(b, Block::Image { .. });
+    let pos = blocks.iter().position(|b| b.seq() == seq && is_img(b))?;
+    let mut start = pos;
+    while start > 0 && is_img(&blocks[start - 1]) {
+        start -= 1;
+    }
+    let mut end = start;
+    while end < blocks.len() && is_img(&blocks[end]) {
+        end += 1;
+    }
+    Some((start, end - start, pos - start))
 }
 
 impl ImageViewState {
@@ -184,6 +211,28 @@ impl ImageViewState {
         self.dims = None;
         self.phase = ImageViewPhase::Closed;
         self.error = None;
+        self.pager = None;
+    }
+
+    /// 打开时记录同消息组 pager（多图切换 `[`/`]`）。
+    pub fn set_pager(&mut self, total: usize, index: usize) {
+        self.pager = Some(ImagePager {
+            total: total.max(1),
+            index: index.min(total.saturating_sub(1)),
+        });
+    }
+
+    /// pager 步进（delta ±1；返回是否可再走）。
+    pub fn move_pager(&mut self, delta: i8) -> bool {
+        let Some(p) = self.pager.as_mut() else {
+            return false;
+        };
+        let next = p.index as isize + delta as isize;
+        if next < 0 || next as usize >= p.total {
+            return false;
+        }
+        p.index = next as usize;
+        true
     }
 }
 
@@ -199,6 +248,64 @@ mod tests {
         }
         assert!(!is_supported_image("image/svg+xml"));
         assert!(!is_supported_image(""));
+    }
+
+    #[test]
+    fn image_run_of_groups_contiguous_images_ac007_06() {
+        use crate::api::types::{ChunkData, ChunkRow, SessionSeq as Seq};
+        use crate::model::PackedChunks;
+        let img = |seq: u64| Block::Image {
+            seq: Seq(seq),
+            attachment_id: Some(format!("a{seq}")),
+            name: None,
+            dims: None,
+        };
+        let blocks = vec![
+            img(1),
+            img(2),
+            Block::UserMessage {
+                seq: Seq(3),
+                content: "之间".into(),
+                time: None,
+            },
+            img(4),
+            img(5),
+            img(6),
+        ];
+        // seq=1 组: (start0,total2,idx0)
+        assert_eq!(image_run_of(&blocks, Seq(1)), Some((0, 2, 0)));
+        // seq=2 → (0,2,1)
+        assert_eq!(image_run_of(&blocks, Seq(2)), Some((0, 2, 1)));
+        // seq=5 → 组在 idx3..6 (start3,total3,idx1)
+        assert_eq!(image_run_of(&blocks, Seq(5)), Some((3, 3, 1)));
+        // 非图片 seq 不命中
+        assert_eq!(image_run_of(&blocks, Seq(3)), None);
+        // 越界/缺失 seq → None
+        assert_eq!(image_run_of(&blocks, Seq(99)), None);
+        let _ = PackedChunks::default();
+        let _ = ChunkData::default();
+        let _ = ChunkRow::Unknown {
+            event_type: String::new(),
+            raw: serde_json::Value::Null,
+        };
+    }
+
+    #[test]
+    fn image_view_pager_move_and_close_clears_ac007_06() {
+        let mut v = ImageViewState {
+            open: true,
+            ..Default::default()
+        };
+        v.set_pager(3, 1);
+        assert_eq!(v.pager.as_ref().map(|p| (p.total, p.index)), Some((3, 1)));
+        assert!(v.move_pager(1));
+        assert_eq!(v.pager.as_ref().map(|p| p.index), Some(2));
+        assert!(!v.move_pager(1), "到组尾不能再走");
+        assert!(v.move_pager(-1));
+        assert!(v.move_pager(-1));
+        assert_eq!(v.pager.as_ref().map(|p| p.index), Some(0));
+        v.close();
+        assert!(v.pager.is_none(), "close 清 pager");
     }
 
     #[test]

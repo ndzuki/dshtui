@@ -128,6 +128,10 @@ pub enum Command {
     HistoryPrev,
     HistoryNext,
     // ---------- REQ-004 IMAGEVIEW 级键位（D-14） ----------
+    /// REQ-007 AC-007-06：`[`/`]` 同消息多图 pager 步进（ImageView 内）。
+    ImageViewPager {
+        delta: i8,
+    },
     /// `y`：复制图片路径/附件名。
     ImageViewCopy,
     /// `o`：系统查看器打开原图。
@@ -621,6 +625,12 @@ impl KeyDecoder {
             KeyCode::Char('o') if key.modifiers.is_empty() => Some(Command::ImageViewOpenExternal),
             KeyCode::Char('y') if key.modifiers.is_empty() => Some(Command::ImageViewCopy),
             KeyCode::Char('q') if key.modifiers.is_empty() => Some(Command::ImageViewClose),
+            KeyCode::Char(']') if key.modifiers.is_empty() => {
+                Some(Command::ImageViewPager { delta: 1 })
+            }
+            KeyCode::Char('[') if key.modifiers.is_empty() => {
+                Some(Command::ImageViewPager { delta: -1 })
+            }
             _ => None,
         }
     }
@@ -912,6 +922,8 @@ fn default_key_tables() -> std::collections::BTreeMap<InputMode, Vec<(&'static s
             ("image_view_open_external", 'o', ImageViewOpenExternal),
             ("image_view_copy", 'y', ImageViewCopy),
             ("image_view_close", 'q', ImageViewClose),
+            ("image_view_pager_next", ']', ImageViewPager { delta: 1 }),
+            ("image_view_pager_prev", '[', ImageViewPager { delta: -1 }),
         ],
     );
     m.insert(
@@ -1445,6 +1457,15 @@ mod image_view_tests {
         assert_eq!(
             d.decode(InputMode::ImageView, key(KeyCode::Char('q'))),
             Some(Command::ImageViewClose)
+        );
+        // REQ-007 AC-007-06：`[`/`]` 同消息 pager。
+        assert_eq!(
+            d.decode(InputMode::ImageView, key(KeyCode::Char(']'))),
+            Some(Command::ImageViewPager { delta: 1 })
+        );
+        assert_eq!(
+            d.decode(InputMode::ImageView, key(KeyCode::Char('['))),
+            Some(Command::ImageViewPager { delta: -1 })
         );
         // 其余键不产生命令（不误触）。
         assert_eq!(

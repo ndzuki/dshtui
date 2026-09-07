@@ -26,19 +26,33 @@ pub fn render(
         .constraints([Constraint::Length(1), Constraint::Min(1)])
         .split(area);
 
-    // 标题行：`名称 · 宽×高`（05 §10）。
+    // 标题行：`名称 · 宽×高`（05 §10）+ 同消息多图 pager `(i/N)`（AC-007-06）。
+    let pager_tag = view
+        .pager
+        .as_ref()
+        .filter(|p| p.total > 1)
+        .map(|p| format!("({}/{}) ", p.index + 1, p.total))
+        .unwrap_or_default();
     let title = match (&view.name, &view.dims) {
         (Some(name), Some(dims)) => format!(" {name} · {dims} "),
         (Some(name), None) => format!(" {name} "),
         (None, Some(dims)) => format!(" image · {dims} "),
         (None, None) => " image ".into(),
     };
-    let title_line = Line::from(Span::styled(
-        title,
-        Style::default()
-            .fg(Color::LightMagenta)
-            .add_modifier(Modifier::BOLD),
-    ));
+    let title_line = Line::from(vec![
+        Span::styled(
+            pager_tag,
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            title,
+            Style::default()
+                .fg(Color::LightMagenta)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]);
     frame.render_widget(Paragraph::new(title_line), chunks[0]);
 
     let body = chunks[1];
