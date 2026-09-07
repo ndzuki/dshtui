@@ -421,6 +421,187 @@ pub struct ApprovalEvent {
     pub raw: serde_json::Value,
 }
 
+// ---------- REQ-006 model catalog / commands / workspace / session mutation
+// wire types (V0.3; official read 0.1.2-rc.1 from typert.remote-client.js) ----------
+
+/// Official `ModelSelection` wire shape (`{provider, model, reasoningEffort?}`).
+/// The status bar models both this and the legacy string form (`Notes/03 §5`
+/// alpha.3), so reads are tolerant (see `model_selection_display`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct WireModelSelection {
+    #[serde(default)]
+    pub provider: String,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+}
+
+impl WireModelSelection {
+    /// `provider/model` display string (empty when unset).
+    pub fn display(&self) -> String {
+        if self.provider.is_empty() {
+            self.model.clone()
+        } else if self.model.is_empty() {
+            self.provider.clone()
+        } else {
+            format!("{}/{}", self.provider, self.model)
+        }
+    }
+}
+
+/// One model entry inside a provider group.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelCatalogModel {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Optional reasoning metadata for this exact route (`efforts` + default).
+    #[serde(default)]
+    pub reasoning: Option<ModelReasoning>,
+}
+
+/// Adapter-owned reasoning metadata for one model route.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelReasoning {
+    #[serde(default)]
+    pub efforts: Vec<ModelReasoningEffort>,
+    #[serde(default)]
+    pub default_effort: Option<String>,
+}
+
+/// One selectable reasoning effort (id/name/description).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelReasoningEffort {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+/// One provider group with its loaded models.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelProviderGroup {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub models: Vec<ModelCatalogModel>,
+}
+
+/// A provider whose catalog lookup failed (shown as a collapsed failure row).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelCatalogFailure {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub message: String,
+}
+
+/// `session/modelCatalog` response (`default`, `routableProviders`, `groups`,
+/// `failures`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelCatalog {
+    #[serde(default)]
+    pub default: Option<WireModelSelection>,
+    #[serde(default)]
+    pub routable_providers: Vec<String>,
+    #[serde(default)]
+    pub groups: Vec<ModelProviderGroup>,
+    #[serde(default)]
+    pub failures: Vec<ModelCatalogFailure>,
+}
+
+/// `session/fork` response.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionForkValue {
+    #[serde(default)]
+    pub session_id: String,
+}
+
+/// `session/rename` response.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionRenameValue {
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub seq: i64,
+}
+
+/// `session/create` response.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionCreateValue {
+    #[serde(default)]
+    pub session_id: String,
+    #[serde(default)]
+    pub agent_preset: Option<String>,
+}
+
+/// `commands/list` one command descriptor (`{name, description, input?}`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CommandDescriptor {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub input: Option<CommandInputSpec>,
+}
+
+/// `commands/list` per-command `input` spec.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CommandInputSpec {
+    #[serde(default)]
+    pub hint: String,
+    #[serde(default)]
+    pub images: Option<bool>,
+}
+
+/// `commands/execute` result (may be `undefined` on the wire when the server
+/// decides there is nothing to report; the api layer tolerates that and maps
+/// it to a success with no text).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CommandExecution {
+    #[serde(default)]
+    pub command_id: String,
+    #[serde(default)]
+    pub result: Option<CommandExecutionResult>,
+}
+
+/// One `commands/execute` result body (`{kind: success|error, text?,
+/// sourceEventSeq?}`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CommandExecutionResult {
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub source_event_seq: Option<i64>,
+}
+
 // ---------- session list (session/list lightweight metadata, Notes/06 §1) ----------
 
 /// The TUI keeps only a lightweight structure (~500B/item); the rest of the

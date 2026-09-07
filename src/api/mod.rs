@@ -8,6 +8,7 @@
 pub mod approval;
 pub mod attachment;
 pub mod auth;
+pub mod commands;
 pub mod envelope;
 pub mod monitor;
 pub mod mux;

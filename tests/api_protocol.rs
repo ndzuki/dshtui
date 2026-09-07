@@ -883,3 +883,321 @@ fn trajectory_wire_snapshot_boundary_events_survive_to_window_ac005_06() {
     // 无逐 delta 展开：10 event 行（chunks 不占独立行）。
     assert_eq!(w.len(), 10);
 }
+
+// ============================================================================
+// REQ-006 Step 1：模型/命令/workspace/session 变更端点 wire mock（0.1.2-rc.1
+// 实读：单 request 形参端点嵌套 {"request":{...}}；commands 平铺；AC-006 前序
+// 契约）。
+// ============================================================================
+
+#[tokio::test]
+async fn model_catalog_zero_arg_and_typed_catalog_response_ac006_01() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let request = read_request(&mut socket).await;
+        assert!(request.starts_with("POST /api/session/modelCatalog HTTP/1.1"));
+        let body: Value = serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(body["method"], "session/modelCatalog");
+        // 零参数：args 为空对象（无 request 嵌套）。
+        assert_eq!(body["payload"]["args"], json!({}));
+        let rpc_id = body["rpcId"].as_str().unwrap().to_string();
+        write_json_response(
+            &mut socket,
+            json!({
+                "type": "server-response",
+                "rpcId": rpc_id,
+                "result": {"ok": true, "value": {
+                    "default": {"provider": "deepseek_official", "model": "deepseek-chat"},
+                    "routableProviders": ["deepseek_official"],
+                    "groups": [
+                        {"id": "deepseek_official", "name": "DeepSeek 官方", "models": [
+                            {"id": "deepseek-chat", "name": "DeepSeek Chat",
+                             "reasoning": {"efforts": [{"id": "low", "name": "Low"}], "defaultEffort": "low"}}
+                        ]}
+                    ],
+                    "failures": []
+                }}
+            }),
+        )
+        .await;
+    });
+
+    let http = reqwest::Client::new();
+    let catalog = dshtui::api::session::model_catalog(&http, &format!("http://{addr}"))
+        .await
+        .unwrap();
+    assert_eq!(catalog.default.as_ref().unwrap().model, "deepseek-chat");
+    assert_eq!(catalog.groups.len(), 1);
+    assert_eq!(catalog.groups[0].models[0].id, "deepseek-chat");
+    let reasoning = catalog.groups[0].models[0].reasoning.as_ref().unwrap();
+    assert_eq!(reasoning.efforts[0].id, "low");
+    assert_eq!(reasoning.default_effort.as_deref(), Some("low"));
+    assert!(catalog.failures.is_empty());
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn select_model_nests_request_and_parses_selected_ac006_08() {
+    use dshtui::api::types::SessionId;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let request = read_request(&mut socket).await;
+        assert!(request.starts_with("POST /api/session/selectModel HTTP/1.1"));
+        let body: Value = serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(body["method"], "session/selectModel");
+        // 单 request 形参端点：业务字段嵌套在 args.request（0.1.2-rc.1 实读）。
+        let req = &body["payload"]["args"]["request"];
+        assert_eq!(req["sessionId"], "sess-1");
+        assert_eq!(req["provider"], "deepseek_official");
+        assert_eq!(req["model"], "deepseek-chat");
+        assert_eq!(req["reasoningEffort"], "low");
+        let rpc_id = body["rpcId"].as_str().unwrap().to_string();
+        write_json_response(
+            &mut socket,
+            json!({
+                "type": "server-response",
+                "rpcId": rpc_id,
+                "result": {"ok": true, "value": {"selected": {
+                    "provider": "deepseek_official",
+                    "model": "deepseek-chat",
+                    "reasoningEffort": "low"
+                }}}
+            }),
+        )
+        .await;
+    });
+
+    let http = reqwest::Client::new();
+    let sel = dshtui::api::session::select_model(
+        &http,
+        &format!("http://{addr}"),
+        &SessionId("sess-1".into()),
+        "deepseek_official",
+        "deepseek-chat",
+        Some("low"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(sel.model, "deepseek-chat");
+    assert_eq!(sel.reasoning_effort.as_deref(), Some("low"));
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn session_fork_rename_create_nest_request_and_parse_typed_values() {
+    use dshtui::api::types::SessionId;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let methods: std::sync::Arc<
+        std::sync::Mutex<Vec<(String, Value)>>,
+    > = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let methods2 = methods.clone();
+    let server = tokio::spawn(async move {
+        for _ in 0..3 {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut socket).await;
+            let body: Value =
+                serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+            let method = body["method"].as_str().unwrap().to_string();
+            methods2
+                .lock()
+                .unwrap()
+                .push((method.clone(), body["payload"]["args"].clone()));
+            let rpc_id = body["rpcId"].as_str().unwrap().to_string();
+            let value = match method.as_str() {
+                "session/fork" => json!({"sessionId": "new-fork-1"}),
+                "session/rename" => json!({"title": "新标题", "seq": 42}),
+                _ => json!({"sessionId": "created-1", "agentPreset": "default"}),
+            };
+            write_json_response(
+                &mut socket,
+                json!({
+                    "type": "server-response",
+                    "rpcId": rpc_id,
+                    "result": {"ok": true, "value": value}
+                }),
+            )
+            .await;
+        }
+    });
+
+    let http = reqwest::Client::new();
+    let base = format!("http://{addr}");
+    let fork = dshtui::api::session::fork(&http, &base, &SessionId("sess-1".into()), Some(7))
+        .await
+        .unwrap();
+    assert_eq!(fork.session_id, "new-fork-1");
+    let rename =
+        dshtui::api::session::rename(&http, &base, &SessionId("sess-1".into()), "新标题")
+            .await
+            .unwrap();
+    assert_eq!(rename.title, "新标题");
+    assert_eq!(rename.seq, 42);
+    let created = dshtui::api::session::create(&http, &base, Some("ws-1"), None).await.unwrap();
+    assert_eq!(created.session_id, "created-1");
+    server.await.unwrap();
+
+    let seen = methods.lock().unwrap();
+    assert_eq!(seen[0].0, "session/fork");
+    assert_eq!(seen[0].1["request"]["sessionId"], "sess-1");
+    assert_eq!(seen[0].1["request"]["atSeq"], 7);
+    assert_eq!(seen[1].0, "session/rename");
+    assert_eq!(seen[1].1["request"]["title"], "新标题");
+    assert_eq!(seen[2].0, "session/create");
+    assert_eq!(seen[2].1["request"]["workspaceId"], "ws-1");
+}
+
+#[tokio::test]
+async fn workspace_mutations_nest_request_and_archive_is_workspace_namespace() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        for _ in 0..2 {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut socket).await;
+            assert!(request.starts_with("POST /api/workspace/"));
+            let body: Value =
+                serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+            let method = body["method"].as_str().unwrap().to_string();
+            let rpc_id = body["rpcId"].as_str().unwrap().to_string();
+            match method.as_str() {
+                "workspace/archiveSession" => {
+                    // archiveSession 属 workspace namespace，请求仅 sessionId
+                    // （FR-006-02 fact 修正）。
+                    assert_eq!(body["payload"]["args"]["request"]["sessionId"], "sess-9");
+                    assert!(body["payload"]["args"]["request"].get("workspaceId").is_none());
+                    write_json_response(
+                        &mut socket,
+                        json!({"type": "server-response", "rpcId": rpc_id,
+                               "result": {"ok": true, "value": {"archivedSessionIds": ["sess-9"]}}}),
+                    )
+                    .await;
+                }
+                _ => {
+                    assert_eq!(body["payload"]["args"]["request"]["workspaceId"], "ws-2");
+                    assert_eq!(body["payload"]["args"]["request"]["title"], "项目 B");
+                    write_json_response(
+                        &mut socket,
+                        json!({"type": "server-response", "rpcId": rpc_id,
+                               "result": {"ok": true, "value": {"workspace": {
+                                   "workspaceId": "ws-2", "path": "/p", "title": "项目 B",
+                                   "sessionIds": [], "createdAt": "x", "updatedAt": "y"
+                               }}}}),
+                    )
+                    .await;
+                }
+            }
+        }
+    });
+
+    let http = reqwest::Client::new();
+    let base = format!("http://{addr}");
+    let archive =
+        dshtui::api::workspace::archive_session(&http, &base, "sess-9").await.unwrap();
+    assert_eq!(archive["archivedSessionIds"][0], "sess-9");
+    let renamed = dshtui::api::workspace::rename_workspace(&http, &base, "ws-2", "项目 B")
+        .await
+        .unwrap();
+    assert_eq!(renamed["workspace"]["title"], "项目 B");
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn commands_flat_args_list_and_execute_undefined_tolerance_ac006_04() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let methods: std::sync::Arc<std::sync::Mutex<Vec<(String, Value)>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let methods2 = methods.clone();
+    let server = tokio::spawn(async move {
+        for _ in 0..2 {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut socket).await;
+            let body: Value =
+                serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+            let method = body["method"].as_str().unwrap().to_string();
+            methods2
+                .lock()
+                .unwrap()
+                .push((method.clone(), body["payload"]["args"].clone()));
+            let rpc_id = body["rpcId"].as_str().unwrap().to_string();
+            let value = if method == "commands/list" {
+                json!([
+                    {"name": "plan", "description": "Plan mode", "input": {"hint": "off"}},
+                    {"name": "help", "description": "Help"}
+                ])
+            } else {
+                // execute 可能返回 undefined（服务器无输出）→ 容忍为成功空值。
+                Value::Null
+            };
+            write_json_response(
+                &mut socket,
+                json!({"type": "server-response", "rpcId": rpc_id,
+                       "result": {"ok": true, "value": value}}),
+            )
+            .await;
+        }
+    });
+
+    let http = reqwest::Client::new();
+    let base = format!("http://{addr}");
+    let cmds = dshtui::api::commands::list(&http, &base, "agent-1").await.unwrap();
+    assert_eq!(cmds.len(), 2);
+    assert_eq!(cmds[0].name, "plan");
+    assert_eq!(cmds[0].input.as_ref().unwrap().hint, "off");
+    assert_eq!(cmds[1].name, "help");
+    let exec = dshtui::api::commands::execute(&http, &base, "agent-1", "/help", &[])
+        .await
+        .unwrap();
+    assert!(exec.is_none(), "undefined 执行值被容忍为空成功");
+    server.await.unwrap();
+
+    let seen = methods.lock().unwrap();
+    // commands 端点平铺 args（agentId 为 lookup scope，非嵌套）。
+    assert_eq!(seen[0].0, "commands/list");
+    assert_eq!(seen[0].1["agentId"], "agent-1");
+    assert_eq!(seen[1].0, "commands/execute");
+    assert_eq!(seen[1].1["agentId"], "agent-1");
+    assert_eq!(seen[1].1["line"], "/help");
+    assert_eq!(seen[1].1["images"], json!([]));
+}
+
+#[tokio::test]
+async fn command_execute_surfaces_remote_error_code_ac006_13() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let request = read_request(&mut socket).await;
+        let body: Value = serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        let rpc_id = body["rpcId"].as_str().unwrap().to_string();
+        write_json_response(
+            &mut socket,
+            json!({
+                "type": "server-response",
+                "rpcId": rpc_id,
+                "result": {"ok": false, "error": {
+                    "code": "commands/not-found", "message": "未知命令"
+                }}
+            }),
+        )
+        .await;
+    });
+
+    let http = reqwest::Client::new();
+    let err = dshtui::api::commands::execute(&http, &format!("http://{addr}"), "agent-1", "/nope", &[])
+        .await
+        .unwrap_err();
+    match err {
+        dshtui::api::ClientError::Remote { code, class, .. } => {
+            assert_eq!(code, "commands/not-found");
+            assert_eq!(class, ErrorClass::UserFacing);
+        }
+        other => panic!("expected Remote error, got {other:?}"),
+    }
+    server.await.unwrap();
+}
