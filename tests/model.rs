@@ -1254,3 +1254,111 @@ fn detail_yank_text_is_args_plus_result_plain_text_ac005_11() {
     let detail2 = detail_for(&call2, &w2).unwrap();
     assert!(detail2.yank_text().is_some(), "仅 args 也可复制");
 }
+
+// ============================================================================
+// REQ-005 Step 4 轨迹内搜索索引（Seam = TrajectorySearchIndex query 纯函数 +
+// RowId 跳转/折叠组展开纯函数；本地 nucleo 窗口内过滤，非 session/search
+// 全历史，D-25）。验收：AC-005-05/13。
+// ============================================================================
+
+use dshtui::model::trajectory::{TrajectorySearchIndex, TrajectorySearchItem};
+
+#[test]
+fn trajectory_search_index_filters_event_rows_ac005_05() {
+    // AC-005-05：输入关键词 → 窗口内过滤命中（即时本地，无网络）。
+    let mut w = TrajectoryWindow::new(200);
+    w.apply(TrajIncoming::Snapshot {
+        cursor: None,
+        records: vec![
+            traj_record(1, "turn/start", serde_json::json!({"turn": 1})),
+            traj_record(2, "step/start", serde_json::json!({"turn": 1, "step": 1})),
+            traj_record(3, "user/message", serde_json::json!({"content": "排查数据库连接"})),
+            traj_record(4, "assistant/message", serde_json::json!({"turn": 1, "step": 1, "content": "先用 bash 检查端口"})),
+            traj_record(5, "tool/call", serde_json::json!({"turn": 1, "step": 1, "callId": "c1", "name": "bash", "arguments": "{\"command\":\"grep -r db /tmp\"}"})),
+            traj_record(6, "tool/result", serde_json::json!({"turn": 1, "step": 1, "callId": "c1", "message": "db:5432 在监听"})),
+            traj_record(7, "request/header", serde_json::json!({"reason": "initial"})),
+            traj_record(8, "turn/end", serde_json::json!({"turn": 1})),
+        ],
+        has_more: false,
+        projections: None,
+    });
+    let mut index = TrajectorySearchIndex::new();
+    index.rebuild(w.raw_rows());
+    // 空查询不触发（前序契约：空查询不触发）。
+    assert!(index.query("  ").is_empty(), "空查询不触发");
+    let hits = index.query("grep");
+    assert!(!hits.is_empty(), "grep 命中 tool/call");
+    let hit = &hits[0];
+    let item = &index.items()[hit.item_index];
+    assert_eq!(item.kind, TrajKind::ToolCall);
+    assert!(item.text.contains("grep"), "text 含关键词: {}", item.text);
+    assert!(!hit.positions.is_empty(), "命中高亮位置");
+    // 中文命中 user 消息。
+    let zh = index.query("排查");
+    assert!(!zh.is_empty());
+    let zh_item = &index.items()[zh[0].item_index];
+    assert_eq!(zh_item.kind, TrajKind::UserMessage);
+    // 边界行（无内容文本）不进索引：不会命中。
+    assert!(index.query("turn/start").is_empty());
+}
+
+#[test]
+fn trajectory_search_match_jumps_to_row_and_expands_fold_ac005_13() {
+    // AC-005-13：Enter 跳转命中行（可展开其所在折叠组）。
+    let mut w = TrajectoryWindow::new(200);
+    w.apply(TrajIncoming::Snapshot {
+        cursor: None,
+        records: vec![
+            traj_record(1, "turn/start", serde_json::json!({"turn": 1})),
+            traj_record(2, "step/start", serde_json::json!({"turn": 1, "step": 1})),
+            traj_record(3, "assistant/message", serde_json::json!({"turn": 1, "step": 1, "content": "a1"})),
+            traj_record(4, "tool/call", serde_json::json!({"turn": 1, "step": 1, "callId": "c1", "name": "bash", "arguments": "{\"command\":\"grep x\"}"})),
+            traj_record(5, "tool/result", serde_json::json!({"turn": 1, "step": 1, "callId": "c1", "message": "hit"})),
+            traj_record(6, "step/end", serde_json::json!({"turn": 1, "step": 1})),
+            traj_record(7, "turn/end", serde_json::json!({"turn": 1})),
+            traj_record(8, "turn/start", serde_json::json!({"turn": 2})),
+            traj_record(9, "step/start", serde_json::json!({"turn": 2, "step": 2})),
+            traj_record(10, "assistant/message", serde_json::json!({"turn": 2, "step": 2, "content": "继续"})),
+            traj_record(11, "tool/call", serde_json::json!({"turn": 2, "step": 2, "callId": "c2", "name": "grep", "arguments": "{\"command\":\"grep y\"}"})),
+            traj_record(12, "turn/end", serde_json::json!({"turn": 2})),
+        ],
+        has_more: false,
+        projections: None,
+    });
+    let mut index = TrajectorySearchIndex::new();
+    index.rebuild(w.raw_rows());
+    // 命中 turn 2 的 tool/call（grep y）。
+    let hits = index.query("grep y");
+    assert_eq!(hits.len(), 1);
+    let item = &index.items()[hits[0].item_index];
+    // 命中行在窗口内可定位（RowId 稳定跳转）。
+    let row = w.row(item.row_id).expect("命中行可定位");
+    assert_eq!(row.seq(), SessionSeq(11));
+    // 折叠 turn 2 的 assistant 组后，命中行被隐藏；展开组后可见（跳转前置）。
+    let mut fold = FoldState::default();
+    let asst2 = w
+        .raw_rows()
+        .find(|r| r.kind() == TrajKind::AssistantMessage && r.turn() == Some(2))
+        .expect("turn2 assistant")
+        .id();
+    assert!(w.toggle_group(&mut fold, asst2), "折叠 assistant 组");
+    let hidden = w.view(&fold).iter().all(|r| r.id() != item.row_id);
+    assert!(hidden, "折叠时命中行隐藏");
+    // 展开命中行所在折叠组 → 行可见（可跳转/定位）。
+    let group = w.group_of(item.row_id).expect("命中行有折叠组");
+    fold.toggle(group);
+    assert!(w.view(&fold).iter().any(|r| r.id() == item.row_id));
+}
+
+#[test]
+fn trajectory_search_item_displays_kind_digest() {
+    // TrajectorySearchItem 形状：kind 标签 + 摘要 digest（窗口内过滤列表行）。
+    let item = TrajectorySearchItem {
+        row_id: RowId(1),
+        kind: TrajKind::ToolCall,
+        seq: SessionSeq(5),
+        text: "bash {\"command\":\"ls\"}".to_string(),
+        display: "tool: bash".to_string(),
+    };
+    assert!(item.display.starts_with("tool:"));
+}

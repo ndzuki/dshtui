@@ -394,6 +394,7 @@ async fn run_connected(eff: Effective, token: String, client: DshClient) -> Resu
                 Mode::ImageView => InputMode::ImageView,
                 // REQ-005：Trajectory 独立模式（详情子层由 focus 分派，
                 // 无独立 InputMode）。
+                Mode::Trajectory if app.traj.filter.open => InputMode::TrajectoryFilter,
                 Mode::Trajectory => InputMode::Trajectory,
             };
             if let Some(command) = decoder.decode(mode, input) {

@@ -1087,3 +1087,111 @@ fn trajectory_slash_does_not_enter_chat_search_mode() {
     app.handle_command(Command::StartSearch);
     assert_eq!(app.mode, Mode::Search);
 }
+
+#[test]
+fn trajectory_filter_input_highlight_and_enter_jump_ac005_05_13() {
+    // AC-005-05/13（reducer 层）：/ 打开过滤 → 输入关键词即时过滤 → j/k 移动
+    // 命中选中 → Enter 跳转命中行（可展开其所在折叠组）。
+    let mut app = traj_app();
+    app.handle_command(Command::ToggleTrajectory);
+    app.handle_command(Command::StartSearch);
+    assert!(app.traj.filter.open);
+    // 输入 "done"：过滤 query 累积（本地即时，无防抖风暴面）。
+    for c in ['d', 'o', 'n', 'e'] {
+        app.handle_command(Command::PickerInput(c.to_string()));
+    }
+    assert_eq!(app.traj.filter.query, "done");
+    // 命中 tool/result 行（message=done）。
+    let hits = app.traj_search_index.query("done");
+    assert_eq!(hits.len(), 1, "过滤即时命中");
+    let hit_row = app.traj_search_index.items()[hits[0].item_index].row_id;
+    // Enter 跳转：cursor 定位命中行。
+    app.handle_command(Command::PickerConfirm);
+    assert!(!app.traj.filter.open, "Enter 后退出过滤");
+    let window = app
+        .active_session
+        .as_ref()
+        .and_then(|sid| app.traj_sessions.get(&sid.0))
+        .unwrap();
+    let view = window.view(&app.traj.fold);
+    let pos = view
+        .iter()
+        .position(|r| r.id() == hit_row)
+        .expect("命中行可见");
+    assert_eq!(app.traj.cursor, pos, "cursor 跳转到命中行");
+    // 跳到命中行后 Enter 可开详情（tool/result 详情）。
+    app.handle_command(Command::OpenDetail);
+    assert!(app.traj.detail_open);
+    assert_eq!(
+        app.traj.detail.as_ref().unwrap().source_kind,
+        dshtui::model::TrajKind::ToolResult
+    );
+}
+
+#[test]
+fn trajectory_filter_jump_expands_collapsed_group_ac005_13() {
+    // AC-005-13：命中行所在折叠组被折叠时，Enter 跳转自动展开（行可见）。
+    let mut app = traj_app();
+    app.handle_command(Command::ToggleTrajectory);
+    // 折叠 turn 1 assistant 组（tool/result 行被隐藏）。
+    let asst = {
+        let window = app
+            .active_session
+            .as_ref()
+            .and_then(|sid| app.traj_sessions.get(&sid.0))
+            .unwrap();
+        window
+            .raw_rows()
+            .find(|r| r.kind() == dshtui::model::TrajKind::AssistantMessage)
+            .unwrap()
+            .id()
+    };
+    app.traj
+        .fold
+        .toggle(dshtui::model::GroupId::Assistant { turn: 1, step: 1 });
+    let _ = asst;
+    app.handle_command(Command::StartSearch);
+    for c in ['d', 'o', 'n', 'e'] {
+        app.handle_command(Command::PickerInput(c.to_string()));
+    }
+    assert!(
+        !app.traj_search_index.query("done").is_empty(),
+        "命中仍可查到"
+    );
+    app.handle_command(Command::PickerConfirm);
+    // 跳转自动展开折叠组：命中行可见。
+    let window = app
+        .active_session
+        .as_ref()
+        .and_then(|sid| app.traj_sessions.get(&sid.0))
+        .unwrap();
+    assert!(window
+        .view(&app.traj.fold)
+        .iter()
+        .any(|r| { r.kind() == dshtui::model::TrajKind::ToolResult && r.summary() == "done" }));
+}
+
+#[test]
+fn trajectory_filter_esc_and_backspace_ac005_05() {
+    // Esc 退出过滤回完整列表；Backspace 删除字符。
+    let mut app = traj_app();
+    app.handle_command(Command::ToggleTrajectory);
+    app.handle_command(Command::StartSearch);
+    for c in ['d', 'o'] {
+        app.handle_command(Command::PickerInput(c.to_string()));
+    }
+    assert_eq!(app.traj.filter.query, "do");
+    app.handle_command(Command::PickerBackspace);
+    assert_eq!(app.traj.filter.query, "d", "Backspace 删除");
+    app.handle_command(Command::ClosePicker); // Esc
+    assert!(!app.traj.filter.open);
+    assert_eq!(app.mode, Mode::Trajectory, "退出过滤仍在 Trajectory tab");
+    // 过滤中 q 也退出过滤（不退出程序）。
+    app.handle_command(Command::StartSearch);
+    for c in ['x', 'y'] {
+        app.handle_command(Command::PickerInput(c.to_string()));
+    }
+    app.handle_command(Command::Quit);
+    assert!(!app.traj.filter.open, "过滤中 q 关过滤");
+    assert!(!app.exited, "过滤中 q 不退出程序");
+}

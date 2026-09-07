@@ -402,6 +402,11 @@ impl FoldState {
             true
         }
     }
+
+    /// 展开指定组（幂等；搜索跳转前置，AC-005-13）。
+    pub fn expand(&mut self, group: GroupId) {
+        self.collapsed.remove(&group);
+    }
 }
 
 /// 输入漏斗（AppState 将 api 事件映射到该类型）。
@@ -1309,4 +1314,157 @@ fn timing_for(
         first_token,
         completed,
     })
+}
+
+// ============================================================================
+// TrajectorySearchIndex —— 轨迹内搜索索引（REQ-005 §5，D-25：窗口内 nucleo
+// 过滤，非 `session/search` 全历史；Notes/06 §4 结构复用）。
+// ============================================================================
+
+/// 一条轨迹搜索索引项（= 一条事件行；RowId 稳定身份供跳转）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct TrajectorySearchItem {
+    pub row_id: RowId,
+    pub kind: TrajKind,
+    pub seq: SessionSeq,
+    /// 搜索文本（消息摘要 / tool name+args / result / header reason）。
+    pub text: String,
+    /// 过滤列表行标签（kind + 摘要 digest）。
+    pub display: String,
+}
+
+/// 一次查询命中（形状对齐 `model::SearchMatch`；窗口内匹配保持窗口序）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct TrajectorySearchMatch {
+    pub item_index: usize,
+    pub score: u16,
+    /// `text` 内命中字符位置（高亮范围）。
+    pub positions: Vec<u32>,
+}
+
+/// 轨迹内搜索索引（随窗口重建；nucleo 0.5 `Matcher` 即时模糊匹配；纯本地
+/// 同步，无异步请求 → 无防抖风暴面，AC-005-05「过滤即时」）。
+#[derive(Debug, Default)]
+pub struct TrajectorySearchIndex {
+    items: Vec<TrajectorySearchItem>,
+}
+
+impl TrajectorySearchIndex {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn items(&self) -> &[TrajectorySearchItem] {
+        &self.items
+    }
+
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    /// 从轨迹窗口行重建索引（窗口序；无内容文本的边界行不进索引）。
+    pub fn rebuild<'a>(&mut self, rows: impl Iterator<Item = &'a TrajectoryRow>) {
+        self.items.clear();
+        for row in rows {
+            let Some(text) = row_search_text(row) else {
+                continue;
+            };
+            let digest: String = text.chars().take(60).collect();
+            let label = kind_label(row.kind());
+            self.items.push(TrajectorySearchItem {
+                row_id: row.id(),
+                kind: row.kind(),
+                seq: row.seq(),
+                text,
+                display: format!("{label}: {digest}"),
+            });
+        }
+    }
+
+    /// 模糊查询（空查询/纯空白 → 无命中，AC-005-05 空查询不触发）。
+    pub fn query(&self, query: &str) -> Vec<TrajectorySearchMatch> {
+        if query.trim().is_empty() {
+            return Vec::new();
+        }
+        let mut matcher = nucleo::Matcher::new(nucleo::Config::DEFAULT);
+        let mut needle_buf = Vec::new();
+        let needle = nucleo::Utf32Str::new(query, &mut needle_buf);
+        let mut out = Vec::new();
+        for (idx, item) in self.items.iter().enumerate() {
+            let mut positions = Vec::new();
+            let mut hay_buf = Vec::new();
+            let haystack = nucleo::Utf32Str::new(&item.text, &mut hay_buf);
+            if let Some(score) = matcher.fuzzy_indices(haystack, needle, &mut positions) {
+                out.push(TrajectorySearchMatch {
+                    item_index: idx,
+                    score,
+                    positions,
+                });
+            }
+        }
+        out
+    }
+}
+
+/// 行 → 可搜索文本（无内容文本的边界行返回 None，不进索引）。
+fn row_search_text(row: &TrajectoryRow) -> Option<String> {
+    let text = match row {
+        TrajectoryRow::UserMessage { summary, .. }
+        | TrajectoryRow::AssistantMessage { summary, .. }
+        | TrajectoryRow::ToolResult { summary, .. }
+        | TrajectoryRow::Compaction { summary, .. } => summary.clone(),
+        TrajectoryRow::ToolCall { name, args_raw, .. } => {
+            let mut s = name.clone().unwrap_or_default();
+            if let Some(args) = args_raw {
+                let arg_text = match args {
+                    Value::String(raw) => raw.clone(),
+                    other => other.to_string(),
+                };
+                if !arg_text.is_empty() {
+                    if !s.is_empty() {
+                        s.push(' ');
+                    }
+                    s.push_str(&arg_text);
+                }
+            }
+            s
+        }
+        TrajectoryRow::RequestHeader {
+            reason, summary, ..
+        } => {
+            if !summary.is_empty() {
+                summary.clone()
+            } else {
+                reason.clone().unwrap_or_default()
+            }
+        }
+        // 边界行（turn/step/Unknown）无用户内容文本，不进索引。
+        _ => return None,
+    };
+    if text.trim().is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+/// 列表行 kind 标签（Notes/05 §7 事件列口径）。
+pub fn kind_label(kind: TrajKind) -> &'static str {
+    match kind {
+        TrajKind::TurnStart => "turn/start",
+        TrajKind::TurnEnd => "turn/end",
+        TrajKind::StepStart => "step/start",
+        TrajKind::StepEnd => "step/end",
+        TrajKind::UserMessage => "user",
+        TrajKind::AssistantMessage => "assistant",
+        TrajKind::ToolCall => "tool",
+        TrajKind::ToolResult => "result",
+        TrajKind::RequestHeader => "header",
+        TrajKind::Compaction => "compaction",
+        TrajKind::Unknown => "unknown",
+    }
 }

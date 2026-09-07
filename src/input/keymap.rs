@@ -24,6 +24,9 @@ pub enum InputMode {
     /// REQ-005 V0.3：Trajectory 视图（D-25：独立模式；详情为内嵌焦点子层，
     /// 不新增 InputMode——`q`/`y`/`j`/`k` 由 AppState 按 focus 分派）。
     Trajectory,
+    /// REQ-005：轨迹内过滤输入态（`/` 打开后任意字符进 query；仍在
+    /// Trajectory 模式，模态上不离开轨迹 tab）。
+    TrajectoryFilter,
 }
 
 /// Domain commands emitted by the input layer.
@@ -141,6 +144,7 @@ impl KeyDecoder {
             InputMode::Approval => self.approval(key),
             InputMode::ImageView => self.image_view(key),
             InputMode::Trajectory => self.trajectory(key),
+            InputMode::TrajectoryFilter => self.trajectory_filter(key),
         }
     }
 
@@ -265,6 +269,24 @@ impl KeyDecoder {
             KeyCode::Char('w') if ctrl => Some(Command::CycleFocus),
             KeyCode::Enter if !ctrl => Some(Command::OpenDetail),
             KeyCode::Esc => Some(Command::ClosePicker),
+            _ => None,
+        }
+    }
+
+    /// 轨迹内过滤输入态键位：普通字符进 query，Backspace 删除，Enter 跳转，
+    /// Esc/q 退出（Step 4，AC-005-13 输入即时过滤）。
+    fn trajectory_filter(&mut self, key: KeyEvent) -> Option<Command> {
+        match key.code {
+            KeyCode::Char(c) if key.modifiers.is_empty() => {
+                Some(Command::PickerInput(c.to_string()))
+            }
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                Some(Command::Quit)
+            }
+            KeyCode::Enter => Some(Command::PickerConfirm),
+            KeyCode::Esc => Some(Command::ClosePicker),
+            KeyCode::Char('q') if key.modifiers.is_empty() => Some(Command::ClosePicker),
+            KeyCode::Backspace => Some(Command::PickerBackspace),
             _ => None,
         }
     }

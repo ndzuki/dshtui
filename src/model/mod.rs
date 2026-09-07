@@ -26,8 +26,9 @@ pub use session::{
     TranscriptWindow, TurnOutlineItem,
 };
 pub use trajectory::{
-    detail_for, FoldState, GroupId, RowId, TrajEffect, TrajError, TrajIncoming, TrajKind,
-    TrajTiming, TrajUsage, TrajectoryDetail, TrajectoryRow, TrajectoryStore, TrajectoryWindow,
+    detail_for, kind_label, FoldState, GroupId, RowId, TrajEffect, TrajError, TrajIncoming,
+    TrajKind, TrajTiming, TrajUsage, TrajectoryDetail, TrajectoryRow, TrajectorySearchIndex,
+    TrajectorySearchItem, TrajectorySearchMatch, TrajectoryStore, TrajectoryWindow,
 };
 pub use workspace::{WorkspaceMeta, WorkspaceStore};
 pub use yank::{

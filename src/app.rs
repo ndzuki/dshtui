@@ -178,11 +178,14 @@ pub struct OutlineState {
     pub selection: usize,
 }
 
-/// 轨迹内过滤输入态（`/`；Step 3 建输入态，Step 4 完成 nucleo 匹配）。
+/// 轨迹内过滤输入态（`/`；本地 nucleo 窗口内过滤——即时、无异步防抖风暴，
+/// AC-005-05/13）。
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TrajFilterState {
     pub open: bool,
     pub query: String,
+    /// 命中列表选中下标（j/k 于过滤列表；Enter 跳转该命中行）。
+    pub cursor: usize,
 }
 
 /// Trajectory 视图状态（REQ-005 §5 状态机，D-25；全部内存、单写多读）。
@@ -516,6 +519,8 @@ pub struct AppState {
     pub traj_sessions: crate::model::TrajectoryStore,
     /// Trajectory 视图状态（折叠/选中/详情/过滤）。
     pub traj: TrajState,
+    /// 轨迹内搜索索引（随过滤操作/窗口变化重建，本地 nucleo）。
+    pub traj_search_index: crate::model::TrajectorySearchIndex,
     pub workspaces: WorkspaceStore,
     pub viewport: Viewport,
     pub picker: PickerState,
@@ -602,6 +607,7 @@ impl Default for AppState {
             sessions: SessionStore::new(3),
             traj_sessions: crate::model::TrajectoryStore::new(3),
             traj: TrajState::default(),
+            traj_search_index: crate::model::TrajectorySearchIndex::new(),
             workspaces: WorkspaceStore::new(),
             viewport: Viewport::default(),
             picker: PickerState::default(),
@@ -2209,6 +2215,16 @@ impl AppState {
                         }
                         _ => {}
                     }
+                } else if self.traj.filter.open {
+                    // 过滤列表：j/k 移动命中选中（N/M matches 口径）。
+                    self.traj_index_rebuild();
+                    let n = self.traj_filter_hit_len();
+                    if matches!(cmd, C::MoveDown) {
+                        self.traj.filter.cursor =
+                            (self.traj.filter.cursor + 1).min(n.saturating_sub(1));
+                    } else {
+                        self.traj.filter.cursor = self.traj.filter.cursor.saturating_sub(1);
+                    }
                 } else if self.focus == Focus::Center {
                     self.move_traj_cursor(matches!(cmd, C::MoveDown));
                 }
@@ -2224,9 +2240,32 @@ impl AppState {
             }
             C::StartSearch => {
                 // 轨迹内过滤：仍在 Trajectory 模式（与 Chat 结构化搜索分离，
-                // 不串模式——Step 3 建输入态，Step 4 补 nucleo 匹配）。
+                // 不串模式）；本地 nucleo 窗口内即时过滤（AC-005-05）。
                 self.traj.filter.open = true;
                 self.traj.filter.query.clear();
+                self.traj.filter.cursor = 0;
+                self.traj_index_rebuild();
+                Some(vec![])
+            }
+            // 过滤输入态（InputMode::TrajectoryFilter）字符/删除/Enter。
+            C::PickerInput(text) => {
+                if self.traj.filter.open {
+                    self.traj.filter.query.push_str(&text);
+                    self.traj.filter.cursor = 0;
+                }
+                Some(vec![])
+            }
+            C::PickerBackspace => {
+                if self.traj.filter.open {
+                    self.traj.filter.query.pop();
+                    self.traj.filter.cursor = 0;
+                }
+                Some(vec![])
+            }
+            C::PickerConfirm => {
+                if self.traj.filter.open {
+                    self.jump_to_traj_match();
+                }
                 Some(vec![])
             }
             C::YankContext => {
@@ -2240,6 +2279,9 @@ impl AppState {
                 if self.traj.detail_open && self.focus == Focus::Details {
                     self.close_traj_detail();
                     Some(vec![])
+                } else if self.traj.filter.open {
+                    self.close_traj_filter();
+                    Some(vec![])
                 } else {
                     // 轨迹列表焦点：全局 q（运行中先 stop 确认）。
                     Some(self.quit())
@@ -2249,7 +2291,7 @@ impl AppState {
                 if self.traj.detail_open && self.focus == Focus::Details {
                     self.close_traj_detail();
                 } else if self.traj.filter.open {
-                    self.traj.filter.open = false;
+                    self.close_traj_filter();
                 }
                 Some(vec![])
             }
@@ -2410,6 +2452,64 @@ impl AppState {
             let _ = self.traj_sessions.touch(&id.0, self.window_cap);
         }
         self.traj.cursor = self.traj.cursor.min(self.traj_view_len().saturating_sub(1));
+    }
+
+    // ---------- REQ-005 Step 4：轨迹内搜索（本地 nucleo 过滤） ----------
+
+    /// 重建轨迹搜索索引（过滤打开/输入/窗口变化后；≤200 行，成本可忽略）。
+    fn traj_index_rebuild(&mut self) {
+        // 借用分离：先在只读 self 上构建新索引，再整体赋值（避免
+        // active_traj_window 与 traj_search_index 可变借用冲突）。
+        let rebuilt = {
+            let mut index = crate::model::TrajectorySearchIndex::new();
+            if let Some(window) = self.active_traj_window() {
+                index.rebuild(window.raw_rows());
+            }
+            index
+        };
+        self.traj_search_index = rebuilt;
+    }
+
+    /// 当前过滤词命中数（N/M matches 与 cursor clamp 依据）。
+    fn traj_filter_hit_len(&self) -> usize {
+        self.traj_search_index.query(&self.traj.filter.query).len()
+    }
+
+    /// Enter 跳转当前选中命中行：展开其所在折叠组（AC-005-13）→ cursor 定位
+    /// → 关闭过滤回完整列表。
+    fn jump_to_traj_match(&mut self) {
+        let hits = self.traj_search_index.query(&self.traj.filter.query);
+        let Some(hit) = hits.get(self.traj.filter.cursor) else {
+            // 无命中（cursor 越界/空查询）：直接退出过滤，不跳转。
+            self.close_traj_filter();
+            return;
+        };
+        let Some(item) = self.traj_search_index.items().get(hit.item_index).cloned() else {
+            return;
+        };
+        // 展开命中行所在折叠组（若折叠）——跳转后行必须可见。
+        if let Some(group) = self
+            .active_traj_window()
+            .and_then(|w| w.group_of(item.row_id))
+        {
+            self.traj.fold.expand(group);
+        }
+        // cursor 定位到命中行（完整折叠视图内）。
+        if let Some(pos) = self
+            .active_traj_window()
+            .map(|w| w.view(&self.traj.fold))
+            .and_then(|view| view.iter().position(|r| r.id() == item.row_id))
+        {
+            self.traj.cursor = pos;
+        }
+        self.close_traj_filter();
+    }
+
+    fn close_traj_filter(&mut self) {
+        self.traj.filter.open = false;
+        self.traj.filter.query.clear();
+        self.traj.filter.cursor = 0;
+        self.focus = Focus::Center;
     }
 
     // ---------- REQ-003: search / visual / approval / outline helpers ----------
