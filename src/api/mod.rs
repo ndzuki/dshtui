@@ -10,9 +10,16 @@ pub mod attachment;
 pub mod auth;
 pub mod commands;
 pub mod envelope;
+pub mod export;
+pub mod feedback;
+pub mod goals;
 pub mod monitor;
 pub mod mux;
+pub mod references;
 pub mod session;
+pub mod settings;
+pub mod skills;
+pub mod subagents;
 pub mod types;
 pub mod workspace;
 

@@ -714,6 +714,309 @@ pub fn meta_from_raw(raw: ListItemRaw) -> Option<SessionMeta> {
     })
 }
 
+// ---------- REQ-007 V0.4 wire types (official read 0.1.2-rc.1; contract
+// smoke locks remaining `[未验证]` fields; all unknown fields tolerated) ----------
+
+impl SessionAddress {
+    /// Subagent address (`kind:"subagent"`): parent + child + mode.
+    pub fn subagent(parent: &str, child: &str, mode: &str) -> Self {
+        Self {
+            kind: "subagent".into(),
+            session_id: None,
+            parent_session_id: Some(parent.to_string()),
+            child_session_id: Some(child.to_string()),
+            mode: Some(mode.to_string()),
+        }
+    }
+}
+
+// ---------- subagents/* ----------
+
+/// `subagents/list(parentSessionId)` catalog (direct children only; the tree
+/// must recurse per parent guided by `hasChildren`).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubagentCatalog {
+    #[serde(default)]
+    pub entries: Vec<SubagentListEntry>,
+    #[serde(default)]
+    pub parent_available: bool,
+}
+
+/// One `subagents/list` entry (child / diagnostic variant; unknown kinds are
+/// preserved tolerantly as raw).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum SubagentListEntry {
+    #[serde(rename = "child", rename_all = "camelCase")]
+    Child {
+        id: String,
+        #[serde(default)]
+        activity: String,
+        #[serde(default)]
+        has_children: bool,
+        #[serde(default)]
+        mode: Option<String>,
+        #[serde(default)]
+        label: Option<String>,
+    },
+    #[serde(rename = "diagnostic", rename_all = "camelCase")]
+    Diagnostic {
+        id: String,
+        #[serde(default)]
+        reason: String,
+    },
+}
+
+/// `subagents/prompt` request args (single `request`-parameter endpoint).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubagentPromptRequest {
+    pub request_id: String,
+    pub parent_session_id: String,
+    pub child_session_id: String,
+    pub mode: String,
+    pub content: Vec<PromptContentPart>,
+}
+
+/// `subagents/prompt` / `subagents/interruptByParent` receipt.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubagentReceipt {
+    #[serde(default)]
+    pub accepted: Option<bool>,
+    #[serde(default)]
+    pub message_id: Option<String>,
+}
+
+// ---------- goals/* (per-session singleton; agentId first flat param) ----------
+
+/// Goal phase vocabulary (projection `goal.phase`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GoalPhase {
+    Active,
+    Paused,
+    Blocked,
+    Complete,
+}
+
+/// `goals/*` mutation receipt (`{ref:{id,revision}}`) — also the CAS payload
+/// (`revision` is echoed back on every mutation).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GoalRef {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub revision: u64,
+}
+
+/// One goal snapshot (also embedded in the `goal` projection).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GoalSnapshot {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub revision: u64,
+    #[serde(default)]
+    pub objective: String,
+    #[serde(default)]
+    pub phase: Option<GoalPhase>,
+    #[serde(default)]
+    pub blocked_reason: Option<String>,
+    #[serde(default)]
+    pub max_goal_rounds: Option<u64>,
+}
+
+/// `goals/create` request args (single `request`-parameter endpoint).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateGoalRequest {
+    pub objective: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_goal_rounds: Option<u64>,
+}
+
+// ---------- settings/* ----------
+
+/// `settings/describe` value.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SettingsDescribeValue {
+    #[serde(default)]
+    pub writable: bool,
+    #[serde(default)]
+    pub has_document: bool,
+    #[serde(default)]
+    pub namespaces: Vec<SettingsNamespaceView>,
+}
+
+/// One settings namespace view (describe/update/replace result).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SettingsNamespaceView {
+    #[serde(default)]
+    pub ns: String,
+    #[serde(default)]
+    pub schema: serde_json::Value,
+    #[serde(default)]
+    pub value: serde_json::Value,
+    #[serde(default)]
+    pub base: Option<serde_json::Value>,
+    #[serde(default)]
+    pub user: Option<serde_json::Value>,
+    #[serde(default)]
+    pub applies: String,
+    #[serde(default)]
+    pub secrets: Vec<String>,
+    #[serde(default)]
+    pub revision: u64,
+}
+
+/// One `settings/mutate` path operation.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SettingsPathOpView {
+    pub path: String,
+    #[serde(rename = "op")]
+    pub op_kind: String, // "set" | "unset"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<serde_json::Value>,
+}
+
+// ---------- skills/* ----------
+
+/// `skills/list(sessionId)` value.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillListValue {
+    #[serde(default)]
+    pub skills: Vec<SkillEntry>,
+}
+
+/// One skill entry.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillEntry {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub when_to_use: Option<String>,
+    #[serde(default)]
+    pub model_invocable: bool,
+}
+
+// ---------- @ mentions (fileReferences + sessionReferenceResolver) ----------
+
+/// One `fileReferences/list` candidate.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileReferenceCandidate {
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub kind: String, // "file" | "directory"
+}
+
+/// One `sessionReferenceResolver/candidates` candidate.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionReferenceMentionCandidate {
+    #[serde(default)]
+    pub session_id: String,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub same_workspace: bool,
+    #[serde(default)]
+    pub created_at: Option<i64>,
+    #[serde(default)]
+    pub mention: String,
+}
+
+// ---------- messageFeedback (CAS ifVersion) ----------
+
+/// `messageFeedback/put` request args.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageFeedbackPutRequest {
+    pub session_id: String,
+    pub message_id: String,
+    pub rating: String, // "positive" | "negative"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub if_version: Option<u64>,
+}
+
+/// One feedback item (`messageFeedback/list`).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageFeedbackItem {
+    #[serde(default)]
+    pub message_id: String,
+    #[serde(default)]
+    pub rating: String,
+    #[serde(default)]
+    pub note: Option<String>,
+    #[serde(default)]
+    pub version: Option<u64>,
+}
+
+// ---------- directoryPicker (workspace-controller; optional enhancement) ----------
+
+/// `directoryPicker/list` entry.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DirectoryEntry {
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub kind: String, // "file" | "directory"
+}
+
+// ---------- SessionJob (session/control jobs mirror) ----------
+
+/// Job status vocabulary (0.1.2-rc.1: no progress field, no stop endpoint).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionJobStatus {
+    Running,
+    Stopping,
+    Completed,
+    Killed,
+    Failed,
+}
+
+/// One `SessionJob` (from control baseline.jobs / `jobs` replacement frames).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionJob {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub status: Option<SessionJobStatus>,
+    #[serde(default)]
+    pub detail: Option<String>,
+    #[serde(default)]
+    pub started_at: Option<i64>,
+    #[serde(default)]
+    pub finished_at: Option<i64>,
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -360,3 +360,43 @@ pub fn parse_control_item(value: &Value) -> Option<super::types::ControlItem> {
             raw: value.clone(),
         })
 }
+
+/// Parse a `jobs` payload (from a control baseline `jobs` field or a `jobs`
+/// replacement frame) into a flat job list.
+///
+/// Tolerant shapes (0.1.2-rc.1 control frames `[未验证]`, contract smoke
+/// locks them):
+/// - a bare array `[SessionJob, ...]` (replacement frame);
+/// - an object `{ "sess-1": [SessionJob, ...], ... }` (per-session baseline);
+/// - `{items: [...]}` wrapper.
+///
+/// Unknown/undecodable rows are skipped with a warning (never fatal).
+pub fn parse_jobs(value: &Value) -> Vec<super::types::SessionJob> {
+    let mut out = Vec::new();
+    let mut collect = |arr: &[Value]| {
+        for v in arr {
+            match serde_json::from_value::<super::types::SessionJob>(v.clone()) {
+                Ok(job) => out.push(job),
+                Err(e) => tracing::warn!(error = %e, "jobs 帧一条解析失败，跳过"),
+            }
+        }
+    };
+    match value {
+        Value::Array(arr) => collect(arr),
+        Value::Object(map) => {
+            if let Some(items) = value.get("items").and_then(|v| v.as_array()) {
+                collect(items);
+            } else {
+                // per-session baseline: {"sessionId": [jobs]}
+                for (_k, v) in map {
+                    if let Some(arr) = v.as_array() {
+                        collect(arr);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
