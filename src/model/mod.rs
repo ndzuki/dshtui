@@ -7,6 +7,7 @@
 
 pub mod agent_roster;
 pub mod agent_town;
+pub mod approval;
 pub mod draft;
 pub mod image;
 pub mod kb_stats;
@@ -30,6 +31,7 @@ pub use image::{
     ImageViewError, ImageViewPhase, ImageViewState, OriginalDimensions, SUPPORTED_IMAGE_TYPES,
 };
 pub use kb_stats::{KbBucket, KbHistogram, KbStatsError, KbStatsSnapshot, KB_DURATION_BOUNDARIES};
+pub use approval::{ApprovalItem, ApprovalQueue, ApprovalSummary};
 pub use projections::ProjectionSnapshot;
 pub use search::{SearchIndex, SearchItem, SearchKind, SearchKindFilter, SearchMatch};
 pub use session::{
