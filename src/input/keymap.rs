@@ -21,12 +21,15 @@ pub enum InputMode {
     Approval,
     /// REQ-004 V0.2：IMAGEVIEW 模式（仅 Kitty 渲染态出现，D-14）。
     ImageView,
+
     /// REQ-005 V0.3：Trajectory 视图（D-25：独立模式；详情为内嵌焦点子层，
     /// 不新增 InputMode——`q`/`y`/`j`/`k` 由 AppState 按 focus 分派）。
     Trajectory,
     /// REQ-005：轨迹内过滤输入态（`/` 打开后任意字符进 query；仍在
     /// Trajectory 模式，模态上不离开轨迹 tab）。
     TrajectoryFilter,
+    /// REQ-009 V0.3：MONITOR 模式（`dshtui monitor` 独立键位表）。
+    Monitor,
 }
 
 /// Domain commands emitted by the input layer.
@@ -107,6 +110,15 @@ pub enum Command {
     ToggleFold,
     /// `Enter` / `d`：打开选中事件详情（右栏子层）。
     OpenDetail,
+    // ---------- REQ-009 MONITOR 级键位（FR-009-04） ----------
+    /// `c`：对焦点 agent 打开问答（`/agent/chat`）。
+    MonitorOpenChat,
+    /// `s`：打开 KB 统计 pane。
+    MonitorStats,
+    /// `f`：加油动效（颜色脉冲 + 状态提示）。
+    MonitorCheer,
+    /// `l`：定位焦点 agent（跳转 NPC + 状态提示）。
+    MonitorLocate,
 }
 
 /// Stateful decoder for multi-key Normal-mode commands such as `gg`.
@@ -145,6 +157,7 @@ impl KeyDecoder {
             InputMode::ImageView => self.image_view(key),
             InputMode::Trajectory => self.trajectory(key),
             InputMode::TrajectoryFilter => self.trajectory_filter(key),
+            InputMode::Monitor => self.monitor(key),
         }
     }
 
@@ -431,6 +444,54 @@ impl KeyDecoder {
             KeyCode::Char('y') if key.modifiers.is_empty() => Some(Command::ImageViewCopy),
             KeyCode::Char('q') if key.modifiers.is_empty() => Some(Command::ImageViewClose),
             _ => None,
+        }
+    }
+
+    /// REQ-009 MONITOR 键位（FR-009-04，vim 风格）：`j/k` 焦点、`gg/G` 首尾、
+    /// `Enter` 详情、`c` 问答、`f` 加油、`l` 定位、`s` KB 统计、`/` 过滤、
+    /// `q` 退出、`?` 帮助。Chat/Filter 输入态复用 Insert 语义（Esc/Enter/
+    /// Backspace/字符）。
+    fn monitor(&mut self, key: KeyEvent) -> Option<Command> {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Char('g') if !ctrl => {
+                if self.pending_g {
+                    self.pending_g = false;
+                    Some(Command::GotoTop)
+                } else {
+                    self.pending_g = true;
+                    None
+                }
+            }
+            KeyCode::Char(c) => {
+                self.pending_g = false;
+                match (c, ctrl) {
+                    ('j', false) => Some(Command::MoveDown),
+                    ('k', false) => Some(Command::MoveUp),
+                    ('G', false) => Some(Command::GotoBottom),
+                    ('c', false) => Some(Command::MonitorOpenChat),
+                    ('f', false) => Some(Command::MonitorCheer),
+                    ('l', false) => Some(Command::MonitorLocate),
+                    ('s', false) => Some(Command::MonitorStats),
+                    ('/', false) => Some(Command::StartSearch),
+                    ('?', false) => Some(Command::OpenHelp),
+                    ('q', false) => Some(Command::Quit),
+                    ('c', true) => Some(Command::Quit),
+                    _ => None,
+                }
+            }
+            KeyCode::Enter if !ctrl => {
+                self.pending_g = false;
+                Some(Command::OpenFocused)
+            }
+            KeyCode::Esc => {
+                self.pending_g = false;
+                Some(Command::ClosePicker)
+            }
+            _ => {
+                self.pending_g = false;
+                None
+            }
         }
     }
 }

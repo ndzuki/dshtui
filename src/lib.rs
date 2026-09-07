@@ -10,4 +10,5 @@ pub mod cache;
 pub mod config;
 pub mod input;
 pub mod model;
+pub mod perf;
 pub mod ui;

@@ -41,6 +41,44 @@ cargo build --release          # 或 cargo run --
 | `r` | 启动失败时重试探测 |
 | `q` / `Ctrl+c` | 退出（运行中会话先确认，再请求 stop 后恢复终端） |
 
+## Agent 监控面板（V0.3，REQ-009）
+
+把 obsidian-task-runner agent-server 的 HTML「Agent Town」搬到 Kitty tab 的 Rust
+TUI 像素小镇：
+
+```bash
+dshtui monitor [--addr http://127.0.0.1:8799] [--log <file>]
+```
+
+- 数据源：直连本机 OTR agent-server（默认 `127.0.0.1:8799`）——
+  `GET /agents` 2s 轮询（`x-agents-finished` 完工计数）、`GET /kb-stats` 30s、
+  `POST /agent/chat` 一问一答（同 agent 多轮复用 sessionId）；零后端改动。
+- Kitty 终端：960×540 像素小镇（四季色板/昼夜光影/STAGE→职业建筑/装饰居民/
+  A* 寻路），静态背景只传一次，后续帧 kitty `a=f` 脏矩形增量（20–30fps 预算，
+  静态停帧）；鼠标点击 NPC 开详情（幂等）。
+- 非 Kitty 终端：自动降级纯文本 roster，功能键位不变。
+- 键位：`j/k` 焦点、`gg/G` 首尾、`Enter` 详情、`c` 问答、`f` 加油、`l` 定位、
+  `s` KB 统计、`/` 过滤、`q` 退出、`?` 帮助。
+- 不可达：启动指引 + 指数退避重试（不自动拉起 agent-server），恢复自动续。
+
+kitty 快捷键（可选，写入 `~/.config/kitty/kitty.conf`，非程序职责）：
+
+```conf
+map ctrl+shift+m launch --type=tab --cwd=current dshtui monitor
+```
+
+配置段（`~/.config/dshtui/config.toml`）：
+
+```toml
+[monitor]
+addr = "http://127.0.0.1:8799"
+poll_agents_ms = 2000
+poll_kb_ms = 30000
+```
+
+性能测量（Notes/06 §8 口径）：`DSHTUI_PERF_LOG=/tmp/dshtui-perf.log dshtui monitor`
+每 5s 追加一行 `rss_mb / frame_p50_ms / poll_ms`。
+
 ## 测试与质量
 
 ```bash

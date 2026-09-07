@@ -44,6 +44,9 @@ image = { version = "0.24.5", default-features = false, features = ["gif", "jpeg
 ratatui-image = "0.10"
 base64 = "0.22"
 lru = "0.12"
+# REQ-009 kitty `o=z` 帧压缩（zlib deflate，miniz_oxide 纯 Rust 后端）——
+# 2.5MB 全量帧 → ~400KB，RSS <20MB 与帧率预算的关键（2026-09-07 实测）。
+flate2 = "1"
 
 [dev-dependencies]
 

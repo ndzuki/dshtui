@@ -1,5 +1,6 @@
 //! Ratatui view composition for the dshtui application.
 
+pub mod agent_town;
 pub mod approval;
 pub mod chat;
 pub mod composer;
@@ -8,6 +9,7 @@ pub mod image;
 pub mod image_view;
 pub mod layout;
 pub mod markdown;
+pub mod monitor;
 pub mod outline;
 pub mod picker;
 pub mod search;

@@ -434,6 +434,7 @@ dependencies = [
  "arboard",
  "base64 0.22.1",
  "crossterm",
+ "flate2",
  "futures-util",
  "http",
  "image 0.24.9",

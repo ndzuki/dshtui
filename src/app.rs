@@ -16,6 +16,9 @@
 //!   exit (AC-001-08);
 //! - permission errors (PERMISSION_DENIED) are not auto-retried (Notes/03 §8).
 
+// REQ-009：`dshtui monitor` 独立状态机与事件循环（同一二进制共存）。
+pub mod monitor;
+
 use std::collections::{HashMap, HashSet};
 
 use crate::api::types::ChunkRow;
@@ -2176,6 +2179,7 @@ impl AppState {
                 self.startup_guidance = None;
                 vec![]
             }
+
             // REQ-005：Chat（NORMAL）`gt`/`2` → Trajectory（AC-005-01）。
             C::ToggleTrajectory => {
                 if self.mode == Mode::Normal {
@@ -2187,6 +2191,10 @@ impl AppState {
             C::GotoChat => vec![],
             // REQ-005：折叠/详情仅 Trajectory 模式语义（此处穷尽性 arm）。
             C::ToggleFold | C::OpenDetail => vec![],
+
+            // REQ-009 monitor 键位：主界面 Chat 上下文为 no-op（monitor
+            // 状态机自行处理，两套状态机共存于同一二进制）。
+            C::MonitorOpenChat | C::MonitorStats | C::MonitorCheer | C::MonitorLocate => vec![],
             C::Resize { width, height } => self.handle(AppEvent::Resize { width, height }),
         }
     }

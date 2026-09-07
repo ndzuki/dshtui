@@ -5,20 +5,31 @@
 //! testable); the single maintenance point for seq/requestId/window
 //! capacity/anchor (Step 3 is the correctness seam).
 
+pub mod agent_roster;
+pub mod agent_town;
 pub mod draft;
 pub mod image;
+pub mod kb_stats;
 pub mod projections;
 pub mod search;
 pub mod session;
+
 pub mod trajectory;
+
+pub mod sprite_tables;
 pub mod workspace;
 pub mod yank;
 
+pub use agent_roster::{
+    esc, fmt_elapsed, short_session, stage_key, stage_meta, AgentKind, AgentRosterEntry,
+    AgentStatus, RosterSnapshot, StageMeta, STAGES,
+};
 pub use draft::{DraftRegistry, DraftState, InputHistory};
 pub use image::{
     image_block_of, is_supported_image, AttachmentRef, ImageBlockRef, ImageCacheEntry,
     ImageViewError, ImageViewPhase, ImageViewState, OriginalDimensions, SUPPORTED_IMAGE_TYPES,
 };
+pub use kb_stats::{KbBucket, KbHistogram, KbStatsError, KbStatsSnapshot, KB_DURATION_BOUNDARIES};
 pub use projections::ProjectionSnapshot;
 pub use search::{SearchIndex, SearchItem, SearchKind, SearchKindFilter, SearchMatch};
 pub use session::{
