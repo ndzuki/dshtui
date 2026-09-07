@@ -2325,6 +2325,35 @@ impl AppState {
             | C::ExpandProject
             | C::VisualStart { .. }
             | C::RetryProbe => Some(vec![]),
+            C::GotoTop => {
+                // S2 修复：轨迹 gg 跳列表顶 + 触发**轨迹自己的**历史分页
+                // （窗口 head_has_more + Ready + single-flight），不再落全局
+                // scroll 改隐藏 Chat 视口（AC-005-07 独立 loadOlder seam）。
+                let before = self.traj.cursor;
+                self.traj.cursor = 0;
+                if self.traj.detail_open && self.traj.cursor != before {
+                    self.rebuild_traj_detail();
+                }
+                let has_more = self
+                    .active_traj_window()
+                    .map(|w| w.head_has_more())
+                    .unwrap_or(false);
+                let mut cmds = vec![];
+                if has_more && self.conn == ConnState::Ready && !self.page_guard.in_flight {
+                    cmds.push(self.page_cmd());
+                }
+                Some(cmds)
+            }
+            C::GotoBottom => {
+                // 轨迹 G 跳列表底（最新事件），对齐 Chat follow_tail 语义。
+                let len = self.traj_view_len();
+                let before = self.traj.cursor;
+                self.traj.cursor = len.saturating_sub(1);
+                if self.traj.detail_open && self.traj.cursor != before {
+                    self.rebuild_traj_detail();
+                }
+                Some(vec![])
+            }
             // 其余（Resize 等）交全局逻辑。
             _ => None,
         }

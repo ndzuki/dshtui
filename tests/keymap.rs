@@ -1454,3 +1454,40 @@ fn trajectory_pending_g_cleared_on_non_prefix_keys_ac005_01() {
         "Esc 后 t 不再触发 gt"
     );
 }
+
+#[test]
+fn trajectory_gg_requests_traj_page_without_touching_chat_viewport_ac005_07() {
+    // code-review S2 修复证据：轨迹 gg 触发轨迹自己的历史分页 seam，
+    // 不再落全局 scroll 改隐藏 Chat 视口（AC-005-07 loadOlder 独立触发）。
+    let mut app = traj_app();
+    app.handle_command(Command::ToggleTrajectory);
+    let vp_before = app.viewport.clone();
+    let cmds = app.handle_command(Command::GotoTop);
+    assert!(
+        matches!(cmds.as_slice(), [dshtui::app::Cmd::RequestPage { .. }]),
+        "轨迹 head_has_more + Ready → 发历史分页: {cmds:?}"
+    );
+    assert_eq!(app.viewport, vp_before, "gg 不改隐藏 Chat 视口");
+    assert_eq!(app.traj.cursor, 0, "轨迹光标到顶");
+}
+
+#[test]
+fn trajectory_goto_bottom_jumps_latest_and_no_page_ac005_07() {
+    let mut app = traj_app();
+    app.handle_command(Command::ToggleTrajectory);
+    app.handle_command(Command::GotoTop); // 光标到顶
+    let cmds = app.handle_command(Command::GotoBottom);
+    assert!(
+        !cmds
+            .iter()
+            .any(|c| matches!(c, dshtui::app::Cmd::RequestPage { .. })),
+        "G 跳底不触发分页"
+    );
+    let len = app
+        .traj_sessions
+        .get("sess-traj")
+        .unwrap()
+        .view(&app.traj.fold)
+        .len();
+    assert_eq!(app.traj.cursor, len - 1, "光标跳列表底（最新）");
+}
