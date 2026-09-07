@@ -2442,9 +2442,7 @@ impl AppState {
                 }]
             }
             C::ClosePicker | C::Quit => {
-                if self.export.phase == crate::model::export::ExportPhase::Downloading
-                    || self.export.phase == crate::model::export::ExportPhase::Rebuilding
-                {
+                if self.export.phase == crate::model::export::ExportPhase::Downloading {
                     self.export.cancelled = true;
                     self.notice = Some("导出已取消——在途下载完成后临时文件自动清理".into());
                 }

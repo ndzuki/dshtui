@@ -75,12 +75,6 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
                 Style::default().fg(accent),
             )));
         }
-        ExportPhase::Rebuilding => {
-            lines.push(Line::from(Span::styled(
-                " ⏳ page 重建 JSONL 中…",
-                Style::default().fg(Color::Yellow),
-            )));
-        }
         ExportPhase::Done => {
             lines.push(Line::from(Span::styled(
                 format!(

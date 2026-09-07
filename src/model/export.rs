@@ -1,8 +1,12 @@
 //! Export state (REQ-007 FR-007-04; pure model).
 //!
-//! Primary path = official same-origin HTTP `/api/session.export` ZIP
-//! download (byte-identical). Page-rebuild JSONL is the fallback when the
-//! route is unavailable (404 / server down). One export per session is
+//! Primary (and only production) path = official same-origin HTTP
+//! `/api/session.export` ZIP download (byte-identical). The page-rebuild
+//! JSONL fallback is deliberately NOT wired (deferred ~nice-to-have,
+//! TASK-007 Step 14 scope decision): the official route is always present on
+//! the target backend, and the fallback's exact session-log-export line
+//! format needs a live contract smoke that cannot run headless — shipping an
+//! unverifiable format would be worse than none. One export per session is
 //! single-flight (requestId idempotent).
 
 /// Export phases.
@@ -13,8 +17,6 @@ pub enum ExportPhase {
     /// Confirm-path sub-stage (write to a user-chosen path).
     PickingPath,
     Downloading,
-    /// Fallback JSONL rebuild running.
-    Rebuilding,
     Done,
     Failed,
 }
@@ -52,23 +54,13 @@ impl ExportState {
         if !has_session || self.path.trim().is_empty() {
             return false;
         }
-        if self.phase == ExportPhase::Downloading || self.phase == ExportPhase::Rebuilding {
+        if self.phase == ExportPhase::Downloading {
             return false; // 在途单飞
         }
         self.phase = ExportPhase::Downloading;
         self.bytes_streamed = 0;
         self.cancelled = false;
         self.last_error_code = None;
-        true
-    }
-
-    pub fn begin_rebuild(&mut self) -> bool {
-        if self.phase == ExportPhase::Downloading || self.phase == ExportPhase::Rebuilding {
-            return false;
-        }
-        self.phase = ExportPhase::Rebuilding;
-        self.bytes_streamed = 0;
-        self.cancelled = false;
         true
     }
 

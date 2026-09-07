@@ -9,8 +9,8 @@
 //!   `session.jsonl` at the root + `subagents/<id>/...` + `media/...`
 //!   (DEFLATE default 6, no manifest);
 //! - this download is BYTE-IDENTICAL to the official export (highest
-//!   fidelity); page-rebuild JSONL is only the fallback when the route is
-//!   unavailable (404 / server down);
+//!   fidelity); the page-rebuild JSONL fallback is deferred ~nice-to-have
+//!   (TASK-007 Step 14 scope decision — format not verifiable headless);
 //! - streaming: chunks are written to a temp file in the TARGET directory and
 //!   renamed on success (atomic; never whole-file in memory — RSS budget).
 
