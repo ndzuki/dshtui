@@ -15,6 +15,11 @@ const HINT_LINE: &str = "[i]输入 [/]搜索 [f]切换 [?]帮助 [q]退出";
 /// IMAGEVIEW 模式提示行（REQ-004 D-14/05 §10：`o` 系统查看器 `y` 复制路径
 /// `q` 关闭）。
 const IMAGE_HINT_LINE: &str = "[o]系统查看器 [y]复制路径 [q]关闭";
+/// REQ-005 Trajectory 列表提示行（Notes/05 §7：j/k 选择 Enter 详情 z 折叠
+/// / 搜索 gt 回对话）。
+const TRAJ_HINT_LINE: &str = "[j/k]选择 [Enter]详情 [z]折叠 [/]搜索 [gt]回对话";
+/// REQ-005 详情子层提示行（Notes/05 §8：y 复制 q 关闭 j/k 滚动）。
+const DETAIL_HINT_LINE: &str = "[y]复制 [j/k]滚动 [q]关闭";
 /// 窄终端省略快捷键提示行（FR-001-05）。
 const MIN_WIDTH_FOR_HINT: u16 = 50;
 
@@ -95,6 +100,24 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             ));
+        }
+        // REQ-005：Trajectory 模式指示（D-25）。
+        crate::app::Mode::Trajectory => {
+            spans.push(Span::styled(
+                " TRAJ ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            // 详情子层指示（D-25：Trajectory 内焦点子层）。
+            if app.traj.detail_open && app.focus == crate::app::Focus::Details {
+                spans.push(Span::styled(
+                    " DETAILS ",
+                    Style::default()
+                        .fg(Color::Magenta)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
         }
         _ => {}
     }
@@ -265,6 +288,15 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         };
         let mut hint = if app.mode == crate::app::Mode::ImageView {
             IMAGE_HINT_LINE.to_string()
+        } else if app.mode == crate::app::Mode::Trajectory
+            && app.traj.detail_open
+            && app.focus == crate::app::Focus::Details
+        {
+            // REQ-005 详情子层提示（Notes/05 §8 `DETAILS`）。
+            DETAIL_HINT_LINE.to_string()
+        } else if app.mode == crate::app::Mode::Trajectory {
+            // REQ-005 轨迹列表提示（Notes/05 §7 `TRAJ`）。
+            TRAJ_HINT_LINE.to_string()
         } else {
             HINT_LINE.to_string()
         };

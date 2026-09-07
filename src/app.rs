@@ -26,9 +26,10 @@ use crate::api::types::{
 };
 use crate::api::{ClientError, ErrorClass};
 use crate::model::{
-    block_plain_text, block_yank_target, selection_text, ApplyEffect, AttachmentRef, DraftRegistry,
-    DraftState, ImageViewState, Incoming, InputHistory, SearchIndex, SearchKindFilter,
-    SessionStore, VisualMode, VisualSelection, WorkspaceStore, YankBackend, YankState,
+    block_plain_text, block_yank_target, detail_for, selection_text, ApplyEffect, AttachmentRef,
+    DraftRegistry, DraftState, FoldState, ImageViewState, Incoming, InputHistory, SearchIndex,
+    SearchKindFilter, SessionStore, TrajIncoming, VisualMode, VisualSelection, WorkspaceStore,
+    YankBackend, YankState,
 };
 
 /// 已编码的 Kitty 帧（ratatui-image `Protocol` 对象；`Box<dyn Protocol>` 无
@@ -56,6 +57,9 @@ pub enum Mode {
     Approval,
     /// ImageView（REQ-004 V0.2：仅 Kitty 渲染态出现，`q` 回 NORMAL）。
     ImageView,
+    /// Trajectory（REQ-005 V0.3，D-25）：顶部 Tab 独立模式；右栏详情为
+    /// Trajectory 内焦点子层（`focus==Details` + `traj.detail_open`）。
+    Trajectory,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -172,6 +176,30 @@ pub struct ApprovalState {
 pub struct OutlineState {
     pub open: bool,
     pub selection: usize,
+}
+
+/// 轨迹内过滤输入态（`/`；Step 3 建输入态，Step 4 完成 nucleo 匹配）。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TrajFilterState {
+    pub open: bool,
+    pub query: String,
+}
+
+/// Trajectory 视图状态（REQ-005 §5 状态机，D-25；全部内存、单写多读）。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TrajState {
+    /// 折叠状态（纯数据；跨 gt/gT 切换保留）。
+    pub fold: crate::model::FoldState,
+    /// 选中行下标（视图行序；j/k 移动，gt/gT 保留）。
+    pub cursor: usize,
+    /// 详情子层开（D-25：Trajectory 内焦点子层，`Enter`/`d` 开）。
+    pub detail_open: bool,
+    /// 当前详情（打开时由 detail_for 构建；行变化/关闭失效，source 锚点防串）。
+    pub detail: Option<crate::model::TrajectoryDetail>,
+    /// 详情面板滚动偏移（j/k 于 Details 焦点时）。
+    pub detail_scroll: usize,
+    /// 轨迹内过滤（`/`）。
+    pub filter: TrajFilterState,
 }
 
 /// Local stop transition (REQ-002 §5): shows「停止中」while requested; ends
@@ -483,6 +511,11 @@ pub struct AppState {
     pub conn: ConnState,
     pub active_session: Option<SessionId>,
     pub sessions: SessionStore,
+    /// REQ-005：多会话轨迹窗口缓存（最近 3，独立投影 D-23，不扩展
+    /// `sessions` 的 TranscriptWindow）。
+    pub traj_sessions: crate::model::TrajectoryStore,
+    /// Trajectory 视图状态（折叠/选中/详情/过滤）。
+    pub traj: TrajState,
     pub workspaces: WorkspaceStore,
     pub viewport: Viewport,
     pub picker: PickerState,
@@ -567,6 +600,8 @@ impl Default for AppState {
             conn: ConnState::Connecting,
             active_session: None,
             sessions: SessionStore::new(3),
+            traj_sessions: crate::model::TrajectoryStore::new(3),
+            traj: TrajState::default(),
             workspaces: WorkspaceStore::new(),
             viewport: Viewport::default(),
             picker: PickerState::default(),
@@ -763,11 +798,21 @@ impl AppState {
                     let w = self.sessions.touch(&session_id.0, self.window_cap);
                     w.apply(Incoming::Snapshot {
                         cursor,
+                        records: records.clone(),
+                        has_more,
+                        projections: projections.clone(),
+                    })
+                };
+                // REQ-005：同一快照喂独立轨迹投影（D-23，边界事件全保留）。
+                {
+                    let tw = self.traj_sessions.touch(&session_id.0, self.window_cap);
+                    tw.apply(TrajIncoming::Snapshot {
+                        cursor,
                         records,
                         has_more,
                         projections,
-                    })
-                };
+                    });
+                }
                 self.adjust_viewport(&eff);
                 self.window_changed();
                 // Reconnect reconciliation: send the browsed gap after the
@@ -780,20 +825,31 @@ impl AppState {
                 }
             }
             AppEvent::FollowEvent { session_id, event } => {
-                let Some(w) = self.sessions.get_mut(&session_id.0) else {
-                    tracing::warn!(session = %session_id, "事件到达但窗口不存在，丢弃");
-                    return vec![];
+                let eff = {
+                    let Some(w) = self.sessions.get_mut(&session_id.0) else {
+                        tracing::warn!(session = %session_id, "事件到达但窗口不存在，丢弃");
+                        return vec![];
+                    };
+                    w.apply(Incoming::FollowEvent(event.clone()))
                 };
-                let eff = w.apply(Incoming::FollowEvent(event));
+                // REQ-005：同一事件喂轨迹投影（边界事件不丢，D-23）。
+                if let Some(tw) = self.traj_sessions.get_mut(&session_id.0) {
+                    tw.apply(TrajIncoming::FollowEvent(event));
+                }
                 self.adjust_viewport(&eff);
                 self.window_changed();
                 vec![]
             }
             AppEvent::FollowChunks { session_id, row } => {
-                let Some(w) = self.sessions.get_mut(&session_id.0) else {
-                    return vec![];
+                let eff = {
+                    let Some(w) = self.sessions.get_mut(&session_id.0) else {
+                        return vec![];
+                    };
+                    w.apply(Incoming::Chunks(row.clone()))
                 };
-                let eff = w.apply(Incoming::Chunks(row));
+                if let Some(tw) = self.traj_sessions.get_mut(&session_id.0) {
+                    tw.apply(TrajIncoming::Chunks(row));
+                }
                 self.adjust_viewport(&eff);
                 self.window_changed();
                 vec![]
@@ -823,13 +879,19 @@ impl AppState {
                     return vec![];
                 }
                 self.page_guard.in_flight = false;
-                let eff = self
-                    .sessions
-                    .get_mut(&session_id.0)
-                    .map(|w| w.apply(Incoming::Page { records, has_more }));
+                let eff = self.sessions.get_mut(&session_id.0).map(|w| {
+                    w.apply(Incoming::Page {
+                        records: records.clone(),
+                        has_more,
+                    })
+                });
                 if let Some(eff) = eff {
                     self.adjust_viewport(&eff);
                     self.window_changed();
+                }
+                // REQ-005：同一页喂轨迹投影（前插合并无重复无空洞，AC-005-07）。
+                if let Some(tw) = self.traj_sessions.get_mut(&session_id.0) {
+                    tw.apply(TrajIncoming::Page { records, has_more });
                 }
                 vec![]
             }
@@ -1746,6 +1808,13 @@ impl AppState {
         if !matches!(&cmd, C::Quit) {
             self.quit_requested = false;
         }
+        // REQ-005：Trajectory 模式命令分流（模态上下文：详情子层 q 关面板、
+        // 列表焦点 q 退出；D-25）。
+        if self.mode == Mode::Trajectory {
+            if let Some(cmds) = self.handle_trajectory_command(cmd.clone()) {
+                return cmds;
+            }
+        }
         match cmd {
             C::MoveDown
             | C::MoveUp
@@ -1828,6 +1897,9 @@ impl AppState {
                 }
                 // IMAGEVIEW：Esc 无语义（`q` 关闭，D-14）。
                 Mode::ImageView => vec![],
+                // REQ-005：Trajectory Esc（详情/过滤关闭）已由分流处理；
+                // 此处保持穷尽性。
+                Mode::Trajectory => vec![],
             },
             C::PickerDown => {
                 if self.mode == Mode::Search {
@@ -2089,8 +2161,255 @@ impl AppState {
                 self.startup_guidance = None;
                 vec![]
             }
+            // REQ-005：Chat（NORMAL）`gt`/`2` → Trajectory（AC-005-01）。
+            C::ToggleTrajectory => {
+                if self.mode == Mode::Normal {
+                    self.switch_to_trajectory();
+                }
+                vec![]
+            }
+            // `gT`/`1` 在 Chat 已是目标 Tab：no-op。
+            C::GotoChat => vec![],
+            // REQ-005：折叠/详情仅 Trajectory 模式语义（此处穷尽性 arm）。
+            C::ToggleFold | C::OpenDetail => vec![],
             C::Resize { width, height } => self.handle(AppEvent::Resize { width, height }),
         }
+    }
+
+    // ---------- REQ-005: Trajectory 模式机与详情子层（D-25） ----------
+
+    /// 当前活跃会话的轨迹窗口（只读）。
+    fn active_traj_window(&self) -> Option<&crate::model::TrajectoryWindow> {
+        self.active_session
+            .as_ref()
+            .and_then(|id| self.traj_sessions.get(&id.0))
+    }
+
+    /// Trajectory 模式命令分派。返回 Some = 已处理（模态上下文语义，
+    /// D-25：详情子层 q 关面板、列表焦点 q 退出、y 复制、j/k 详情滚动）。
+    /// 返回 None = 非 Trajectory 专属命令（交全局 handle_command 现有逻辑，
+    /// 如 Resize/CycleFocus 全局语义保持）。
+    fn handle_trajectory_command(&mut self, cmd: crate::input::Command) -> Option<Vec<Cmd>> {
+        use crate::input::Command as C;
+        match cmd {
+            C::ToggleTrajectory | C::GotoChat => {
+                self.switch_to_chat();
+                Some(vec![])
+            }
+            C::MoveDown | C::MoveUp => {
+                if self.traj.detail_open && self.focus == Focus::Details {
+                    // 详情子层：j/k 滚动详情文本。
+                    let max = self.traj_detail_row_count().saturating_sub(1);
+                    match cmd {
+                        C::MoveDown => {
+                            self.traj.detail_scroll = (self.traj.detail_scroll + 1).min(max)
+                        }
+                        C::MoveUp => {
+                            self.traj.detail_scroll = self.traj.detail_scroll.saturating_sub(1)
+                        }
+                        _ => {}
+                    }
+                } else if self.focus == Focus::Center {
+                    self.move_traj_cursor(matches!(cmd, C::MoveDown));
+                }
+                Some(vec![])
+            }
+            C::ToggleFold => {
+                self.toggle_traj_fold();
+                Some(vec![])
+            }
+            C::OpenDetail => {
+                self.open_traj_detail();
+                Some(vec![])
+            }
+            C::StartSearch => {
+                // 轨迹内过滤：仍在 Trajectory 模式（与 Chat 结构化搜索分离，
+                // 不串模式——Step 3 建输入态，Step 4 补 nucleo 匹配）。
+                self.traj.filter.open = true;
+                self.traj.filter.query.clear();
+                Some(vec![])
+            }
+            C::YankContext => {
+                if self.traj.detail_open && self.focus == Focus::Details {
+                    Some(self.yank_traj_detail())
+                } else {
+                    Some(vec![])
+                }
+            }
+            C::Quit => {
+                if self.traj.detail_open && self.focus == Focus::Details {
+                    self.close_traj_detail();
+                    Some(vec![])
+                } else {
+                    // 轨迹列表焦点：全局 q（运行中先 stop 确认）。
+                    Some(self.quit())
+                }
+            }
+            C::ClosePicker => {
+                if self.traj.detail_open && self.focus == Focus::Details {
+                    self.close_traj_detail();
+                } else if self.traj.filter.open {
+                    self.traj.filter.open = false;
+                }
+                Some(vec![])
+            }
+            C::CycleFocus => {
+                // Ctrl+w：Sidebar ↔ Center(Trajectory) ↔ Details（详情开时）。
+                self.focus = match self.focus {
+                    Focus::Sidebar => Focus::Center,
+                    Focus::Center if self.traj.detail_open => Focus::Details,
+                    Focus::Details => Focus::Sidebar,
+                    Focus::Center => Focus::Sidebar,
+                };
+                Some(vec![])
+            }
+            C::OpenSelected
+            | C::OpenFocused
+            | C::OpenPicker
+            | C::InsertMode
+            | C::OpenOutline
+            | C::OpenHelp
+            | C::StopRunning
+            | C::CollapseProject
+            | C::ExpandProject
+            | C::VisualStart { .. }
+            | C::RetryProbe => Some(vec![]),
+            // 其余（Resize 等）交全局逻辑。
+            _ => None,
+        }
+    }
+
+    /// 详情文本行数（供 detail_scroll clamp；由 Detail 行布局决定，UI 层
+    /// 同步裁剪）。
+    fn traj_detail_row_count(&self) -> usize {
+        let mut n = 0usize;
+        if let Some(d) = &self.traj.detail {
+            n += 4; // title + 分隔线基础行
+            if let Some(args) = &d.args_text {
+                n += args.lines().count() + 1;
+            }
+            if let Some(result) = &d.result_text {
+                n += result.lines().count() + 1;
+            }
+            n += 4; // error / usage / timing / diff 基础行
+            if let Some(diff) = &d.diff {
+                n += diff.lines().count() + 1;
+            }
+        }
+        n
+    }
+
+    /// 轨迹视图行数（折叠后可见行；AppState 视角供 cursor 移动 clamp）。
+    fn traj_view_len(&self) -> usize {
+        self.active_traj_window()
+            .map(|w| w.view(&self.traj.fold).len())
+            .unwrap_or(0)
+    }
+
+    fn move_traj_cursor(&mut self, down: bool) {
+        let len = self.traj_view_len();
+        if down {
+            self.traj.cursor = (self.traj.cursor + 1).min(len.saturating_sub(1));
+        } else {
+            self.traj.cursor = self.traj.cursor.saturating_sub(1);
+        }
+        // 详情开时选中行不随列表滚动变化（详情锚点锁定）。
+    }
+
+    fn toggle_traj_fold(&mut self) {
+        // 取选中行的折叠组（借用分离：先只读 RowId → 再改 fold）。
+        let group = {
+            let Some(window) = self.active_traj_window() else {
+                return;
+            };
+            let view = window.view(&self.traj.fold);
+            let Some(row) = view.get(self.traj.cursor) else {
+                return;
+            };
+            window.group_of(row.id())
+        };
+        if let Some(g) = group {
+            let now_collapsed = self.traj.fold.toggle(g);
+            // 折叠后 cursor 定位到该组组首（折叠后唯一保留的组成员，仍可经
+            // group_of 识别）——再次 za 时 cursor 落在组首，toggle 能命中同
+            // 组展开（AC-005-04/12 z/za 往返正确）。
+            if now_collapsed {
+                if let Some(window) = self.active_traj_window() {
+                    let view = window.view(&self.traj.fold);
+                    if let Some(pos) = view.iter().position(|r| window.group_of(r.id()) == Some(g))
+                    {
+                        self.traj.cursor = pos;
+                    }
+                }
+            }
+            self.traj.cursor = self.traj.cursor.min(self.traj_view_len().saturating_sub(1));
+        }
+    }
+
+    fn open_traj_detail(&mut self) {
+        // 计算详情（纯函数 detail_for），计算结束即释放窗口借用。
+        let detail = {
+            let Some(window) = self.active_traj_window() else {
+                return;
+            };
+            let view = window.view(&self.traj.fold);
+            let Some(row) = view.get(self.traj.cursor) else {
+                return;
+            };
+            detail_for(row, window)
+        };
+        if let Some(d) = detail {
+            self.traj.detail = Some(d);
+            self.traj.detail_open = true;
+            self.traj.detail_scroll = 0;
+            self.focus = Focus::Details;
+        }
+    }
+
+    fn close_traj_detail(&mut self) {
+        self.traj.detail_open = false;
+        self.traj.detail = None;
+        self.traj.detail_scroll = 0;
+        self.focus = Focus::Center;
+    }
+
+    /// y 复制详情 args/result 纯文本（AC-005-11；走 Cmd::CopyToClipboard，
+    /// main 里 arboard→OSC52→tmux 执行，不落盘）。
+    fn yank_traj_detail(&mut self) -> Vec<Cmd> {
+        let Some(detail) = &self.traj.detail else {
+            return vec![];
+        };
+        match detail.yank_text() {
+            Some(text) => {
+                self.notice = Some("copied".to_string());
+                vec![Cmd::CopyToClipboard { text }]
+            }
+            None => vec![],
+        }
+    }
+
+    /// 从 Trajectory 切回 Chat（先关详情子层；折叠/选中随 traj 状态保留，
+    /// AC-005-01）。
+    fn switch_to_chat(&mut self) {
+        if self.traj.detail_open {
+            self.close_traj_detail();
+        }
+        if self.traj.filter.open {
+            self.traj.filter.open = false;
+        }
+        self.mode = Mode::Normal;
+        self.focus = Focus::Center;
+    }
+
+    /// 从 Chat 切到 Trajectory（gt；无会话也能切，空轨迹视图展示）。
+    pub fn switch_to_trajectory(&mut self) {
+        self.mode = Mode::Trajectory;
+        self.focus = Focus::Center;
+        // 活跃会话的轨迹窗口确保存在（触达：首帧渲染空、事件到达后填充）。
+        if let Some(id) = self.active_session.clone() {
+            let _ = self.traj_sessions.touch(&id.0, self.window_cap);
+        }
+        self.traj.cursor = self.traj.cursor.min(self.traj_view_len().saturating_sub(1));
     }
 
     // ---------- REQ-003: search / visual / approval / outline helpers ----------
@@ -2481,6 +2800,15 @@ impl AppState {
         self.composer.visible = false;
         self.composer.steer = false;
         self.composer.active_session = Some(sid.clone());
+        // REQ-005：会话切换重置轨迹视图（fold/cursor 是会话级；轨迹窗口
+        // 触达——打开会话即准备轨迹投影缓存位，事件到达后填充）。
+        self.traj.fold = FoldState::default();
+        self.traj.cursor = 0;
+        self.traj.detail_open = false;
+        self.traj.detail = None;
+        self.traj.detail_scroll = 0;
+        self.traj.filter.open = false;
+        let _ = self.traj_sessions.touch(&sid.0, self.window_cap);
         // 关掉内容 overlay（搜索/大纲），回到 NORMAL 内容浏览态。
         if self.mode == Mode::Search {
             self.close_search();

@@ -12,6 +12,7 @@ pub mod picker;
 pub mod search;
 pub mod sidebar;
 pub mod status;
+pub mod trajectory;
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -47,6 +48,10 @@ pub fn render(frame: &mut Frame<'_>, app: &AppState) {
                 .title(" Reconnecting "),
         );
         frame.render_widget(body, areas.center);
+    } else if app.mode == crate::app::Mode::Trajectory {
+        // REQ-005：Trajectory 视图（Step 5 交付完整事件表；此处分派占位
+        // 文本确保模式机先行为正确——避免误渲染 Chat）。
+        trajectory::render_placeholder(frame, areas.center, app);
     } else if app.mode == crate::app::Mode::ImageView {
         // REQ-004：IMAGEVIEW 模式中心区渲染 ImageView（仅 Kitty 出现）。
         image_view::render(

@@ -796,3 +796,294 @@ fn stale_attachment_failure_does_not_reconnect_active_session() {
     assert!(cmds.is_empty(), "stale 失败不得触发重连: {cmds:?}");
     assert_eq!(app.conn, dshtui::app::ConnState::Ready);
 }
+
+// ============================================================================
+// REQ-005 V0.3 Trajectory 键位矩阵（Seam = KeyDecoder.decode + AppState
+// handle_command；D-25/Notes/04 §3.6）。验收：AC-005-01/04/11。
+// ============================================================================
+
+#[test]
+fn trajectory_mode_key_matrix_maps_to_commands() {
+    let mut d = KeyDecoder::new();
+    // gt（g 前缀双键）：Normal → Trajectory 切换命令。
+    assert_eq!(d.decode(InputMode::Normal, key(KeyCode::Char('g'))), None);
+    assert_eq!(
+        d.decode(InputMode::Normal, key(KeyCode::Char('t'))),
+        Some(Command::ToggleTrajectory)
+    );
+    // gT：回 Chat。
+    let mut d2 = KeyDecoder::new();
+    assert_eq!(d2.decode(InputMode::Normal, key(KeyCode::Char('g'))), None);
+    assert_eq!(
+        d2.decode(InputMode::Normal, key(KeyCode::Char('T'))),
+        Some(Command::GotoChat)
+    );
+    // Trajectory 模式键位矩阵（D-25/Notes/04 §3.6）。
+    let mut t = KeyDecoder::new();
+    assert_eq!(
+        t.decode(InputMode::Trajectory, key(KeyCode::Char('j'))),
+        Some(Command::MoveDown)
+    );
+    assert_eq!(
+        t.decode(InputMode::Trajectory, key(KeyCode::Char('k'))),
+        Some(Command::MoveUp)
+    );
+    assert_eq!(
+        t.decode(InputMode::Trajectory, key(KeyCode::Char('z'))),
+        Some(Command::ToggleFold)
+    );
+    assert_eq!(
+        t.decode(InputMode::Trajectory, key(KeyCode::Enter)),
+        Some(Command::OpenDetail)
+    );
+    assert_eq!(
+        t.decode(InputMode::Trajectory, key(KeyCode::Char('d'))),
+        Some(Command::OpenDetail)
+    );
+    assert_eq!(
+        t.decode(InputMode::Trajectory, key(KeyCode::Char('/'))),
+        Some(Command::StartSearch)
+    );
+    assert_eq!(
+        t.decode(InputMode::Trajectory, key(KeyCode::Char('y'))),
+        Some(Command::YankContext)
+    );
+    assert_eq!(
+        t.decode(InputMode::Trajectory, key(KeyCode::Char('q'))),
+        Some(Command::Quit)
+    );
+    assert_eq!(
+        t.decode(InputMode::Trajectory, ctrl('w')),
+        Some(Command::CycleFocus)
+    );
+    assert_eq!(
+        t.decode(InputMode::Trajectory, key(KeyCode::Char('2'))),
+        Some(Command::ToggleTrajectory)
+    );
+    assert_eq!(
+        t.decode(InputMode::Trajectory, key(KeyCode::Char('1'))),
+        Some(Command::GotoChat)
+    );
+    // Trajectory 内 gt → 切回 Chat（Notes/04 §3.6）。
+    let mut t2 = KeyDecoder::new();
+    assert_eq!(
+        t2.decode(InputMode::Trajectory, key(KeyCode::Char('g'))),
+        None
+    );
+    assert_eq!(
+        t2.decode(InputMode::Trajectory, key(KeyCode::Char('t'))),
+        Some(Command::ToggleTrajectory)
+    );
+    // Chat 专属键不进入 Trajectory 键位（不串模式）。
+    let mut t3 = KeyDecoder::new();
+    assert_eq!(
+        t3.decode(InputMode::Trajectory, key(KeyCode::Char('i'))),
+        None
+    );
+    assert_eq!(
+        t3.decode(InputMode::Trajectory, key(KeyCode::Char('f'))),
+        None
+    );
+    assert_eq!(
+        t3.decode(InputMode::Trajectory, key(KeyCode::Char('s'))),
+        None
+    );
+}
+
+#[test]
+fn normal_gg_still_works_after_g_prefix_extension() {
+    // gg 语义不被 gt/gT 扩展破坏（回归）。
+    let mut d = KeyDecoder::new();
+    assert_eq!(d.decode(InputMode::Normal, key(KeyCode::Char('g'))), None);
+    assert_eq!(
+        d.decode(InputMode::Normal, key(KeyCode::Char('g'))),
+        Some(Command::GotoTop)
+    );
+    // g + 非 g/t/T 第二键 → 清前缀（x 按普通键解码 no-op）。
+    let mut d2 = KeyDecoder::new();
+    assert_eq!(d2.decode(InputMode::Normal, key(KeyCode::Char('g'))), None);
+    assert_eq!(d2.decode(InputMode::Normal, key(KeyCode::Char('x'))), None);
+    // 前缀已清：需重新 gg 才 GotoTop。
+    assert_eq!(d2.decode(InputMode::Normal, key(KeyCode::Char('g'))), None);
+    assert_eq!(
+        d2.decode(InputMode::Normal, key(KeyCode::Char('g'))),
+        Some(Command::GotoTop),
+        "前缀被清 → 新 gg 生效"
+    );
+}
+
+// ============================================================================
+// REQ-005 Trajectory reducer 状态机（Seam = AppState.handle_command +
+// handle，无 IO；原型 PASS 条件对应落测）。验收：AC-005-01/04/11。
+// ============================================================================
+
+/// 构建含轨迹数据的 AppState（FollowSnapshot 双写 transcript + traj 窗口）。
+fn traj_app() -> AppState {
+    let mut app = AppState::new(200);
+    app.conn = dshtui::app::ConnState::Ready;
+    let sid = SessionId("sess-traj".into());
+    app.active_session = Some(sid.clone());
+    let rec = |seq: u64, ty: &str, data: serde_json::Value| {
+        dshtui::api::types::SessionHistoryRecord::Event {
+            event: dshtui::api::types::SessionWireEvent {
+                event_type: ty.to_string(),
+                seq: Some(dshtui::api::types::SessionSeq(seq)),
+                time: Some(seq as i64),
+                request_id: None,
+                ignorable: None,
+                source_event_seqs: None,
+                surface_op: None,
+                data: Some(data),
+            },
+        }
+    };
+    let records = vec![
+        rec(1, "turn/start", serde_json::json!({"turn": 1})),
+        rec(2, "step/start", serde_json::json!({"turn": 1, "step": 1})),
+        rec(
+            3,
+            "assistant/message",
+            serde_json::json!({"turn": 1, "step": 1, "content": "a1"}),
+        ),
+        rec(
+            4,
+            "tool/call",
+            serde_json::json!({"turn": 1, "step": 1, "callId": "c1", "name": "bash", "arguments": "{\"command\":\"ls\"}"}),
+        ),
+        rec(
+            5,
+            "tool/result",
+            serde_json::json!({"turn": 1, "step": 1, "callId": "c1", "message": "done"}),
+        ),
+        rec(6, "step/end", serde_json::json!({"turn": 1, "step": 1})),
+        rec(7, "turn/end", serde_json::json!({"turn": 1})),
+    ];
+    app.handle(AppEvent::FollowSnapshot {
+        session_id: sid,
+        cursor: None,
+        records,
+        has_more: false,
+        projections: None,
+    });
+    app
+}
+
+#[test]
+fn gt_switch_tab_and_back_ac005_01() {
+    // AC-005-01：gt → Trajectory；gT → Chat。
+    let mut app = traj_app();
+    assert_eq!(app.mode, Mode::Normal);
+    app.handle_command(Command::ToggleTrajectory); // gt
+    assert_eq!(app.mode, Mode::Trajectory, "gt 切到 Trajectory");
+    app.handle_command(Command::GotoChat); // gT
+    assert_eq!(app.mode, Mode::Normal, "gT 切回 Chat");
+    // 再 gt 回 Trajectory（轨迹窗口有数据可浏览）。
+    app.handle_command(Command::ToggleTrajectory);
+    assert_eq!(app.mode, Mode::Trajectory);
+}
+
+#[test]
+fn gt_switch_preserves_fold_and_cursor_ac005_01_04() {
+    // gt/gT 互切不丢折叠/选中（Prototype PASS2 → reducer 层）。
+    let mut app = traj_app();
+    app.handle_command(Command::ToggleTrajectory);
+    // 光标移到 tool/call 行（view index 3）。
+    for _ in 0..3 {
+        app.handle_command(Command::MoveDown);
+    }
+    assert_eq!(app.traj.cursor, 3);
+    app.handle_command(Command::ToggleFold); // z 折叠 assistant 组
+    let folded = app
+        .traj
+        .fold
+        .is_collapsed(dshtui::model::GroupId::Assistant { turn: 1, step: 1 });
+    assert!(folded, "z 折叠当前组");
+    // 切走再切回：fold 保留（cursor 收敛到可见范围）。
+    app.handle_command(Command::GotoChat);
+    assert_eq!(app.mode, Mode::Normal);
+    app.handle_command(Command::ToggleTrajectory);
+    assert!(app
+        .traj
+        .fold
+        .is_collapsed(dshtui::model::GroupId::Assistant { turn: 1, step: 1 }));
+    // 展开（za 同一 toggle）。
+    app.handle_command(Command::ToggleFold);
+    assert!(!app
+        .traj
+        .fold
+        .is_collapsed(dshtui::model::GroupId::Assistant { turn: 1, step: 1 }));
+}
+
+#[test]
+fn enter_detail_yank_copy_and_q_modal_context_ac005_03_11() {
+    // AC-005-03/11：Enter 开详情（tool/call 行）、y 复制 args/result、
+    // 详情子层 q 关面板回轨迹、列表焦点 q 全局退出。
+    let mut app = traj_app();
+    app.handle_command(Command::ToggleTrajectory);
+    app.traj.cursor = 3; // tool/call 行
+    app.handle_command(Command::OpenDetail); // Enter
+    assert!(app.traj.detail_open, "Enter 打开详情子层");
+    assert_eq!(app.focus, dshtui::app::Focus::Details);
+    let detail = app.traj.detail.as_ref().expect("详情已构建");
+    assert_eq!(detail.source_kind, dshtui::model::TrajKind::ToolCall);
+    assert!(detail.args_text.is_some(), "args 在详情");
+    // y 复制 → CopyToClipboard 命令（内存文本，main 执行 arboard 后端）。
+    let cmds = app.handle_command(Command::YankContext);
+    assert_eq!(cmds.len(), 1);
+    match &cmds[0] {
+        dshtui::app::Cmd::CopyToClipboard { text } => {
+            assert!(text.contains("command"), "复制目标含 args: {text}");
+            assert!(text.contains("done"), "复制目标含 result: {text}");
+        }
+        other => panic!("期望 CopyToClipboard，得到 {other:?}"),
+    }
+    // 详情子层 q → 关面板回轨迹列表（不退出）。
+    assert!(!app.exited);
+    app.handle_command(Command::Quit);
+    assert!(!app.traj.detail_open, "q 关闭详情");
+    assert_eq!(app.mode, Mode::Trajectory, "q 回轨迹列表");
+    assert!(!app.exited, "详情 q 不退出程序");
+    // 列表焦点 q → 全局退出路径（quit 触发运行检查；无运行会话直接 exit 链）。
+    app.handle_command(Command::Quit);
+    assert!(
+        app.quit_requested || app.exited,
+        "列表焦点 q 走全局退出（quit_requested={} exited={}）",
+        app.quit_requested,
+        app.exited
+    );
+}
+
+#[test]
+fn ctrl_w_focus_cycle_includes_detail_sublayer() {
+    // Prototype PASS3 → reducer：Ctrl+w 三向循环含详情子层。
+    let mut app = traj_app();
+    app.handle_command(Command::ToggleTrajectory);
+    app.focus = dshtui::app::Focus::Sidebar;
+    app.handle_command(Command::CycleFocus);
+    assert_eq!(app.focus, dshtui::app::Focus::Center);
+    // 详情关：Center → Sidebar（不进入 Details）。
+    app.handle_command(Command::CycleFocus);
+    assert_eq!(app.focus, dshtui::app::Focus::Sidebar);
+    // 开详情后：Center → Details → Sidebar。
+    app.traj.cursor = 3;
+    app.handle_command(Command::OpenDetail);
+    assert_eq!(app.focus, dshtui::app::Focus::Details);
+    app.handle_command(Command::CycleFocus);
+    assert_eq!(app.focus, dshtui::app::Focus::Sidebar);
+}
+
+#[test]
+fn trajectory_slash_does_not_enter_chat_search_mode() {
+    // Prototype PASS4 → reducer：轨迹内 / 不进入 Chat 结构化搜索 Mode::Search。
+    let mut app = traj_app();
+    app.handle_command(Command::ToggleTrajectory);
+    app.handle_command(Command::StartSearch);
+    assert_eq!(app.mode, Mode::Trajectory, "轨迹内 / 不串 Chat 搜索模式");
+    assert!(app.traj.filter.open, "过滤输入态打开");
+    app.handle_command(Command::ClosePicker); // Esc
+    assert!(!app.traj.filter.open);
+    // Chat 模式 / → Mode::Search（对照不串）。
+    app.handle_command(Command::ToggleTrajectory);
+    app.handle_command(Command::StartSearch);
+    assert_eq!(app.mode, Mode::Search);
+}
