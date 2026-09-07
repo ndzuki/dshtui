@@ -3265,13 +3265,26 @@ impl AppState {
                 // After recovery trigger refollow only once (no repeated
                 // repair); REQ-003 重开 control 流（运行态/审批降级状态读取）。
                 match self.active_session.clone() {
-                    Some(sid) => vec![
-                        Cmd::OpenFollow {
-                            session_id: sid.clone(),
-                            max_messages: self.window_cap,
-                        },
-                        Cmd::OpenControl { session_id: sid },
-                    ],
+                    Some(sid) => {
+                        // AC-007-01：child 打开态重连保持 subagent address
+                        // （不退回普通 session follow、不订阅 control——
+                        // 与首次打开语义一致，避免 address 漂移）。
+                        if let Some((parent_id, child_id)) = self.active_subagent_parent() {
+                            vec![Cmd::OpenFollowSubagent {
+                                parent_id,
+                                child_id,
+                                max_messages: self.window_cap,
+                            }]
+                        } else {
+                            vec![
+                                Cmd::OpenFollow {
+                                    session_id: sid.clone(),
+                                    max_messages: self.window_cap,
+                                },
+                                Cmd::OpenControl { session_id: sid },
+                            ]
+                        }
+                    }
                     None => vec![Cmd::LoadSessionList { cursor: None }],
                 }
             }
@@ -10900,5 +10913,51 @@ mod tests {
         s2.mode = Mode::Insert;
         let cmds2 = s2.submit_input(PromptMode::Queue);
         assert!(cmds2.iter().any(|c| matches!(c, Cmd::SendPrompt { .. })));
+    }
+
+    #[test]
+    fn reconnect_keeps_open_subagent_child_address_ac007_01() {
+        // child 打开态断线重连：follow 仍走 subagent address、不退回普通
+        // session/control（与首次打开语义一致，避免 address 漂移）。
+        let mut s = AppState::default();
+        let sid = SessionId("c1".into());
+        s.active_session = Some(sid.clone());
+        s.subagent_parents.insert("c1".into(), "p1".into());
+        let cmds = s.handle(AppEvent::Reconnected);
+        assert_eq!(
+            cmds.iter()
+                .filter(|c| matches!(c, Cmd::OpenFollow { .. }))
+                .count(),
+            0,
+            "child 打开态重连不退回普通 session follow"
+        );
+        assert_eq!(
+            cmds.iter()
+                .filter(|c| matches!(c, Cmd::OpenControl { .. }))
+                .count(),
+            0,
+            "child 打开态不订阅 control"
+        );
+        assert!(
+            cmds.iter().any(|c| matches!(
+                c,
+                Cmd::OpenFollowSubagent { parent_id, child_id, .. }
+                    if parent_id == "p1" && child_id == "c1"
+            )),
+            "重连保持 subagent address follow, cmds={cmds:?}"
+        );
+        // 普通会话重连仍发 OpenFollow+OpenControl（回归）。
+        let mut s2 = AppState::default();
+        let sid2 = SessionId("s1".into());
+        s2.active_session = Some(sid2.clone());
+        let cmds2 = s2.handle(AppEvent::Reconnected);
+        assert_eq!(
+            cmds2
+                .iter()
+                .filter(|c| matches!(c, Cmd::OpenFollow { .. }))
+                .count(),
+            1
+        );
+        assert!(cmds2.iter().any(|c| matches!(c, Cmd::OpenControl { .. })));
     }
 }
