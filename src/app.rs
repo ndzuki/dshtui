@@ -118,6 +118,15 @@ pub struct PickerState {
     pub selection: usize,
 }
 
+/// Sidebar 行光标（REQ-006 FR-006-02）：Focus::Sidebar 下 j/k 移动、
+/// Enter 打开光标行。与 active_session 高亮分离——光标标记导航行，
+/// session 行的 `●`/`○` 仍标运行/空闲（Prototype PASS：不串语义）。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SidebarState {
+    /// 渲染行下标（`sidebar_rows` 视图态行序，UI 与 reducer 共享 seam）。
+    pub cursor: usize,
+}
+
 /// Modal composer state (REQ-002 §5): visible only in INSERT.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ComposerState {
@@ -741,8 +750,11 @@ pub struct AppState {
     load_through_target: Option<SessionSeq>,
     load_through_pages: usize,
     running_sessions: HashSet<SessionId>,
-    /// Workspaces collapsed via `h` (FR-001-03); `l` expands all.
-    pub collapsed_workspaces: HashSet<crate::api::types::WorkspaceId>,
+    /// 侧栏本地视图态（REQ-006 D-034：group_by/order_by/折叠；gv 仅本地态，
+    /// 无远端写）。折叠语义迁自 `collapsed_workspaces`（h 折叠 / l 展开）。
+    pub sidebar_view: crate::model::WorkspaceViewState,
+    /// 侧栏行光标（Focus::Sidebar 下 j/k 移动、Enter 打开）。
+    pub sidebar: SidebarState,
     list_cursor: Option<String>,
     list_loaded: bool,
     // ---------- REQ-004 V0.2 图片 ----------
@@ -813,7 +825,8 @@ impl Default for AppState {
             load_through_target: None,
             load_through_pages: 0,
             running_sessions: HashSet::new(),
-            collapsed_workspaces: HashSet::new(),
+            sidebar_view: crate::model::WorkspaceViewState::default(),
+            sidebar: SidebarState::default(),
             list_cursor: None,
             list_loaded: false,
             kitty_capable: false,
@@ -2163,6 +2176,19 @@ impl AppState {
                         _ => {}
                     }
                     vec![]
+                } else if self.mode == Mode::Normal
+                    && self.focus == Focus::Sidebar
+                    && matches!(cmd, C::MoveDown | C::MoveUp)
+                {
+                    // REQ-006（D-034/Step 4 Prototype PASS）：Focus::Sidebar 下
+                    // j/k 移动侧栏行光标（不触发 Chat 滚动）；Chat 滚动需在
+                    // Center/Details 焦点（Ctrl+w 循环）。半页/G/gg 仍是滚动。
+                    if cmd == C::MoveDown {
+                        self.sidebar_cursor_move(true);
+                    } else {
+                        self.sidebar_cursor_move(false);
+                    }
+                    vec![]
                 } else {
                     self.scroll(cmd)
                 }
@@ -2383,14 +2409,19 @@ impl AppState {
                     self.open_focused_image()
                 } else {
                     match self.focus {
-                        Focus::Sidebar => self.open_session_from_selection(),
+                        // REQ-006：Sidebar `o` 打开光标行（session→open；
+                        // workspace header→折叠/展开）。
+                        Focus::Sidebar => self.open_sidebar_cursor_row(),
                         _ => self.open_external_at_cursor(),
                     }
                 }
             }
             C::OpenFocused => {
-                // NORMAL Enter：仅中心区图片焦点打开图片（D-14）。
-                if self.focus == Focus::Center && self.focused_image_block().is_some() {
+                // NORMAL Enter：Center 图片打开；REQ-006 Sidebar Enter 打开
+                // 光标行（session/workspace）。
+                if self.focus == Focus::Sidebar {
+                    self.open_sidebar_cursor_row()
+                } else if self.focus == Focus::Center && self.focused_image_block().is_some() {
                     self.open_focused_image()
                 } else {
                     vec![]
@@ -2446,13 +2477,15 @@ impl AppState {
             }
             C::StopRunning => self.request_stop(),
             C::CollapseProject => {
-                for workspace in &self.workspaces.workspaces {
-                    self.collapsed_workspaces.insert(workspace.id.clone());
-                }
+                // h：折叠所有 workspace（本地视图态，D-034）。
+                self.sidebar_view.collapse_all(&self.workspaces);
+                self.clamp_sidebar_cursor();
                 vec![]
             }
             C::ExpandProject => {
-                self.collapsed_workspaces.clear();
+                // l：展开全部 workspace。
+                self.sidebar_view.expand_all();
+                self.clamp_sidebar_cursor();
                 vec![]
             }
             C::PickerConfirm => match self.mode {
@@ -2543,6 +2576,19 @@ impl AppState {
                 } else {
                     vec![]
                 }
+            }
+            // REQ-006：`gv` 循环侧栏视图（本地态，AC-006-03/11 无写）。
+            C::CycleSidebarView => {
+                if self.mode == Mode::Normal {
+                    self.sidebar_view.cycle();
+                    self.clamp_sidebar_cursor();
+                    self.notice = Some(format!(
+                        "视图: group={} order={}",
+                        self.sidebar_view.group_by.as_str(),
+                        self.sidebar_view.order_by.as_str()
+                    ));
+                }
+                vec![]
             }
 
             // REQ-005：Chat（NORMAL）`gt`/`2` → Trajectory（AC-005-01）。
@@ -2975,6 +3021,57 @@ impl AppState {
         self.search.history_generation = self.search.history_generation.wrapping_add(1);
         self.search.history_loading = false;
         self.search.results_locked = false;
+    }
+
+    // ---------- REQ-006 Sidebar 行光标与视图态（FR-006-02，D-034） ----------
+
+    /// 侧栏可见行数（视图态行序，`sidebar_rows` 纯函数；UI 与 reducer 共享）。
+    fn sidebar_row_len(&self) -> usize {
+        crate::model::sidebar_rows(&self.sidebar_view, &self.workspaces).len()
+    }
+
+    fn clamp_sidebar_cursor(&mut self) {
+        let len = self.sidebar_row_len();
+        if len == 0 {
+            self.sidebar.cursor = 0;
+        } else if self.sidebar.cursor >= len {
+            self.sidebar.cursor = len - 1;
+        }
+    }
+
+    /// j/k（Focus::Sidebar）：移动行光标（不触发 Chat 滚动）。
+    fn sidebar_cursor_move(&mut self, down: bool) {
+        let len = self.sidebar_row_len();
+        if len == 0 {
+            return;
+        }
+        if down {
+            self.sidebar.cursor = (self.sidebar.cursor + 1).min(len - 1);
+        } else {
+            self.sidebar.cursor = self.sidebar.cursor.saturating_sub(1);
+        }
+    }
+
+    /// 光标行目标（session / workspace header）。
+    fn sidebar_cursor_row(&self) -> Option<crate::model::SidebarRow> {
+        crate::model::sidebar_rows(&self.sidebar_view, &self.workspaces)
+            .into_iter()
+            .nth(self.sidebar.cursor)
+    }
+
+    /// Enter/`o`（Focus::Sidebar）：打开光标行——session → open follow；
+    /// workspace header → 折叠/展开（本地视图态）。
+    fn open_sidebar_cursor_row(&mut self) -> Vec<Cmd> {
+        use crate::model::SidebarRow as Row;
+        match self.sidebar_cursor_row() {
+            Some(Row::Session(id)) => self.open_session(id),
+            Some(Row::WorkspaceHeader { id, .. }) => {
+                self.sidebar_view.toggle(&id);
+                self.clamp_sidebar_cursor();
+                vec![]
+            }
+            None => vec![],
+        }
     }
 
     // ---------- REQ-006 模型目录（FR-006-01） ----------
@@ -3639,13 +3736,6 @@ impl AppState {
             },
             Cmd::OpenControl { session_id: sid },
         ]
-    }
-
-    fn open_session_from_selection(&mut self) -> Vec<Cmd> {
-        match self.picker_selected_session() {
-            Some(sid) => self.open_session(sid),
-            None => vec![],
-        }
     }
 
     fn picker_selected_session(&self) -> Option<SessionId> {

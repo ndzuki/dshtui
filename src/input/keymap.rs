@@ -136,6 +136,9 @@ pub enum Command {
     // ---------- REQ-006 模型目录（FR-006-01） ----------
     /// NORMAL `M`：打开模型目录 overlay（本地 nucleo 过滤 + 热切换）。
     OpenModelCatalog,
+    // ---------- REQ-006 侧栏视图（FR-006-02，D-034） ----------
+    /// `gv`：循环切换侧栏 groupBy/orderBy（仅本地视图态，无远端写）。
+    CycleSidebarView,
 }
 
 /// Stateful decoder for multi-key Normal-mode commands such as `gg`.
@@ -186,6 +189,8 @@ impl KeyDecoder {
         match c {
             't' => Some(Command::ToggleTrajectory),
             'T' => Some(Command::GotoChat),
+            // REQ-006：`gv` 循环侧栏视图（groupBy/orderBy，D-034）。
+            'v' => Some(Command::CycleSidebarView),
             _ => None,
         }
     }
@@ -205,6 +210,9 @@ impl KeyDecoder {
             KeyCode::Char(c) if !ctrl => {
                 if self.pending_g {
                     if let Some(cmd) = self.g_prefix_key(c) {
+                        // gt/gT/gv 等双键命令：清前缀（g 后继续按 g 不再误触
+                        // GotoTop；code-review 同源修复）。
+                        self.pending_g = false;
                         return Some(cmd);
                     }
                     self.pending_g = false; // g+其它键：清前缀，按单键解码
@@ -281,6 +289,8 @@ impl KeyDecoder {
             KeyCode::Char(c) if !ctrl => {
                 if self.pending_g {
                     if let Some(cmd) = self.g_prefix_key(c) {
+                        // Trajectory 内 gt/gT/gv：清前缀（同 normal 修复）。
+                        self.pending_g = false;
                         return Some(cmd);
                     }
                     self.pending_g = false;

@@ -16,6 +16,192 @@ pub struct WorkspaceMeta {
     pub session_ids: Vec<SessionId>,
 }
 
+// ---------- REQ-006 Sidebar 视图态（FR-006-02 视图半，D-034：gv 仅本地
+// 视图态、无远端写；AC-006-03/11） ----------
+
+/// 侧栏分组视图（`gv` 切换；仅本地态）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GroupBy {
+    /// workspace/follow 提供的项目分组（无 workspace 对象时退化为平铺）。
+    #[default]
+    Workspace,
+    /// 全部会话平铺（按 updated desc）。
+    Flat,
+}
+
+impl GroupBy {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            GroupBy::Workspace => "workspace",
+            GroupBy::Flat => "flat",
+        }
+    }
+}
+
+/// 侧栏排序视图（`gv` 切换；workspace 分组内的会话顺序）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OrderBy {
+    /// 按 workspace.session_ids（用户手工顺序）。
+    Manual,
+    /// 按 updated_at_ms 降序。
+    #[default]
+    Updated,
+}
+
+impl OrderBy {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            OrderBy::Manual => "manual",
+            OrderBy::Updated => "updated",
+        }
+    }
+}
+
+/// 侧栏本地视图状态（REQ-006 §5 `WorkspaceViewState`；仅内存，D-034 无远端
+/// 写）。`collapsed` 保持既有 h/l 语义（默认展开、h 折叠），从 AppState 的
+/// `collapsed_workspaces` 迁入。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WorkspaceViewState {
+    pub group_by: GroupBy,
+    pub order_by: OrderBy,
+    /// 折叠的 workspace（▸）；展开为默认（▾）。
+    pub collapsed: std::collections::HashSet<WorkspaceId>,
+}
+
+impl WorkspaceViewState {
+    pub fn collapse_all(&mut self, store: &WorkspaceStore) {
+        for w in &store.workspaces {
+            self.collapsed.insert(w.id.clone());
+        }
+    }
+
+    pub fn expand_all(&mut self) {
+        self.collapsed.clear();
+    }
+
+    pub fn toggle(&mut self, id: &WorkspaceId) {
+        if !self.collapsed.remove(id) {
+            self.collapsed.insert(id.clone());
+        }
+    }
+
+    pub fn is_collapsed(&self, id: &WorkspaceId) -> bool {
+        self.collapsed.contains(id)
+    }
+
+    /// `gv` 单键循环 group_by × order_by 四组合（AC-006-03：每按一次视图
+    /// 即时变化；仅本地态）。每次只动一轴，行为可预期：先切 order，再切
+    /// group：workspace/updated → workspace/manual → flat/manual →
+    /// flat/updated → 回到起点。
+    pub fn cycle(&mut self) {
+        use GroupBy::*;
+        use OrderBy::*;
+        (self.group_by, self.order_by) = match (self.group_by, self.order_by) {
+            (Workspace, Updated) => (Workspace, Manual),
+            (Workspace, Manual) => (Flat, Manual),
+            (Flat, Manual) => (Flat, Updated),
+            (Flat, Updated) => (Workspace, Updated),
+        };
+    }
+}
+
+/// 侧栏一行（渲染与光标移动/打开的共享行模型）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SidebarRow {
+    /// workspace header（可折叠）。
+    WorkspaceHeader { id: WorkspaceId, collapsed: bool },
+    /// 会话行（元数据按 id 从 store 查询）。
+    Session(SessionId),
+}
+
+impl SidebarRow {
+    pub fn session_id(&self) -> Option<&SessionId> {
+        match self {
+            SidebarRow::Session(id) => Some(id),
+            _ => None,
+        }
+    }
+
+    pub fn workspace_id(&self) -> Option<&WorkspaceId> {
+        match self {
+            SidebarRow::WorkspaceHeader { id, .. } => Some(id),
+            _ => None,
+        }
+    }
+}
+
+/// 按当前视图态计算侧栏可见行（纯函数；渲染与 reducer 共享同一 seam）。
+///
+/// - `GroupBy::Workspace`：每个 workspace 一个 header（折叠时无子行）+
+///   组内会话按 `OrderBy`（manual=session_ids 顺序 / updated=updated_at_ms
+///   降序）；不在任何 workspace 的会话按 updated desc 追加尾部。
+/// - `GroupBy::Flat`：全部会话平铺（updated desc；order 只作用于分组内）。
+/// - store 中已不存在的 session id 会被跳过（列表不漂移）。
+pub fn sidebar_rows(view: &WorkspaceViewState, store: &WorkspaceStore) -> Vec<SidebarRow> {
+    let mut rows = Vec::new();
+    match view.group_by {
+        GroupBy::Flat => {
+            for meta in store.sessions_sorted() {
+                rows.push(SidebarRow::Session(meta.id.clone()));
+            }
+        }
+        GroupBy::Workspace => {
+            if store.workspaces.is_empty() {
+                // 无 workspace 对象（follow 未到达）→ 退化为平铺。
+                for meta in store.sessions_sorted() {
+                    rows.push(SidebarRow::Session(meta.id.clone()));
+                }
+                return rows;
+            }
+            let mut grouped: Vec<SessionId> = Vec::new();
+            for workspace in &store.workspaces {
+                rows.push(SidebarRow::WorkspaceHeader {
+                    id: workspace.id.clone(),
+                    collapsed: view.is_collapsed(&workspace.id),
+                });
+                // 折叠：会话仍标记为已分组（避免被当未分组在尾部渲染），但
+                // 不产生可见行。
+                if view.is_collapsed(&workspace.id) {
+                    for sid in &workspace.session_ids {
+                        if store.sessions.contains_key(sid) {
+                            grouped.push(sid.clone());
+                        }
+                    }
+                    continue;
+                }
+                let mut members: Vec<&SessionId> = workspace
+                    .session_ids
+                    .iter()
+                    .filter(|sid| store.sessions.contains_key(*sid))
+                    .collect();
+                match view.order_by {
+                    OrderBy::Manual => {}
+                    OrderBy::Updated => members.sort_by_key(|sid| {
+                        std::cmp::Reverse(
+                            store
+                                .sessions
+                                .get(*sid)
+                                .map(|m| m.updated_at_ms)
+                                .unwrap_or(0),
+                        )
+                    }),
+                }
+                for sid in members {
+                    grouped.push((*sid).clone());
+                    rows.push(SidebarRow::Session((*sid).clone()));
+                }
+            }
+            // 未分组的会话尾部平铺（updated desc）。
+            for meta in store.sessions_sorted() {
+                if !grouped.contains(&meta.id) {
+                    rows.push(SidebarRow::Session(meta.id.clone()));
+                }
+            }
+        }
+    }
+    rows
+}
+
 /// Sidebar data source: workspace/follow grouping + session/list session rows.
 #[derive(Debug, Default)]
 pub struct WorkspaceStore {
@@ -267,5 +453,116 @@ mod tests {
         // The newest (highest updated_at_ms) survives, the oldest does not.
         assert!(store.sessions.contains_key(&SessionId("s20000".into())));
         assert!(!store.sessions.contains_key(&SessionId("s00000".into())));
+    }
+
+    // ---------- REQ-006 视图态（FR-006-02 / D-034） ----------
+
+    fn ws(store: &mut WorkspaceStore, id: &str) -> WorkspaceId {
+        let wid = WorkspaceId(id.into());
+        store.upsert_workspace(wid.clone(), Some(format!("项目{id}")));
+        wid
+    }
+
+    fn row_ids(rows: &[SidebarRow]) -> Vec<String> {
+        rows.iter()
+            .map(|r| match r {
+                SidebarRow::WorkspaceHeader { id, .. } => format!("[{id}]"),
+                SidebarRow::Session(id) => id.0.clone(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn sidebar_view_state_gv_cycles_group_and_order_ac006_03() {
+        let mut view = WorkspaceViewState::default();
+        assert_eq!(view.group_by, GroupBy::Workspace);
+        assert_eq!(view.order_by, OrderBy::Updated);
+        // 每按一次 gv 只动一轴：order → group → order → group 回起点。
+        view.cycle();
+        assert_eq!(view.group_by, GroupBy::Workspace);
+        assert_eq!(view.order_by, OrderBy::Manual);
+        view.cycle();
+        assert_eq!(view.group_by, GroupBy::Flat);
+        assert_eq!(view.order_by, OrderBy::Manual);
+        view.cycle();
+        assert_eq!(view.group_by, GroupBy::Flat);
+        assert_eq!(view.order_by, OrderBy::Updated);
+        view.cycle();
+        assert_eq!(view.group_by, GroupBy::Workspace);
+        assert_eq!(view.order_by, OrderBy::Updated, "四态循环回到起点");
+    }
+
+    #[test]
+    fn sidebar_rows_grouped_manual_order_and_collapse() {
+        let mut store = WorkspaceStore::new();
+        let ws1 = ws(&mut store, "ws1");
+        store.upsert_session(meta("a", 1, None));
+        store.upsert_session(meta("b", 200, None));
+        store.upsert_session(meta("c", 50, None));
+        store.upsert_session(meta("free", 999, None)); // 未分组
+        for sid in ["b", "a", "c"] {
+            store.attach_session_to_workspace(&ws1, &SessionId(sid.into()));
+        }
+        // manual：按 session_ids 顺序 [b, a, c]。
+        let view = WorkspaceViewState {
+            group_by: GroupBy::Workspace,
+            order_by: OrderBy::Manual,
+            collapsed: Default::default(),
+        };
+        let rows = sidebar_rows(&view, &store);
+        assert_eq!(
+            row_ids(&rows),
+            vec!["[ws1]", "b", "a", "c", "free"],
+            "manual=session_ids 顺序；未分组尾部"
+        );
+        // updated：组内按 updated desc → c(50) 在 a(1) 前？desc → b(200), c(50), a(1)。
+        let view = WorkspaceViewState {
+            group_by: GroupBy::Workspace,
+            order_by: OrderBy::Updated,
+            collapsed: Default::default(),
+        };
+        let rows = sidebar_rows(&view, &store);
+        assert_eq!(
+            row_ids(&rows),
+            vec!["[ws1]", "b", "c", "a", "free"],
+            "updated 组内降序"
+        );
+        // 折叠：只留 header。
+        let mut view = view;
+        view.collapsed.insert(ws1.clone());
+        let rows = sidebar_rows(&view, &store);
+        assert_eq!(
+            row_ids(&rows),
+            vec!["[ws1]", "free"],
+            "折叠 workspace 隐藏子行（未分组仍显示）"
+        );
+        // toggle 展开。
+        view.toggle(&ws1);
+        assert!(!view.is_collapsed(&ws1));
+    }
+
+    #[test]
+    fn sidebar_rows_flat_lists_all_sessions_sorted_ac006_03() {
+        let mut store = WorkspaceStore::new();
+        let ws1 = ws(&mut store, "ws1");
+        store.upsert_session(meta("old", 1, None));
+        store.upsert_session(meta("new", 100, None));
+        store.attach_session_to_workspace(&ws1, &SessionId("old".into()));
+        let view = WorkspaceViewState {
+            group_by: GroupBy::Flat,
+            order_by: OrderBy::Updated,
+            collapsed: Default::default(),
+        };
+        let rows = sidebar_rows(&view, &store);
+        assert_eq!(
+            row_ids(&rows),
+            vec!["new", "old"],
+            "flat 全量平铺（updated desc），无 header"
+        );
+        // 无 workspace 对象（follow 未达）时 workspace 分组退化为平铺。
+        let empty = WorkspaceStore::new();
+        let view = WorkspaceViewState::default();
+        let rows = sidebar_rows(&view, &empty);
+        assert!(rows.is_empty());
     }
 }

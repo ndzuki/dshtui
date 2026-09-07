@@ -45,7 +45,9 @@ pub use trajectory::{
     TrajKind, TrajTiming, TrajUsage, TrajectoryDetail, TrajectoryRow, TrajectorySearchIndex,
     TrajectorySearchItem, TrajectorySearchMatch, TrajectoryStore, TrajectoryWindow,
 };
-pub use workspace::{WorkspaceMeta, WorkspaceStore};
+pub use workspace::{
+    sidebar_rows, GroupBy, OrderBy, SidebarRow, WorkspaceMeta, WorkspaceStore, WorkspaceViewState,
+};
 pub use yank::{
     block_plain_text, block_yank_target, selection_text, VisualMode, VisualSelection, YankBackend,
     YankState, YankTarget,

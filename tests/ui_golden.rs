@@ -860,3 +860,50 @@ fn model_catalog_overlay_renders_rows_and_status_ac006_01() {
     assert!(text.contains("1/2"), "命中/总数计数, text={text}");
     assert!(text.contains("effort: low"), "effort 元数据, text={text}");
 }
+
+#[test]
+fn sidebar_gv_grouped_vs_flat_renders_ac006_03() {
+    // AC-006-03（渲染侧）：gv 切换 groupBy 后侧栏「视图即时变化」——分组态
+    // 显示 workspace header，flat 态无 header 直接平铺。
+    use dshtui::api::types::{SessionMeta, WorkspaceId};
+    let mut app = AppState::new(20);
+    app.conn = ConnState::Ready;
+    let ws1 = WorkspaceId("ws1".into());
+    app.workspaces
+        .upsert_workspace(ws1.clone(), Some("项目A".into()));
+    let meta = |id: &str, ws: &WorkspaceId| SessionMeta {
+        id: SessionId(id.into()),
+        title: Some(format!("T-{id}")),
+        cwd: None,
+        updated_at_ms: 1,
+        running: false,
+        blank: false,
+        origin: None,
+        parent_id: None,
+        workspace: Some(ws.clone()),
+        last_turn_preview: None,
+    };
+    app.workspaces.upsert_session(meta("s1", &ws1));
+    app.workspaces
+        .attach_session_to_workspace(&ws1, &SessionId("s1".into()));
+
+    // 默认 workspace 分组：header + session（140 列 → 侧栏 32 列完整显示）。
+    let backend = TestBackend::new(140, 10);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::render(frame, &app)).unwrap();
+    let text = rendered_text(&terminal);
+    assert!(text.contains("▾ 项目A"), "分组态 header, text={text}");
+    assert!(text.contains("T-s1"), "分组态 session, text={text}");
+
+    // gv ×2 → flat（先切 order 再切 group，每按只动一轴）。
+    app.handle_command(dshtui::input::Command::CycleSidebarView);
+    app.handle_command(dshtui::input::Command::CycleSidebarView);
+    assert_eq!(app.sidebar_view.group_by, dshtui::model::GroupBy::Flat);
+    let backend = TestBackend::new(140, 10);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::render(frame, &app)).unwrap();
+    let text = rendered_text(&terminal);
+    assert!(!text.contains("▾ 项目A"), "flat 无 header, text={text}");
+    assert!(!text.contains("项目A"), "flat 无 workspace 名, text={text}");
+    assert!(text.contains("T-s1"), "flat 仍显示会话, text={text}");
+}

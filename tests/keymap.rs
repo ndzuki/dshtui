@@ -1588,3 +1588,195 @@ mod monitor_keymap_tests {
         }
     }
 }
+
+// ---------- REQ-006 Sidebar 行光标与 gv（FR-006-02 / D-034） ----------
+
+fn srec(seq: u64) -> dshtui::api::types::SessionHistoryRecord {
+    dshtui::api::types::SessionHistoryRecord::Event {
+        event: dshtui::api::types::SessionWireEvent {
+            event_type: "user/message".into(),
+            seq: Some(dshtui::api::types::SessionSeq(seq)),
+            time: None,
+            request_id: None,
+            ignorable: None,
+            source_event_seqs: None,
+            surface_op: None,
+            data: Some(serde_json::json!({"content": format!("row {seq}")})),
+        },
+    }
+}
+
+fn sidebar_app() -> AppState {
+    use dshtui::api::types::SessionMeta;
+    use dshtui::api::types::{SessionId, WorkspaceId};
+    let mut app = AppState::new(20);
+    app.mode = Mode::Normal;
+    app.focus = dshtui::app::Focus::Sidebar;
+    let meta = |id: &str, updated: i64, ws: Option<&str>| SessionMeta {
+        id: SessionId(id.into()),
+        title: Some(format!("S-{id}")),
+        cwd: None,
+        updated_at_ms: updated,
+        running: false,
+        blank: false,
+        origin: None,
+        parent_id: None,
+        workspace: ws.map(|w| WorkspaceId(w.into())),
+        last_turn_preview: None,
+    };
+    app.workspaces.upsert_session(meta("s1", 300, None));
+    app.workspaces.upsert_session(meta("s2", 200, None));
+    app.workspaces.upsert_session(meta("s3", 100, None));
+    app
+}
+
+#[test]
+fn sidebar_focus_jk_moves_cursor_without_chat_scroll_ac006_03() {
+    let mut app = sidebar_app();
+    app.focus = dshtui::app::Focus::Sidebar;
+    // 给 Center 一个窗口：j/k 若误触发 Chat 滚动会改变 viewport。
+    app.active_session = Some(SessionId("s1".into()));
+    app.sessions
+        .touch("s1", 20)
+        .apply(dshtui::model::Incoming::Snapshot {
+            cursor: None,
+            records: vec![srec(1), srec(2), srec(3)],
+            has_more: false,
+            projections: Some(serde_json::json!({"running": false})),
+        });
+    let vp_before = app.viewport.clone();
+    // Sidebar 焦点：j 移动行光标。
+    app.handle_command(Command::MoveDown);
+    assert_eq!(app.sidebar.cursor, 1, "j 移动光标到第 2 行");
+    app.handle_command(Command::MoveDown);
+    assert_eq!(app.sidebar.cursor, 2);
+    app.handle_command(Command::MoveDown);
+    assert_eq!(app.sidebar.cursor, 2, "末尾钳制");
+    app.handle_command(Command::MoveUp);
+    assert_eq!(app.sidebar.cursor, 1, "k 上移");
+    assert_eq!(app.viewport, vp_before, "Sidebar 焦点 j/k 不触发 Chat 滚动");
+}
+
+#[test]
+fn center_focus_jk_still_scrolls_chat_ac006_03_regression() {
+    // 回归：Center/Details 焦点下 j/k 仍滚动 Chat（既有语义）。
+    let mut app = sidebar_app();
+    app.focus = dshtui::app::Focus::Center;
+    app.active_session = Some(SessionId("s1".into()));
+    app.sessions
+        .touch("s1", 20)
+        .apply(dshtui::model::Incoming::Snapshot {
+            cursor: None,
+            records: (1..=30).map(srec).collect(),
+            has_more: false,
+            projections: Some(serde_json::json!({"running": false})),
+        });
+    app.handle_command(Command::MoveDown);
+    assert_eq!(app.sidebar.cursor, 0, "Center 焦点不改侧栏光标");
+    assert!(
+        app.viewport.offset > 0 || !app.viewport.follow_tail,
+        "Center 焦点 j/k 仍滚动 Chat"
+    );
+}
+
+#[test]
+fn sidebar_enter_opens_cursor_session_row_ac006_02() {
+    let mut app = sidebar_app();
+    app.active_session = Some(SessionId("s1".into()));
+    // 光标移到 s3 → Enter 打开 s3。
+    app.sidebar.cursor = 2;
+    app.handle_command(Command::OpenFocused);
+    assert_eq!(
+        app.active_session,
+        Some(SessionId("s3".into())),
+        "Enter 打开光标行会话"
+    );
+}
+
+#[test]
+fn sidebar_enter_on_workspace_header_toggles_collapse_ac006_03() {
+    use dshtui::api::types::WorkspaceId;
+    let mut app = AppState::new(20);
+    app.mode = Mode::Normal;
+    app.focus = dshtui::app::Focus::Sidebar;
+    app.workspaces
+        .upsert_workspace(WorkspaceId("ws1".into()), Some("项目A".into()));
+    app.workspaces
+        .upsert_session(dshtui::api::types::SessionMeta {
+            id: SessionId("s1".into()),
+            title: Some("S-s1".into()),
+            cwd: None,
+            updated_at_ms: 1,
+            running: false,
+            blank: false,
+            origin: None,
+            parent_id: None,
+            workspace: Some(WorkspaceId("ws1".into())),
+            last_turn_preview: None,
+        });
+    app.workspaces
+        .attach_session_to_workspace(&WorkspaceId("ws1".into()), &SessionId("s1".into()));
+    // 光标在第 0 行 = workspace header。
+    app.sidebar.cursor = 0;
+    app.handle_command(Command::OpenFocused);
+    assert!(
+        app.sidebar_view.is_collapsed(&WorkspaceId("ws1".into())),
+        "Enter 折叠 workspace header"
+    );
+    assert_eq!(app.sidebar.cursor, 0);
+    app.handle_command(Command::OpenFocused);
+    assert!(
+        !app.sidebar_view.is_collapsed(&WorkspaceId("ws1".into())),
+        "再次 Enter 展开"
+    );
+}
+
+#[test]
+fn gv_cycles_local_view_without_write_cmd_ac006_11() {
+    // AC-006-11：`gv` 仅更新本地视图态，reducer 不发任何写 Cmd（无远端写）。
+    let mut app = sidebar_app();
+    assert_eq!(app.sidebar_view.group_by, dshtui::model::GroupBy::Workspace);
+    assert_eq!(app.sidebar_view.order_by, dshtui::model::OrderBy::Updated);
+    let cmds = app.handle_command(Command::CycleSidebarView);
+    assert!(cmds.is_empty(), "gv 不发写命令, cmds={cmds:?}");
+    assert_eq!(app.sidebar_view.order_by, dshtui::model::OrderBy::Manual);
+    let notice = app.notice.as_deref().unwrap();
+    assert!(notice.contains("group=workspace"), "notice={notice}");
+    assert!(notice.contains("order=manual"), "notice={notice}");
+    app.handle_command(Command::CycleSidebarView);
+    assert_eq!(app.sidebar_view.group_by, dshtui::model::GroupBy::Flat);
+}
+
+#[test]
+fn h_l_collapse_expand_all_workspaces_ac006_03() {
+    use dshtui::api::types::WorkspaceId;
+    let mut app = AppState::new(20);
+    app.workspaces
+        .upsert_workspace(WorkspaceId("w1".into()), Some("A".into()));
+    app.workspaces
+        .upsert_workspace(WorkspaceId("w2".into()), Some("B".into()));
+    app.handle_command(Command::CollapseProject); // h
+    assert!(app.sidebar_view.is_collapsed(&WorkspaceId("w1".into())));
+    assert!(app.sidebar_view.is_collapsed(&WorkspaceId("w2".into())));
+    app.handle_command(Command::ExpandProject); // l
+    assert!(!app.sidebar_view.is_collapsed(&WorkspaceId("w1".into())));
+    assert!(!app.sidebar_view.is_collapsed(&WorkspaceId("w2".into())));
+}
+
+#[test]
+fn gv_two_key_decodes_cycle_sidebar_view_ac006_11() {
+    let mut d = KeyDecoder::new();
+    assert_eq!(d.decode(InputMode::Normal, key(KeyCode::Char('g'))), None);
+    assert_eq!(
+        d.decode(InputMode::Normal, key(KeyCode::Char('v'))),
+        Some(Command::CycleSidebarView),
+        "gv = CycleSidebarView（g 前缀扩展）"
+    );
+    // g 前缀清空后普通单键语义不回归。
+    assert_eq!(d.decode(InputMode::Normal, key(KeyCode::Char('g'))), None);
+    assert_eq!(
+        d.decode(InputMode::Normal, key(KeyCode::Char('t'))),
+        Some(Command::ToggleTrajectory),
+        "gt 仍切 Trajectory"
+    );
+}
