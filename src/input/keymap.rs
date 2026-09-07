@@ -6,7 +6,7 @@
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 /// Input modes that affect key meaning.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Hash)]
 pub enum InputMode {
     #[default]
     Normal,
@@ -153,11 +153,35 @@ pub enum Command {
 #[derive(Debug, Clone, Default)]
 pub struct KeyDecoder {
     pending_g: bool,
+    /// 非 None 时启用 `[keymap]` 覆盖层（AC-007-21）。默认 None = 内置键位，
+    /// decode 与历史硬编码分支逐位一致（向后兼容）。
+    keymap: Option<Keymap>,
 }
 
 impl KeyDecoder {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// 携带 `[keymap]` 覆盖的解码器（REQ-007 AC-007-21）。
+    pub fn with_keymap(keymap: Keymap) -> Self {
+        Self {
+            pending_g: false,
+            keymap: Some(keymap),
+        }
+    }
+
+    /// 从 effective 配置构造：`[keymap]` 空 → 内置键位（`new()` 同构）；
+    /// 非空 → build + 输出可读警告（tracing）。
+    pub fn from_effective(eff: &crate::config::Effective) -> Self {
+        if eff.keymap.modes.is_empty() {
+            return Self::new();
+        }
+        let km = Keymap::build(&eff.keymap);
+        for w in &km.warnings {
+            tracing::warn!(warning = %w, "[keymap] 覆盖警告");
+        }
+        Self::with_keymap(km)
     }
 
     pub fn reset(&mut self) {
@@ -168,7 +192,18 @@ impl KeyDecoder {
     pub fn decode(&mut self, mode: InputMode, event: Event) -> Option<Command> {
         match event {
             Event::Resize(width, height) => Some(Command::Resize { width, height }),
-            Event::Key(key) if key.kind == KeyEventKind::Press => self.decode_key(mode, key),
+            Event::Key(key) if key.kind == KeyEventKind::Press => {
+                // REQ-007：`[keymap]` 覆盖层（Step 5，keymap_override_proto 验证）。
+                if let Some(km) = &self.keymap {
+                    if let Some(outcome) = km.decode_override(mode, key) {
+                        // 非 `g` 键命中原默认键需清 pending_g（与原分支语义一致）；
+                        // `g` 前缀键永不进 override 表。
+                        self.pending_g = false;
+                        return outcome;
+                    }
+                }
+                self.decode_key(mode, key)
+            }
             _ => None,
         }
     }
@@ -598,6 +633,313 @@ impl KeyDecoder {
                 None
             }
         }
+    }
+}
+
+// ============================================================================
+// REQ-007 AC-007-21：`[keymap]` 覆盖（Step 5；设计 A 最小接口 re-home）。
+//
+// 机制（经 keymap_override_proto 原型验证 PASS）：
+// - Keymap 持有每个 mode 的「默认单键表」与「生效表（默认 ∘ 覆盖）」；
+// - `KeyDecoder` 无覆盖（默认 new()）时 decode 与既有硬编码分支 **逐位一致**
+//   （no-op 回落，既有 ~54 keymap 测试不改仍绿是提取正确性护栏）；
+// - 有覆盖时 decode_key 顶部查 override 层：新键命中即返回、原默认键被
+//   shadow（无需 post-decode remap 表达了解绑/改键）；未知 command/非法
+//   keyspec/位移冲突 → warn 保默认（非失败合并）。
+// 覆盖范围 = 无字符输入 catch-all 的命令型 mode（Normal/Trajectory/Visual/
+// Approval/ApprovalList/ImageView/Help/Monitor）；输入型 mode（Search/
+// ModelCatalog/CommandPalette/Picker/Insert…）字符兼作输入，不改键。
+// `g` 前缀键保留（双键 gg/gt/gT/gv 结构性命令不可重绑，原型已验证）。
+// ============================================================================
+
+/// 可重绑命令的规范名（配置键）。每个 mode 的表引用同名条，命令本身
+/// mode 相关（同名字符在 Normal 是 MoveDown、在 Picker 是 PickerDown——
+/// 但输入型 mode 不在此表）。
+fn cmd_display(c: &Command) -> String {
+    format!("{c:?}")
+}
+
+/// 默认单键表提取（逐行对应 `KeyDecoder::normal`/`trajectory`/… 硬编码
+/// 分支；无字符输入 catch-all 的 mode）。`name` 为 `[keymap.modes.<mode>]`
+/// 配置键。payload 型命令（VisualStart/OpenSession/PickerInput 等）不入表
+/// （改键语义依赖 payload，非目标）。
+fn default_key_tables() -> std::collections::BTreeMap<InputMode, Vec<(&'static str, char, Command)>>
+{
+    use Command::*;
+    let mut m = std::collections::BTreeMap::new();
+    m.insert(
+        InputMode::Normal,
+        vec![
+            ("move_down", 'j', MoveDown),
+            ("move_up", 'k', MoveUp),
+            ("goto_bottom", 'G', GotoBottom),
+            ("open_picker", 'f', OpenPicker),
+            ("insert_mode", 'i', InsertMode),
+            ("open_help", '?', OpenHelp),
+            ("quit", 'q', Quit),
+            ("retry_probe", 'r', RetryProbe),
+            ("stop_running", 's', StopRunning),
+            ("collapse_project", 'h', CollapseProject),
+            ("expand_project", 'l', ExpandProject),
+            ("open_selected", 'o', OpenSelected),
+            ("yank_context", 'y', YankContext),
+            ("open_outline", 'O', OpenOutline),
+            ("next_turn", ']', NextTurn),
+            ("prev_turn", '[', PrevTurn),
+            ("goto_chat", '1', GotoChat),
+            ("toggle_trajectory", '2', ToggleTrajectory),
+            ("open_model_catalog", 'M', OpenModelCatalog),
+            ("open_command_palette", ':', OpenCommandPalette),
+        ],
+    );
+    m.insert(
+        InputMode::Trajectory,
+        vec![
+            ("move_down", 'j', MoveDown),
+            ("move_up", 'k', MoveUp),
+            ("toggle_fold", 'z', ToggleFold),
+            ("open_detail", 'd', OpenDetail),
+            ("yank_context", 'y', YankContext),
+            ("quit", 'q', Quit),
+            ("goto_bottom", 'G', GotoBottom),
+        ],
+    );
+    m.insert(
+        InputMode::Visual,
+        vec![
+            ("move_down", 'j', MoveDown),
+            ("move_up", 'k', MoveUp),
+            ("yank_context", 'y', YankContext),
+            ("open_selected", 'o', OpenSelected),
+        ],
+    );
+    m.insert(
+        InputMode::Approval,
+        vec![
+            ("approval_allow", 'y', ApprovalAllow),
+            ("approval_reject", 'n', ApprovalReject),
+            ("approval_cancel", 'q', ApprovalCancel),
+            ("approval_always", 'a', ApprovalAlways),
+            ("open_approval_list", 'L', OpenApprovalList),
+        ],
+    );
+    m.insert(
+        InputMode::ApprovalList,
+        vec![
+            ("approval_retry", 'r', ApprovalRetry),
+            ("approval_batch_allow", 'A', ApprovalBatchAllow),
+            ("approval_allow", 'y', ApprovalAllow),
+            ("approval_reject", 'n', ApprovalReject),
+            ("approval_always", 'a', ApprovalAlways),
+        ],
+    );
+    m.insert(
+        InputMode::ImageView,
+        vec![
+            ("image_view_open_external", 'o', ImageViewOpenExternal),
+            ("image_view_copy", 'y', ImageViewCopy),
+            ("image_view_close", 'q', ImageViewClose),
+        ],
+    );
+    m.insert(
+        InputMode::Help,
+        vec![("quit", 'q', Quit), ("close_help", '?', CloseHelp)],
+    );
+    m.insert(
+        InputMode::Monitor,
+        vec![
+            ("move_down", 'j', MoveDown),
+            ("move_up", 'k', MoveUp),
+            ("goto_bottom", 'G', GotoBottom),
+            ("monitor_open_chat", 'c', MonitorOpenChat),
+            ("monitor_cheer", 'f', MonitorCheer),
+            ("monitor_locate", 'l', MonitorLocate),
+            ("monitor_stats", 's', MonitorStats),
+            ("quit", 'q', Quit),
+        ],
+    );
+    m
+}
+
+/// Effective keymap（默认 ∘ 覆盖）。每 mode：`defaults`（原始）与
+/// `effective`（覆盖后）。
+#[derive(Debug, Clone, Default)]
+pub struct Keymap {
+    defaults: std::collections::BTreeMap<InputMode, std::collections::BTreeMap<char, Command>>,
+    effective: std::collections::BTreeMap<InputMode, std::collections::BTreeMap<char, Command>>,
+    /// build 期的可读警告（未知 command/mode、非法 keyspec、位移冲突）。
+    pub warnings: Vec<String>,
+}
+
+impl Keymap {
+    /// 从 `[keymap]` 配置非失败合并。未知项 warn 保默认，永不崩溃。
+    pub fn build(cfg: &crate::config::KeymapConfig) -> Self {
+        let default_rows = default_key_tables();
+        let mut defaults = std::collections::BTreeMap::new();
+        let mut effective = std::collections::BTreeMap::new();
+        for (mode, rows) in &default_rows {
+            let def: std::collections::BTreeMap<char, Command> =
+                rows.iter().map(|(_, k, c)| (*k, c.clone())).collect();
+            defaults.insert(*mode, def.clone());
+            effective.insert(*mode, def);
+        }
+        let mut warnings = Vec::new();
+        for (mode_name, binds) in &cfg.modes {
+            let Some(mode) = mode_from_name(mode_name) else {
+                warnings.push(format!("未知 mode: {mode_name:?}（忽略）"));
+                continue;
+            };
+            let Some(rows) = default_rows.get(&mode) else {
+                warnings.push(format!("mode {mode_name:?} 为输入型/不支持覆盖（忽略）"));
+                continue;
+            };
+            let def = defaults.get(&mode).cloned().unwrap_or_default();
+            let eff = effective.entry(mode).or_default();
+            for (cmd_name, keyspec) in binds {
+                let Some((_old_key, _, default_cmd)) =
+                    rows.iter().find(|(name, _, _)| name == cmd_name)
+                else {
+                    warnings.push(format!("{mode_name}.{cmd_name}: 未知 command（保留默认）"));
+                    continue;
+                };
+                // 定位该 command 的默认键。
+                let default_key = def
+                    .iter()
+                    .find_map(|(k, c)| (c == default_cmd).then_some(*k));
+                if keyspec == "none" {
+                    if let Some(k) = default_key {
+                        eff.remove(&k);
+                    }
+                    continue;
+                }
+                // 单字符 plain key（原型已验证范围；双键/修饰键暂 warn）。
+                let mut cs = keyspec.chars();
+                let (Some(c), None) = (cs.next(), cs.next()) else {
+                    warnings.push(format!(
+                        "{mode_name}.{cmd_name}={keyspec:?}: 非法键序列（本版支持单字符或 none，保留默认）"
+                    ));
+                    continue;
+                };
+                if !c.is_ascii() || c.is_whitespace() || c.is_control() {
+                    warnings.push(format!(
+                        "{mode_name}.{cmd_name}={keyspec:?}: 非法键序列（保留默认）"
+                    ));
+                    continue;
+                }
+                if c == 'g' {
+                    warnings.push(format!(
+                        "{mode_name}.{cmd_name}: g 为前缀键不可重绑（保留默认）"
+                    ));
+                    continue;
+                }
+                // 原默认键失绑。
+                if let Some(k) = default_key {
+                    eff.remove(&k);
+                }
+                // 后写胜；位移既有默认绑定 → warn。
+                if let Some(displaced) = defaults.get(&mode).and_then(|d| d.get(&c)) {
+                    if displaced != default_cmd {
+                        warnings.push(format!(
+                            "{mode_name}.{cmd_name}={c} 位移默认绑定 {}（{}）",
+                            cmd_display(displaced),
+                            c
+                        ));
+                    }
+                }
+                eff.insert(c, default_cmd.clone());
+            }
+        }
+        Keymap {
+            defaults,
+            effective,
+            warnings,
+        }
+    }
+
+    /// 生效差异行（帮助面板联动/`--dump-keymap` 单一事实源）：`mode 键 →
+    /// 命令` 或 `mode 键 unbind`（仅列与默认不同的项）。
+    pub fn override_lines(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for (mode, eff) in &self.effective {
+            let def = self.defaults.get(mode).cloned().unwrap_or_default();
+            let mode_name = mode_name_of(*mode);
+            for (k, cmd) in eff {
+                let old = def.get(k);
+                if old != Some(cmd) {
+                    out.push(format!(
+                        "[{mode_name}] {k} → {}（默认 {}）",
+                        cmd_display(cmd),
+                        old.map(cmd_display).unwrap_or_else(|| "无".into())
+                    ));
+                }
+            }
+            for (k, cmd) in &def {
+                if !eff.contains_key(k) {
+                    out.push(format!("[{mode_name}] {k} unbind（{}）", cmd_display(cmd)));
+                }
+            }
+        }
+        out
+    }
+
+    /// 顶部查表（仅 plain 无修饰单字符）：命中 → Some(Some(cmd))；原默认键被
+    /// shadow → Some(None)；未命中（含结构性键/未覆盖默认键）→ None 回落既有
+    /// 硬编码分支。
+    pub(crate) fn decode_override(
+        &self,
+        mode: InputMode,
+        key: KeyEvent,
+    ) -> Option<Option<Command>> {
+        let KeyCode::Char(c) = key.code else {
+            return None;
+        };
+        if key.modifiers != KeyModifiers::NONE {
+            return None;
+        }
+        let eff = self.effective.get(&mode).and_then(|t| t.get(&c)).cloned();
+        let def = self.defaults.get(&mode).and_then(|t| t.get(&c)).cloned();
+        match (eff, def) {
+            // 新键/改键命中（override 层拥有该键）。
+            (Some(cmd), Some(old)) if cmd != old => Some(Some(cmd)),
+            (Some(cmd), None) => Some(Some(cmd)),
+            // 原默认键：command 被改键/解绑 → shadow（返回 None，不改语义）。
+            (None, Some(_)) => Some(None),
+            // 未覆盖默认键 → 回落生产分支。
+            _ => None,
+        }
+    }
+}
+
+fn mode_name_of(mode: InputMode) -> &'static str {
+    match mode {
+        InputMode::Normal => "normal",
+        InputMode::Trajectory => "trajectory",
+        InputMode::Visual => "visual",
+        InputMode::Approval => "approval",
+        InputMode::ApprovalList => "approval_list",
+        InputMode::ImageView => "image_view",
+        InputMode::Help => "help",
+        InputMode::Monitor => "monitor",
+        InputMode::Picker
+        | InputMode::Insert
+        | InputMode::Search
+        | InputMode::TrajectoryFilter
+        | InputMode::ModelCatalog
+        | InputMode::CommandPalette => "input(不可覆盖)",
+    }
+}
+
+fn mode_from_name(name: &str) -> Option<InputMode> {
+    match name {
+        "normal" => Some(InputMode::Normal),
+        "trajectory" => Some(InputMode::Trajectory),
+        "visual" => Some(InputMode::Visual),
+        "approval" => Some(InputMode::Approval),
+        "approval_list" => Some(InputMode::ApprovalList),
+        "image_view" => Some(InputMode::ImageView),
+        "help" => Some(InputMode::Help),
+        "monitor" => Some(InputMode::Monitor),
+        _ => None,
     }
 }
 

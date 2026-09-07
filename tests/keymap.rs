@@ -1880,3 +1880,177 @@ fn insert_tab_opens_palette_with_slash_prefix_and_esc_returns_composer_ac006_04(
     assert!(app.notice.as_deref().unwrap().contains("Tab 补全"));
     assert_eq!(app.mode, Mode::Insert, "无斜杠词不离开 composer");
 }
+
+// ============================================================================
+// REQ-007 AC-007-21：`[keymap]` 覆盖（Step 5）——真实 Keymap::build + decode。
+// 既有 ~54 用例零改动保绿（no-op 回落）；此处验证 override 生效/解绑/冲突
+// 警告/非法回退（keymap_override_proto 原型 PASS 后接线）。
+// ============================================================================
+
+fn keymap_with(cfg: &str) -> (dshtui::input::Keymap, Vec<String>) {
+    // cfg: 一段 `[keymap.modes.normal] ...` TOML 片段。
+    let full = format!("[keymap.modes.normal]\n{cfg}\n");
+    // 通过 Config::load 全链解析（真实注入链），再 build。
+    let dir = std::env::temp_dir().join(format!(
+        "dshtui-km-test-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("config.toml");
+    std::fs::write(&path, &full).unwrap();
+    let cfg: dshtui::config::Config = dshtui::config::Config::load(Some(&path)).unwrap_or_default();
+    let _ = std::fs::remove_dir_all(&dir);
+    let km = dshtui::input::Keymap::build(&cfg.keymap);
+    let warnings = km.warnings.clone();
+    (km, warnings)
+}
+
+fn char_ev(c: char) -> Event {
+    Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
+}
+
+#[test]
+fn keymap_override_rebinds_and_shadows_old_key_ac007_21() {
+    let (km, _w) = keymap_with("move_down = \"x\"\n");
+    let mut d = KeyDecoder::with_keymap(km);
+    assert_eq!(
+        d.decode(InputMode::Normal, char_ev('x')),
+        Some(Command::MoveDown),
+        "新键 x 命中 MoveDown"
+    );
+    assert_eq!(
+        d.decode(InputMode::Normal, char_ev('j')),
+        None,
+        "原默认键 j 失绑（shadow，无 post-decode remap）"
+    );
+    // 未覆盖键不受影响（fall-through 到既有分支）。
+    assert_eq!(
+        d.decode(InputMode::Normal, char_ev('k')),
+        Some(Command::MoveUp)
+    );
+    assert_eq!(
+        d.decode(InputMode::Normal, char_ev('q')),
+        Some(Command::Quit)
+    );
+}
+
+#[test]
+fn keymap_unbind_none_ac007_21() {
+    let (km, _w) = keymap_with("quit = \"none\"\n");
+    let mut d = KeyDecoder::with_keymap(km);
+    assert_eq!(d.decode(InputMode::Normal, char_ev('q')), None, "q 解绑");
+    assert_eq!(
+        d.decode(InputMode::Normal, char_ev('j')),
+        Some(Command::MoveDown)
+    );
+}
+
+#[test]
+fn keymap_jk_swap_later_wins_and_warns_ac007_21() {
+    let (km, warnings) = keymap_with("move_down = \"k\"\n");
+    let mut d = KeyDecoder::with_keymap(km);
+    assert_eq!(
+        d.decode(InputMode::Normal, char_ev('k')),
+        Some(Command::MoveDown),
+        "后写胜：k 现在是 MoveDown"
+    );
+    assert_eq!(d.decode(InputMode::Normal, char_ev('j')), None, "j 失绑");
+    assert!(
+        warnings.iter().any(|w| w.contains("位移默认绑定")),
+        "位移冲突需 warn：warnings={warnings:?}"
+    );
+}
+
+#[test]
+fn keymap_unknown_and_illegal_warn_keep_default_ac007_21() {
+    let (km, warnings) =
+        keymap_with("no_such_command = \"x\"\nopen_help = \"j k\"\nstop_running = \"\"\n");
+    assert!(
+        warnings.iter().any(|w| w.contains("未知 command")),
+        "未知 command warn：{warnings:?}"
+    );
+    assert!(
+        warnings.iter().any(|w| w.contains("非法键序列")),
+        "非法 keyspec warn：{warnings:?}"
+    );
+    let mut d = KeyDecoder::with_keymap(km);
+    // 非法项保默认（? 仍是 OpenHelp）。
+    assert_eq!(
+        d.decode(InputMode::Normal, char_ev('?')),
+        Some(Command::OpenHelp)
+    );
+    assert_eq!(
+        d.decode(InputMode::Normal, char_ev('j')),
+        Some(Command::MoveDown)
+    );
+    assert_eq!(
+        d.decode(InputMode::Normal, char_ev('s')),
+        Some(Command::StopRunning)
+    );
+}
+
+#[test]
+fn keymap_g_prefix_is_not_rebindable_ac007_21() {
+    let (km, warnings) = keymap_with("move_down = \"g\"\n");
+    assert!(
+        warnings.iter().any(|w| w.contains("g 为前缀键不可重绑")),
+        "g 保留给前缀：{warnings:?}"
+    );
+    let mut d = KeyDecoder::with_keymap(km);
+    // gg/gt 前缀语义不变。
+    assert_eq!(d.decode(InputMode::Normal, char_ev('g')), None);
+    assert_eq!(
+        d.decode(InputMode::Normal, char_ev('g')),
+        Some(Command::GotoTop)
+    );
+    assert_eq!(d.decode(InputMode::Normal, char_ev('g')), None);
+    assert_eq!(
+        d.decode(InputMode::Normal, char_ev('t')),
+        Some(Command::ToggleTrajectory)
+    );
+}
+
+#[test]
+fn keymap_empty_config_is_byte_identical_to_builtin_ac007_21() {
+    // 无覆盖时 KeyDecoder::with_keymap(empty) 与 new() 行为一致（no-op 回落
+    // ——既有 54 测试不改仍绿是该断言的全量证据；此处抽查等价）。
+    let (km, _w) = keymap_with("");
+    let mut a = KeyDecoder::new();
+    let mut b = KeyDecoder::with_keymap(km);
+    for c in [
+        'j', 'k', 'G', 'f', 'i', '?', 'q', 's', 'h', 'l', 'o', 'M', ':',
+    ] {
+        assert_eq!(
+            a.decode(InputMode::Normal, char_ev(c)),
+            b.decode(InputMode::Normal, char_ev(c)),
+            "字符 {c} 解码必须一致"
+        );
+    }
+}
+
+#[test]
+fn keymap_override_works_in_command_modes_ac007_21() {
+    // ImageView：image_view_close 改键。
+    let full = "[keymap.modes.image_view]\nimage_view_close = \"x\"\n";
+    let dir = std::env::temp_dir().join(format!("dshtui-km2-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("config.toml");
+    std::fs::write(&path, full).unwrap();
+    let cfg: dshtui::config::Config = dshtui::config::Config::load(Some(&path)).unwrap_or_default();
+    let _ = std::fs::remove_dir_all(&dir);
+    let km = dshtui::input::Keymap::build(&cfg.keymap);
+    let mut d = KeyDecoder::with_keymap(km);
+    assert_eq!(
+        d.decode(InputMode::ImageView, char_ev('x')),
+        Some(Command::ImageViewClose)
+    );
+    assert_eq!(d.decode(InputMode::ImageView, char_ev('q')), None, "q 失绑");
+    assert_eq!(
+        d.decode(InputMode::ImageView, char_ev('o')),
+        Some(Command::ImageViewOpenExternal)
+    );
+}

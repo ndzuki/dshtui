@@ -116,7 +116,13 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
     if !app.help_open {
         return;
     }
-    let overlay = centered_rect(area, 70, 80);
+    // 有 `[keymap]` 覆盖行时加高帮助面板（容纳「自定义键位」节）。
+    let height_pct = if app.keymap_override_lines.is_empty() {
+        80
+    } else {
+        94
+    };
+    let overlay = centered_rect(area, 70, height_pct);
     frame.render_widget(Clear, overlay);
     let keys: &[(&str, &str)] = &[
         ("j / k", "上/下滚动"),
@@ -145,7 +151,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         ("q / Ctrl+c", "退出（运行中先 stop；审批中 q=中止）"),
         ("r", "启动失败时重试探测"),
     ];
-    let lines = keys
+    let mut lines = keys
         .iter()
         .map(|(key, desc)| {
             Line::from(vec![
@@ -159,8 +165,32 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
             ])
         })
         .collect::<Vec<_>>();
-    let panel =
-        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" 帮助 Help "));
+    // REQ-007 AC-007-21：`[keymap]` 覆盖生效行（未配置则不显示）。
+    if !app.keymap_override_lines.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "自定义键位（config.toml [keymap]，覆盖默认）：",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )));
+        for l in &app.keymap_override_lines {
+            lines.push(Line::from(Span::styled(
+                format!("  {l}"),
+                Style::default().fg(Color::Yellow),
+            )));
+        }
+    }
+    // 有覆盖节且面板不够高时底部对齐（露出「自定义键位」区；无覆盖保持既有
+    // 顶部裁剪行为不变）。
+    let mut scroll_rows = 0usize;
+    let max_rows = overlay.height.saturating_sub(2) as usize; // 上下边框
+    if !app.keymap_override_lines.is_empty() && lines.len() > max_rows {
+        scroll_rows = lines.len() - max_rows;
+    }
+    let panel = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title(" 帮助 Help "))
+        .scroll((scroll_rows as u16, 0));
     frame.render_widget(panel, overlay);
 }
 
@@ -262,6 +292,42 @@ mod tests {
         assert!(
             text.contains("picker"),
             "help must list picker, text={text}"
+        );
+    }
+
+    #[test]
+    fn help_overlay_shows_keymap_override_lines_when_configured_ac007_21() {
+        let mut app = AppState::default();
+        app.help_open = true;
+        app.conn = crate::app::ConnState::Ready;
+        app.keymap_override_lines = vec![
+            "[normal] x → MoveDown（默认 j）".into(),
+            "[normal] q unbind（Quit）".into(),
+        ];
+        let backend = TestBackend::new(90, 26);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let text = rendered_text(&terminal);
+        assert!(
+            text.contains("自定义键位"),
+            "帮助显示覆盖节标题, text={text}"
+        );
+        assert!(text.contains("MoveDown"), "帮助显示生效覆盖行, text={text}");
+        assert!(text.contains("unbind"), "帮助显示解绑行, text={text}");
+    }
+
+    #[test]
+    fn help_overlay_without_overrides_has_no_override_section() {
+        let mut app = AppState::default();
+        app.help_open = true;
+        app.conn = crate::app::ConnState::Ready;
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let text = rendered_text(&terminal);
+        assert!(
+            !text.contains("自定义键位"),
+            "无覆盖不显示该节, text={text}"
         );
     }
 

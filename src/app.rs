@@ -1142,6 +1142,9 @@ pub struct AppState {
     pub palette: crate::ui::theme::Palette,
     /// User palette overrides kept on AppState (persisted on theme toggle).
     pub palette_overrides: std::collections::BTreeMap<String, String>,
+    /// REQ-007 AC-007-21：生效 `[keymap]` 覆盖差异行（帮助面板联动；
+    /// 空 = 内置键位无覆盖）。
+    pub keymap_override_lines: Vec<String>,
     page_guard: PageGuard,
     /// 模型目录 fetch 单飞 generation（REQ-006 FR-006-01）：打开时自增，
     /// stale 响应（overlay 已关/已重开）直接丢弃（模式 15 in-flight 去重）。
@@ -1227,6 +1230,7 @@ impl Default for AppState {
             details_width_cells: crate::ui::layout::DEFAULT_DETAILS_WIDTH,
             palette: crate::ui::theme::Palette::default(),
             palette_overrides: std::collections::BTreeMap::new(),
+            keymap_override_lines: Vec::new(),
             page_guard: PageGuard::default(),
             catalog_generation: 0,
             want_backfill: false,

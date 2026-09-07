@@ -18,7 +18,15 @@ page_size = 50                   # session/page 每页条数
 cache_bytes = 33554432           # 图片/历史缓存上限 32MB
 rss_target_mb = 80               # 超限触发 LRU 释放
 
-[keymap]                         # 默认内置，允许覆盖（后期）
+# [keymap]                         # 默认内置键位；以下展示覆盖写法（REQ-007 V0.4）
+# 支持覆盖的 mode：normal/trajectory/visual/approval/approval_list/image_view/
+# help/monitor（字符兼作输入的模式不可覆盖）。command 名见 Notes/04 §3 冻结表。
+# 键序列支持单字符或 none（解绑）；g 为前缀键不可重绑；非法项警告并保默认。
+# [keymap.modes.normal]
+# move_down = "x"                 # j → x（原 j 失绑）
+# quit = "none"                   # 解绑 q（不退出）
+# [keymap.modes.image_view]
+# image_view_close = "c"
 
 [monitor]                         # REQ-009 V0.3 Agent Town 监控面板
 addr = "http://127.0.0.1:8799"    # OTR agent-server 地址（默认仅连 loopback）

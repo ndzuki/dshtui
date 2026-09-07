@@ -151,6 +151,8 @@ pub struct Effective {
     pub monitor: MonitorConfig,
     pub drafts: DraftsConfig,
     pub export: ExportConfig,
+    /// `[keymap]` 覆盖（REQ-007 AC-007-21）；empty = 内置键位。
+    pub keymap: KeymapConfig,
 }
 
 pub const DEFAULT_URL: &str = "http://127.0.0.1:3080";
@@ -283,6 +285,7 @@ impl Config {
             monitor,
             drafts: self.drafts.clone(),
             export: self.export.clone(),
+            keymap: self.keymap.clone(),
         })
     }
 
@@ -925,6 +928,7 @@ window_messages = 100
             monitor: MonitorConfig::default(),
             drafts: DraftsConfig::default(),
             export: ExportConfig::default(),
+            keymap: KeymapConfig::default(),
         };
         let s = redact_summary(&eff);
         assert!(!s.contains("super-secret-token"));

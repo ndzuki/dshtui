@@ -228,7 +228,7 @@ async fn run_startup_guidance(
     let mut app = AppState::new(eff.perf.window_messages);
     app.handle(AppEvent::StartupProbeFailed(error.to_string()));
     let mut terminal = TerminalSession::enter().map_err(|e| e.to_string())?;
-    let mut decoder = KeyDecoder::new();
+    let mut decoder = KeyDecoder::from_effective(&eff);
     let mut entering = false;
     let mut draft = String::new();
 
@@ -364,7 +364,12 @@ async fn run_connected(eff: Effective, token: String, client: DshClient) -> Resu
             }
         }
     }
-    let mut decoder = KeyDecoder::new();
+    let mut decoder = KeyDecoder::from_effective(&eff);
+    // REQ-007 AC-007-21：把生效覆盖行注入 AppState（帮助面板「我的键位」）。
+    if !eff.keymap.modes.is_empty() {
+        let km = dshtui::input::Keymap::build(&eff.keymap);
+        app.keymap_override_lines = km.override_lines();
+    }
     let mut client = Some(client);
     let mut mux: Option<Mux> = None;
     // Stream generations: stale stream tasks from a replaced mux must not
