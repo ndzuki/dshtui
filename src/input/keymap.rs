@@ -33,6 +33,9 @@ pub enum InputMode {
     /// REQ-006：模型目录 overlay（`M` 打开；输入即时本地 nucleo 过滤，
     /// j/k 移动、Enter 选择、q/Esc 关闭）。effort 子阶段同键位表。
     ModelCatalog,
+    /// REQ-006：命令面板 overlay（`:` 打开；输入过滤、j/k 移动、Enter 执行、
+    /// Esc/q 关闭）。
+    CommandPalette,
     /// REQ-009 V0.3：MONITOR 模式（`dshtui monitor` 独立键位表）。
     Monitor,
 }
@@ -139,6 +142,9 @@ pub enum Command {
     // ---------- REQ-006 侧栏视图（FR-006-02，D-034） ----------
     /// `gv`：循环切换侧栏 groupBy/orderBy（仅本地视图态，无远端写）。
     CycleSidebarView,
+    // ---------- REQ-006 命令面板（FR-006-03） ----------
+    /// NORMAL `:`：打开命令面板（本地命令 + 斜杠命令）。
+    OpenCommandPalette,
 }
 
 /// Stateful decoder for multi-key Normal-mode commands such as `gg`.
@@ -179,6 +185,7 @@ impl KeyDecoder {
             InputMode::Trajectory => self.trajectory(key),
             InputMode::TrajectoryFilter => self.trajectory_filter(key),
             InputMode::ModelCatalog => self.model_catalog(key),
+            InputMode::CommandPalette => self.command_palette(key),
             InputMode::Monitor => self.monitor(key),
         }
     }
@@ -243,6 +250,8 @@ impl KeyDecoder {
                     '2' => Some(Command::ToggleTrajectory),
                     // REQ-006 模型目录（FR-006-01；`M` 现未占用）。
                     'M' => Some(Command::OpenModelCatalog),
+                    // REQ-006 命令面板（FR-006-03；Notes/04 §3.1 `:`）。
+                    ':' => Some(Command::OpenCommandPalette),
                     _ => None,
                 }
             }
@@ -484,6 +493,24 @@ impl KeyDecoder {
     /// 确认 effort）、Esc/q 关闭、Backspace 删字符。effort 子阶段由 reducer
     /// 依状态分派 Enter/Esc（同键位表，无独立 InputMode）。
     fn model_catalog(&mut self, key: KeyEvent) -> Option<Command> {
+        self.pending_g = false;
+        match key.code {
+            KeyCode::Esc => Some(Command::ClosePicker),
+            KeyCode::Char('q') if key.modifiers.is_empty() => Some(Command::ClosePicker),
+            KeyCode::Enter if key.modifiers.is_empty() => Some(Command::PickerConfirm),
+            KeyCode::Char('j') if key.modifiers.is_empty() => Some(Command::PickerDown),
+            KeyCode::Char('k') if key.modifiers.is_empty() => Some(Command::PickerUp),
+            KeyCode::Backspace => Some(Command::PickerBackspace),
+            KeyCode::Char(c) if key.modifiers.is_empty() => {
+                Some(Command::PickerInput(c.to_string()))
+            }
+            _ => None,
+        }
+    }
+
+    /// 命令面板 overlay 键位（REQ-006 FR-006-03）：字符输入命令名/斜杠行、
+    /// j/k 移动候选、Enter 执行、Backspace 删、Esc/q 关闭。
+    fn command_palette(&mut self, key: KeyEvent) -> Option<Command> {
         self.pending_g = false;
         match key.code {
             KeyCode::Esc => Some(Command::ClosePicker),

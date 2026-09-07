@@ -1780,3 +1780,63 @@ fn gv_two_key_decodes_cycle_sidebar_view_ac006_11() {
         "gt 仍切 Trajectory"
     );
 }
+
+#[test]
+fn colon_opens_command_palette_and_mode_keys_filter_execute_ac006_04() {
+    // Normal `:` → OpenCommandPalette。
+    let mut d = KeyDecoder::new();
+    assert_eq!(
+        d.decode(InputMode::Normal, key(KeyCode::Char(':'))),
+        Some(Command::OpenCommandPalette)
+    );
+    // 命令面板键位：字符输入、j/k、Enter、Backspace、Esc/q。
+    assert_eq!(
+        d.decode(InputMode::CommandPalette, key(KeyCode::Char('n'))),
+        Some(Command::PickerInput("n".into()))
+    );
+    assert_eq!(
+        d.decode(InputMode::CommandPalette, key(KeyCode::Char('j'))),
+        Some(Command::PickerDown)
+    );
+    assert_eq!(
+        d.decode(InputMode::CommandPalette, key(KeyCode::Char('k'))),
+        Some(Command::PickerUp)
+    );
+    assert_eq!(
+        d.decode(InputMode::CommandPalette, key(KeyCode::Enter)),
+        Some(Command::PickerConfirm)
+    );
+    assert_eq!(
+        d.decode(InputMode::CommandPalette, key(KeyCode::Backspace)),
+        Some(Command::PickerBackspace)
+    );
+    assert_eq!(
+        d.decode(InputMode::CommandPalette, key(KeyCode::Esc)),
+        Some(Command::ClosePicker)
+    );
+    assert_eq!(
+        d.decode(InputMode::CommandPalette, key(KeyCode::Char('q'))),
+        Some(Command::ClosePicker),
+        "q=关闭"
+    );
+    // reducer 侧：打开面板 + 输入过滤 + Esc 关闭回 NORMAL。
+    let mut app = AppState::default();
+    app.handle_command(Command::OpenCommandPalette);
+    assert_eq!(app.mode, Mode::CommandPalette);
+    assert!(app.command_palette.visible);
+    app.handle_command(Command::PickerInput("new".into()));
+    let filtered = app.command_palette.filtered();
+    assert!(
+        filtered.iter().any(|i| matches!(
+            i,
+            dshtui::app::CommandPaletteItem::Local {
+                label: "new session",
+                ..
+            }
+        )),
+        "输入过滤后命中 new session"
+    );
+    app.handle_command(Command::ClosePicker);
+    assert_eq!(app.mode, Mode::Normal);
+    assert!(!app.command_palette.visible);
+}

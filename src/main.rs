@@ -422,6 +422,8 @@ async fn run_connected(eff: Effective, token: String, client: DshClient) -> Resu
                 Mode::Trajectory => InputMode::Trajectory,
                 // REQ-006：模型目录 overlay（`M` 打开；effort 子阶段同键位表）。
                 Mode::ModelCatalog => InputMode::ModelCatalog,
+                // REQ-006：命令面板 overlay（`:` 打开）。
+                Mode::CommandPalette => InputMode::CommandPalette,
             };
             if let Some(command) = decoder.decode(mode, input) {
                 commands.extend(app.handle_command(command));
@@ -722,6 +724,80 @@ async fn execute_one(
                 Ok(selected) => AppEvent::ModelSelected { selected },
                 Err(error) => AppEvent::ModelSelectFailed { error },
             };
+            commands.extend(app.handle(event));
+        }
+        // ---------- REQ-006：命令面板（FR-006-03） ----------
+        Cmd::FetchRemoteCommands => {
+            let Some(client) = client.as_ref() else {
+                let event = AppEvent::RemoteCommandsFailed {
+                    error: ClientError::Transport("未连接（dsh web 不可达）".into()),
+                };
+                commands.extend(app.handle(event));
+                return;
+            };
+            // 官方 wire `agentId: SessionId`（0.1.2-rc.1 实读 dsh-commands
+            // .d.ts）：主会话流以活动会话 id 为 agent 作用域。
+            let Some(agent_id) = app.active_session.clone() else {
+                let event = AppEvent::RemoteCommandsFailed {
+                    error: ClientError::Protocol("无活动会话：斜杠命令需先打开会话".into()),
+                };
+                commands.extend(app.handle(event));
+                return;
+            };
+            let event =
+                match dshtui::api::commands::list(&client.http, &client.base, &agent_id.0).await {
+                    Ok(cmds) => AppEvent::RemoteCommandsLoaded { commands: cmds },
+                    Err(error) => AppEvent::RemoteCommandsFailed { error },
+                };
+            commands.extend(app.handle(event));
+        }
+        Cmd::ExecuteCommand { line } => {
+            let Some(client) = client.as_ref() else {
+                let event = AppEvent::CommandExecuteFailed {
+                    error: ClientError::Transport("未连接（dsh web 不可达）".into()),
+                };
+                commands.extend(app.handle(event));
+                return;
+            };
+            let Some(agent_id) = app.active_session.clone() else {
+                let event = AppEvent::CommandExecuteFailed {
+                    error: ClientError::Protocol("无活动会话：斜杠命令需先打开会话".into()),
+                };
+                commands.extend(app.handle(event));
+                return;
+            };
+            let event = match dshtui::api::commands::execute(
+                &client.http,
+                &client.base,
+                &agent_id.0,
+                &line,
+                &[],
+            )
+            .await
+            {
+                Ok(exec) => AppEvent::CommandExecuted {
+                    text: exec.and_then(|e| e.result).and_then(|r| r.text),
+                },
+                Err(error) => AppEvent::CommandExecuteFailed { error },
+            };
+            commands.extend(app.handle(event));
+        }
+        // ---------- REQ-006：workspace/session 操作（FR-006-02 操作半） ----------
+        Cmd::CreateSession => {
+            let Some(client) = client.as_ref() else {
+                let event = AppEvent::SessionCreateFailed {
+                    error: ClientError::Transport("未连接（dsh web 不可达）".into()),
+                };
+                commands.extend(app.handle(event));
+                return;
+            };
+            let event =
+                match dshtui::api::session::create(&client.http, &client.base, None, None).await {
+                    Ok(created) => AppEvent::SessionCreated {
+                        session_id: created.session_id,
+                    },
+                    Err(error) => AppEvent::SessionCreateFailed { error },
+                };
             commands.extend(app.handle(event));
         }
         Cmd::OpenExternal { target } => {

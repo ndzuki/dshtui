@@ -3,6 +3,7 @@
 pub mod agent_town;
 pub mod approval;
 pub mod chat;
+pub mod command_palette;
 pub mod composer;
 pub mod detail;
 pub mod image;
@@ -103,6 +104,8 @@ pub fn render(frame: &mut Frame<'_>, app: &AppState) {
     approval::render(frame, areas.center, app);
     // REQ-006：模型目录 overlay（`M` 打开，在审批之上、帮助之下）。
     model_catalog::render(frame, areas.center, app);
+    // REQ-006：命令面板 overlay（`:` 打开）。
+    command_palette::render(frame, areas.center, app);
     // FR-001-07：帮助 overlay 最后渲染，位于 picker 之上。
     render_help(frame, frame.area(), app);
 }

@@ -128,6 +128,15 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
                     .add_modifier(Modifier::BOLD),
             ));
         }
+        // REQ-006：命令面板模式指示（FR-006-03）。
+        crate::app::Mode::CommandPalette => {
+            spans.push(Span::styled(
+                " CMD ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
         _ => {}
     }
     // AC-003-18：不可编程审批降级 → 状态条 `等待审批` 高亮（不弹窗）。

@@ -66,6 +66,9 @@ pub enum Mode {
     /// 模型目录 overlay（REQ-006 FR-006-01，`M` 打开；ADDR-007 独立模态，
     /// 不串 SEARCH）。
     ModelCatalog,
+    /// 命令面板 overlay（REQ-006 FR-006-03，`:` 打开；ADR-007 独立模态，
+    /// 不串 SEARCH）。
+    CommandPalette,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -309,6 +312,165 @@ pub struct EffortPick {
     pub efforts: Vec<String>,
     pub default: Option<String>,
     pub cursor: usize,
+}
+
+/// 命令面板候选的动作类型（REQ-006 FR-006-03 / D-035）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaletteAction {
+    /// ≡ `M` 打开模型目录。
+    ModelCatalog,
+    /// ≡ `gv` 循环侧栏视图（本地态）。
+    CycleSidebarView,
+    /// ≡ `h` 折叠全部 workspace。
+    CollapseAll,
+    /// ≡ `l` 展开全部 workspace。
+    ExpandAll,
+    /// 新建会话（`session/create`，空 workspace；成功刷新列表）。
+    NewSession,
+    /// 关闭命令面板并打开模型目录已含；`help` 打开帮助。
+    Help,
+}
+
+/// 命令面板候选条目（本地动作 / 远端斜杠命令 / V0.4 占位）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum CommandPaletteItem {
+    /// TUI 可执行动作（进入对应流程/发写命令）。
+    Local {
+        label: &'static str,
+        desc: &'static str,
+        action: PaletteAction,
+    },
+    /// 远端斜杠命令（`commands/list` 动态注册；执行经 commands/execute）。
+    Remote { name: String, desc: String },
+    /// V0.4 才有的项（settings/theme/keymap/export…），选中仅显示提示。
+    V04 {
+        label: &'static str,
+        desc: &'static str,
+    },
+}
+
+/// 命令面板 overlay 状态（REQ-006 §5 `CommandPaletteState`；仅内存）。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CommandPaletteState {
+    pub visible: bool,
+    /// 输入行（命令名前缀 / 完整斜杠行）。
+    pub query: String,
+    /// 过滤后候选选中下标。
+    pub selection: usize,
+    /// 最近一次 `commands/execute` 失败 `error.code`（AC-006-13，D-035）。
+    pub last_error_code: Option<String>,
+    /// 最近一次执行反馈（成功/失败文本；面板内显示）。
+    pub last_result: Option<String>,
+    /// 远端命令表（`commands/list` 拉取一次缓存；打开会话后可用）。
+    pub remote_commands: Vec<crate::api::types::CommandDescriptor>,
+    /// 远端命令表是否已拉取（fetch-once）。
+    pub remote_fetched: bool,
+    /// `commands/execute` 单飞（同一行只提交一次，AC-006-12/15 同源）。
+    pub executing: bool,
+}
+
+impl CommandPaletteState {
+    /// 打开即重置为初态（保留远端缓存供重开复用；query/结果清空）。
+    pub fn reset_for_open(&mut self) {
+        self.visible = true;
+        self.query.clear();
+        self.selection = 0;
+        self.last_error_code = None;
+        self.last_result = None;
+        self.executing = false;
+    }
+
+    /// 内置本地命令 + V0.4 占位（D-035 映射清单；workspace/session 操作项由
+    /// sidebar 上下文与 Step 6 执行链路承载，此处列纯本地入口）。
+    fn local_candidates() -> Vec<CommandPaletteItem> {
+        vec![
+            CommandPaletteItem::Local {
+                label: "model catalog",
+                desc: "模型目录与热切换（M）",
+                action: PaletteAction::ModelCatalog,
+            },
+            CommandPaletteItem::Local {
+                label: "new session",
+                desc: "新建会话（官方 web New session）",
+                action: PaletteAction::NewSession,
+            },
+            CommandPaletteItem::Local {
+                label: "sidebar view",
+                desc: "循环侧栏视图 groupBy/orderBy（gv）",
+                action: PaletteAction::CycleSidebarView,
+            },
+            CommandPaletteItem::Local {
+                label: "collapse all",
+                desc: "折叠全部 workspace（h）",
+                action: PaletteAction::CollapseAll,
+            },
+            CommandPaletteItem::Local {
+                label: "expand all",
+                desc: "展开全部 workspace（l）",
+                action: PaletteAction::ExpandAll,
+            },
+            CommandPaletteItem::Local {
+                label: "help",
+                desc: "键位帮助（?）",
+                action: PaletteAction::Help,
+            },
+            CommandPaletteItem::V04 {
+                label: "settings",
+                desc: "设置面板（V0.4）",
+            },
+            CommandPaletteItem::V04 {
+                label: "theme",
+                desc: "主题切换（V0.4）",
+            },
+            CommandPaletteItem::V04 {
+                label: "keymap",
+                desc: "键位编辑（V0.4）",
+            },
+            CommandPaletteItem::V04 {
+                label: "export",
+                desc: "导出/存档（V0.4）",
+            },
+        ]
+    }
+
+    /// 全量候选（本地 + 远端斜杠）。远端需已拉取；否则仅本地。
+    pub fn all_candidates(&self) -> Vec<CommandPaletteItem> {
+        let mut out = Self::local_candidates();
+        if self.remote_fetched {
+            for c in &self.remote_commands {
+                out.push(CommandPaletteItem::Remote {
+                    name: c.name.clone(),
+                    desc: c.description.clone(),
+                });
+            }
+        }
+        out
+    }
+
+    /// 过滤后的可见候选（UI 与 reducer 共享 seam：命令名/标签前缀匹配；
+    /// 忽略前导 `:`/`/`，便于直接输入斜杠命令名）。
+    pub fn filtered(&self) -> Vec<CommandPaletteItem> {
+        let q = self
+            .query
+            .trim()
+            .trim_start_matches(':')
+            .trim_start_matches('/')
+            .to_lowercase();
+        self.all_candidates()
+            .into_iter()
+            .filter(|item| match item {
+                CommandPaletteItem::Local { label, .. } => {
+                    q.is_empty() || label.to_lowercase().contains(&q)
+                }
+                CommandPaletteItem::Remote { name, .. } => {
+                    q.is_empty() || name.to_lowercase().contains(&q)
+                }
+                CommandPaletteItem::V04 { label, .. } => {
+                    q.is_empty() || label.to_lowercase().contains(&q)
+                }
+            })
+            .collect()
+    }
 }
 
 /// turnOutline 大纲列表（`O`；D-19 独立键，与 `o` 打开不冲突）。
@@ -579,6 +741,34 @@ pub enum AppEvent {
     ModelSelectFailed {
         error: ClientError,
     },
+    // ---------- REQ-006 命令面板（FR-006-03） ----------
+    /// `commands/list` 成功（agentId=当前会话 id，官方 wire `agentId:
+    /// SessionId` 实读 0.1.2-rc.1）。
+    RemoteCommandsLoaded {
+        commands: Vec<crate::api::types::CommandDescriptor>,
+    },
+    /// `commands/list` 失败（面板内提示，不崩）。
+    RemoteCommandsFailed {
+        error: ClientError,
+    },
+    /// `commands/execute` 成功（result 文本；undefined 容忍为空成功）。
+    CommandExecuted {
+        text: Option<String>,
+    },
+    /// `commands/execute` 失败（显示 error.code，面板保持可继续输入，
+    /// AC-006-13）。
+    CommandExecuteFailed {
+        error: ClientError,
+    },
+    // ---------- REQ-006 workspace/session 操作（FR-006-02 操作半） ----------
+    /// `session/create` 成功（新建会话；刷新会话列表，web 立即可见一致，
+    /// AC-006-02/04）。
+    SessionCreated {
+        session_id: String,
+    },
+    SessionCreateFailed {
+        error: ClientError,
+    },
 }
 
 /// Orchestration commands emitted by the reducer (executed by the run loop).
@@ -680,6 +870,15 @@ pub enum Cmd {
         model: String,
         reasoning_effort: Option<String>,
     },
+    // ---------- REQ-006 命令面板（FR-006-03） ----------
+    /// `commands/list` 拉取（打开命令面板且有活动会话时一次；agentId=会话）。
+    FetchRemoteCommands,
+    /// `commands/execute` 执行斜杠行（agentId=会话 id；images 空）。
+    ExecuteCommand {
+        line: String,
+    },
+    /// `session/create` 新建会话（Step 5 `new session` 命令）。
+    CreateSession,
 }
 
 #[derive(Debug)]
@@ -716,6 +915,8 @@ pub struct AppState {
     pub approval: ApprovalState,
     /// 模型目录 overlay（REQ-006 FR-006-01，`M` 打开）。
     pub model_catalog: ModelCatalogState,
+    /// 命令面板 overlay（REQ-006 FR-006-03，`:` 打开）。
+    pub command_palette: CommandPaletteState,
     /// turnOutline 大纲列表（`O`）。
     pub outline: OutlineState,
     /// 焦点块游标（窗口块下标；搜索跳转/视觉选择/上下文 yank 的锚）。
@@ -806,6 +1007,7 @@ impl Default for AppState {
             yank: YankState::default(),
             approval: ApprovalState::default(),
             model_catalog: ModelCatalogState::default(),
+            command_palette: CommandPaletteState::default(),
             outline: OutlineState::default(),
             cursor_block: 0,
             stop: StopState::default(),
@@ -1559,6 +1761,62 @@ impl AppState {
                 }
                 vec![]
             }
+            // ---------- REQ-006 命令面板（FR-006-03） ----------
+            AppEvent::RemoteCommandsLoaded { commands } => {
+                // 缓存命令表（fetch-once；重开命令面板复用）。
+                self.command_palette.remote_commands = commands;
+                self.command_palette.remote_fetched = true;
+                self.command_palette.selection = 0;
+                vec![]
+            }
+            AppEvent::RemoteCommandsFailed { error } => {
+                self.command_palette.last_error_code = Some(error.code());
+                self.command_palette.last_result = Some(format!("斜杠命令加载失败: {error}"));
+                tracing::warn!(error = %error, "commands/list 失败");
+                vec![]
+            }
+            AppEvent::CommandExecuted { text } => {
+                // execute 单飞结束；面板显示结果文本，保持打开可继续输入
+                // （AC-006-13 不崩溃）。
+                self.command_palette.executing = false;
+                self.command_palette.last_result = Some(match text {
+                    Some(t) if !t.trim().is_empty() => t,
+                    _ => "命令已执行".to_string(),
+                });
+                vec![]
+            }
+            AppEvent::CommandExecuteFailed { error } => {
+                // AC-006-13：显示 error.code、面板不崩溃可继续输入、权限错误
+                // 不自动重试。
+                self.command_palette.executing = false;
+                let code = error.code();
+                self.command_palette.last_error_code = Some(code);
+                self.command_palette.last_result = Some(format!("命令执行失败: {error}"));
+                if error.class() == ErrorClass::PermissionDenied {
+                    tracing::error!(error = %error, "commands/execute 权限不足");
+                } else {
+                    tracing::warn!(error = %error, "commands/execute 失败");
+                }
+                vec![]
+            }
+            // ---------- REQ-006 workspace/session 操作（FR-006-02 操作半） ----------
+            AppEvent::SessionCreated { session_id } => {
+                // 新建成功：notice + 重拉会话列表（web 一致，AC-006-02/04）。
+                self.notice = Some(format!("已新建会话 {session_id}"));
+                self.list_loaded = false;
+                vec![Cmd::LoadSessionList { cursor: None }]
+            }
+            AppEvent::SessionCreateFailed { error } => {
+                let code = error.code();
+                self.command_palette.last_error_code = Some(code);
+                self.command_palette.last_result = Some(format!("新建会话失败: {error}"));
+                if error.class() == ErrorClass::PermissionDenied {
+                    tracing::error!(error = %error, "session/create 权限不足");
+                } else {
+                    tracing::warn!(error = %error, "session/create 失败");
+                }
+                vec![]
+            }
         }
     }
 
@@ -2254,6 +2512,11 @@ impl AppState {
                     }
                     vec![]
                 }
+                // REQ-006：命令面板 q/Esc 关闭。
+                Mode::CommandPalette => {
+                    self.close_command_palette();
+                    vec![]
+                }
             },
             C::PickerDown => {
                 if self.approval.list_open && self.mode == Mode::Approval {
@@ -2277,6 +2540,9 @@ impl AppState {
                 } else if self.mode == Mode::ModelCatalog {
                     self.model_catalog_cursor_move(true);
                     vec![]
+                } else if self.mode == Mode::CommandPalette {
+                    self.command_palette_cursor_move(true);
+                    vec![]
                 } else {
                     self.picker.selection += 1;
                     vec![]
@@ -2297,6 +2563,9 @@ impl AppState {
                 } else if self.mode == Mode::ModelCatalog {
                     self.model_catalog_cursor_move(false);
                     vec![]
+                } else if self.mode == Mode::CommandPalette {
+                    self.command_palette_cursor_move(false);
+                    vec![]
                 } else {
                     self.picker.selection = self.picker.selection.saturating_sub(1);
                     vec![]
@@ -2309,6 +2578,9 @@ impl AppState {
                     self.search_input(&text)
                 } else if self.mode == Mode::ModelCatalog {
                     self.model_catalog_input(&text);
+                    vec![]
+                } else if self.mode == Mode::CommandPalette {
+                    self.command_palette_input(&text);
                     vec![]
                 } else {
                     self.picker.query.push_str(&text);
@@ -2323,6 +2595,9 @@ impl AppState {
                     self.search_input_backspace()
                 } else if self.mode == Mode::ModelCatalog {
                     self.model_catalog_backspace();
+                    vec![]
+                } else if self.mode == Mode::CommandPalette {
+                    self.command_palette_backspace();
                     vec![]
                 } else {
                     self.picker.query.pop();
@@ -2502,6 +2777,8 @@ impl AppState {
                 // REQ-006：模型目录 Enter——主列表：选中模型（带 efforts →
                 // 进 effort 子阶段）；effort 子阶段：确认 effort 提交热切换。
                 Mode::ModelCatalog => self.model_catalog_confirm(),
+                // REQ-006：命令面板 Enter——执行选中候选。
+                Mode::CommandPalette => self.command_palette_confirm(),
                 // APPROVAL 仅 y/n/q/Esc/a（§3 键位边界；Enter 无语义，no-op）。
                 Mode::Normal if self.outline.open => self.outline_confirm(),
                 _ => vec![],
@@ -2573,6 +2850,14 @@ impl AppState {
             C::OpenModelCatalog => {
                 if self.mode == Mode::Normal {
                     self.open_model_catalog()
+                } else {
+                    vec![]
+                }
+            }
+            // REQ-006：命令面板 `:` 打开（仅 NORMAL）。
+            C::OpenCommandPalette => {
+                if self.mode == Mode::Normal {
+                    self.open_command_palette()
                 } else {
                     vec![]
                 }
@@ -3233,6 +3518,127 @@ impl AppState {
             model,
             reasoning_effort,
         }]
+    }
+
+    // ---------- REQ-006 命令面板（FR-006-03，`:`） ----------
+
+    /// `:` 打开命令面板：重置输入态；有活动会话则拉取远端斜杠命令表
+    /// （fetch-once：已拉取重开复用不重拉）。
+    fn open_command_palette(&mut self) -> Vec<Cmd> {
+        self.mode = Mode::CommandPalette;
+        self.command_palette.reset_for_open();
+        let mut cmds = Vec::new();
+        if !self.command_palette.remote_fetched && self.active_session.is_some() {
+            cmds.push(Cmd::FetchRemoteCommands);
+        }
+        cmds
+    }
+
+    /// q/Esc 关闭命令面板。
+    fn close_command_palette(&mut self) {
+        self.command_palette.visible = false;
+        self.command_palette.executing = false;
+        self.mode = Mode::Normal;
+    }
+
+    /// j/k 移动候选光标。
+    fn command_palette_cursor_move(&mut self, down: bool) {
+        let total = self.command_palette.filtered().len();
+        if total == 0 {
+            return;
+        }
+        if down {
+            self.command_palette.selection = (self.command_palette.selection + 1).min(total - 1);
+        } else {
+            self.command_palette.selection = self.command_palette.selection.saturating_sub(1);
+        }
+    }
+
+    /// 字符输入（输入过滤；重新选中首项）。
+    fn command_palette_input(&mut self, text: &str) {
+        self.command_palette.query.push_str(text);
+        self.command_palette.selection = 0;
+        self.command_palette.last_result = None;
+        self.command_palette.last_error_code = None;
+    }
+
+    fn command_palette_backspace(&mut self) {
+        self.command_palette.query.pop();
+        self.command_palette.selection = 0;
+        self.command_palette.last_result = None;
+        self.command_palette.last_error_code = None;
+    }
+
+    /// Enter：执行选中候选（本地动作 → reducer 直执行；远端 → Cmd 单飞；
+    /// V0.4 → 面板提示不执行）。
+    fn command_palette_confirm(&mut self) -> Vec<Cmd> {
+        let Some(item) = self
+            .command_palette
+            .filtered()
+            .into_iter()
+            .nth(self.command_palette.selection)
+        else {
+            return vec![];
+        };
+        match item {
+            CommandPaletteItem::Local { action, .. } => {
+                self.command_palette.visible = false;
+                self.mode = Mode::Normal;
+                match action {
+                    PaletteAction::ModelCatalog => self.open_model_catalog(),
+                    PaletteAction::CycleSidebarView => {
+                        self.sidebar_view.cycle();
+                        self.clamp_sidebar_cursor();
+                        self.notice = Some(format!(
+                            "视图: group={} order={}",
+                            self.sidebar_view.group_by.as_str(),
+                            self.sidebar_view.order_by.as_str()
+                        ));
+                        vec![]
+                    }
+                    PaletteAction::CollapseAll => {
+                        self.sidebar_view.collapse_all(&self.workspaces);
+                        self.clamp_sidebar_cursor();
+                        vec![]
+                    }
+                    PaletteAction::ExpandAll => {
+                        self.sidebar_view.expand_all();
+                        self.clamp_sidebar_cursor();
+                        vec![]
+                    }
+                    PaletteAction::NewSession => {
+                        // 关闭面板（保持 NORMAL）再发 create；结果事件返回。
+                        vec![Cmd::CreateSession]
+                    }
+                    PaletteAction::Help => {
+                        self.help_open = true;
+                        vec![]
+                    }
+                }
+            }
+            CommandPaletteItem::Remote { name, .. } => {
+                // 单飞：同一命令行只提交一次（AC-006-12/13）。
+                if self.command_palette.executing {
+                    return vec![];
+                }
+                // 执行完整斜杠行（query 中可能带参数，如 `/plan off`）。
+                let line = if self.command_palette.query.trim_start().starts_with('/') {
+                    self.command_palette.query.trim().to_string()
+                } else {
+                    format!("/{name}")
+                };
+                self.command_palette.executing = true;
+                self.command_palette.last_result = None;
+                self.command_palette.last_error_code = None;
+                vec![Cmd::ExecuteCommand { line }]
+            }
+            CommandPaletteItem::V04 { label, .. } => {
+                // 非目标项：显示禁用提示（REQ-007 V0.4），面板保持可输入。
+                self.command_palette.last_result =
+                    Some(format!("{label} 在 V0.4 提供（当前版本不可用）"));
+                vec![]
+            }
+        }
     }
 
     fn search_input(&mut self, text: &str) -> Vec<Cmd> {
@@ -5781,5 +6187,149 @@ mod tests {
         });
         assert_eq!(s.model_catalog.phase, CatalogPhase::Ready);
         assert_eq!(s.model_catalog.index.len(), 2);
+    }
+
+    // ---------- REQ-006 命令面板 reducer 测试（FR-006-03） ----------
+
+    #[test]
+    fn palette_colon_opens_with_remote_fetch_when_session_active() {
+        let mut s = AppState::default();
+        let cmds = s.handle_command(C::OpenCommandPalette);
+        assert_eq!(s.mode, Mode::CommandPalette);
+        assert!(s.command_palette.visible);
+        // 无活动会话：不拉远端（返回空命令列表）。
+        assert!(cmds.is_empty());
+        // 打开会话后再开：发 FetchRemoteCommands。
+        s.handle_command(C::ClosePicker);
+        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        let cmds = s.handle_command(C::OpenCommandPalette);
+        assert!(matches!(cmds[0], Cmd::FetchRemoteCommands), "cmds={cmds:?}");
+        // 远端命令到达 → 缓存并显示为候选。
+        s.handle(AppEvent::RemoteCommandsLoaded {
+            commands: vec![crate::api::types::CommandDescriptor {
+                name: "plan".into(),
+                description: "Plan mode".into(),
+                input: None,
+            }],
+        });
+        assert!(s.command_palette.remote_fetched);
+        let filtered = s.command_palette.filtered();
+        assert!(filtered.iter().any(|i| matches!(
+            i,
+            CommandPaletteItem::Remote { name, .. } if name == "plan"
+        )));
+    }
+
+    #[test]
+    fn palette_confirm_remote_execute_and_failure_stays_open_ac006_13() {
+        let mut s = AppState::default();
+        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle_command(C::OpenCommandPalette);
+        s.handle(AppEvent::RemoteCommandsLoaded {
+            commands: vec![crate::api::types::CommandDescriptor {
+                name: "plan".into(),
+                description: "Plan mode".into(),
+                input: None,
+            }],
+        });
+        // 选中 plan（filtered 里第一个 remote 是 plan? 直接设 query）。
+        s.handle_command(C::PickerInput("/plan".into()));
+        let idx = s
+            .command_palette
+            .filtered()
+            .iter()
+            .position(|i| matches!(i, CommandPaletteItem::Remote { name, .. } if name == "plan"))
+            .unwrap();
+        s.command_palette.selection = idx;
+        let cmds = s.handle_command(C::PickerConfirm);
+        assert!(matches!(&cmds[0], Cmd::ExecuteCommand { line } if line == "/plan"));
+        assert!(s.command_palette.executing, "单飞在途");
+        // 重复 Enter 单飞拒绝（不重复提交，AC-006-12/15 同源）。
+        assert!(s.handle_command(C::PickerConfirm).is_empty());
+        // 执行失败：error.code 显示、面板保持打开可继续输入（AC-006-13）。
+        let cmds = s.handle(AppEvent::CommandExecuteFailed {
+            error: ClientError::Remote {
+                code: "PERMISSION_DENIED".into(),
+                message: "denied".into(),
+                class: ErrorClass::PermissionDenied,
+            },
+        });
+        assert!(cmds.is_empty(), "权限错误不自动重试");
+        assert_eq!(
+            s.command_palette.last_error_code.as_deref(),
+            Some("PERMISSION_DENIED")
+        );
+        assert!(!s.command_palette.executing, "在途清除");
+        assert_eq!(s.mode, Mode::CommandPalette, "面板保持打开");
+        // 恢复路径：清除错误后执行成功。
+        s.command_palette.last_result = None;
+        s.handle_command(C::PickerInput("x".into())); // 触发错误清空
+        assert!(s.command_palette.last_error_code.is_none());
+    }
+
+    #[test]
+    fn palette_v04_and_local_actions() {
+        let mut s = AppState::default();
+        s.handle_command(C::OpenCommandPalette);
+        // V0.4 占位：Enter 不执行，仅提示，面板保持。
+        let idx = s
+            .command_palette
+            .filtered()
+            .iter()
+            .position(|i| {
+                matches!(
+                    i,
+                    CommandPaletteItem::V04 {
+                        label: "settings",
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        s.command_palette.selection = idx;
+        assert!(s.handle_command(C::PickerConfirm).is_empty());
+        assert_eq!(s.mode, Mode::CommandPalette);
+        assert!(s
+            .command_palette
+            .last_result
+            .as_deref()
+            .unwrap()
+            .contains("V0.4"));
+        // 本地 model catalog 动作：关闭面板并打开模型目录。
+        s.command_palette.query = "model".into();
+        let idx = s
+            .command_palette
+            .filtered()
+            .iter()
+            .position(|i| {
+                matches!(
+                    i,
+                    CommandPaletteItem::Local {
+                        label: "model catalog",
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        s.command_palette.selection = idx;
+        let cmds = s.handle_command(C::PickerConfirm);
+        assert!(matches!(cmds[0], Cmd::FetchModelCatalog { .. }));
+        assert_eq!(s.mode, Mode::ModelCatalog, "model catalog 打开");
+        // new session 动作：发 CreateSession。
+        s.handle_command(C::ClosePicker);
+        s.handle_command(C::OpenCommandPalette);
+        s.command_palette.query = "new session".into();
+        s.command_palette.selection = 0;
+        let cmds = s.handle_command(C::PickerConfirm);
+        assert!(matches!(cmds[0], Cmd::CreateSession), "cmds={cmds:?}");
+        assert_eq!(s.mode, Mode::Normal);
+        // SessionCreated → 刷新列表 + notice。
+        let cmds = s.handle(AppEvent::SessionCreated {
+            session_id: "s-new".into(),
+        });
+        assert!(cmds
+            .iter()
+            .any(|c| matches!(c, Cmd::LoadSessionList { .. })));
+        assert!(s.notice.as_deref().unwrap().contains("s-new"));
     }
 }
