@@ -382,7 +382,7 @@ pub enum GroupId {
 }
 
 /// 折叠状态（纯数据：在集合 = 折叠；AppState 单写多读，`02 §3`）。
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FoldState {
     collapsed: HashSet<GroupId>,
 }
