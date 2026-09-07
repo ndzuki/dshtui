@@ -83,6 +83,8 @@ pub enum Mode {
     Skills,
     /// 会话导出（REQ-007 FR-007-04；`:export` 打开）。
     Export,
+    /// 消息动作菜单（REQ-007 AC-007-27/28；`m` 打开）。
+    MessageAction,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -428,6 +430,30 @@ impl WorkspaceOperation {
             WorkspaceOperation::ArchiveSession { .. } | WorkspaceOperation::DeleteWorkspace { .. }
         )
     }
+}
+
+/// 消息动作菜单目标（AC-007-27）：聚焦块的捕获快照。
+#[derive(Debug, Clone, PartialEq)]
+pub struct MessageActionTarget {
+    pub session_id: SessionId,
+    pub seq: u64,
+    /// block 种类：UserMessage（retry 需要 content）| AssistantMessage
+    /// （feedback 需要 message_id）。
+    pub kind: MsgTargetKind,
+    /// retry 重发内容（UserMessage content）。
+    pub user_text: Option<String>,
+    /// assistant message.id（feedback 定位锚）。
+    pub message_id: Option<String>,
+    /// 目标所属 turn 是否 running（运行中动作需二次确认，AC-007-28）。
+    pub running: bool,
+    /// 是否为静止轮次的末条 user 消息（branch 门槛）。
+    pub is_last_user: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MsgTargetKind {
+    User,
+    Assistant,
 }
 
 /// goal 写操作（REQ-007 FR-007-02；CAS revision 由面板 inflight 携带，
@@ -1109,6 +1135,18 @@ pub enum AppEvent {
     ExportFailed {
         error: ClientError,
     },
+    // ---------- REQ-007 V0.4 消息动作回执 ----------
+    MessageBranchDone {
+        session_id: String,
+    },
+    MessageActionFailed {
+        op: crate::model::MessageActionKind,
+        error: ClientError,
+    },
+    FeedbackPutDone,
+    FeedbackPutFailed {
+        error: ClientError,
+    },
 }
 
 /// Orchestration commands emitted by the reducer (executed by the run loop).
@@ -1277,6 +1315,19 @@ pub enum Cmd {
         session_id: String,
         path: std::path::PathBuf,
     },
+    // ---------- REQ-007 V0.4 消息动作（AC-007-27/28） ----------
+    /// 分支：`session/fork atSeq`（静止轮次末条 user 消息）。
+    ForkAtSeq {
+        session_id: String,
+        at_seq: u64,
+    },
+    /// feedback：`messageFeedback/put`（messageId=assistant message.id）。
+    FeedbackPut {
+        session_id: String,
+        message_id: String,
+        rating: String,
+        note: Option<String>,
+    },
 }
 
 #[derive(Debug)]
@@ -1375,6 +1426,10 @@ pub struct AppState {
     pub timeline: crate::model::TimelineState,
     /// config `[ui].show_timeline`（默认 false）。
     pub show_timeline: bool,
+    /// REQ-007 AC-007-27/28：消息动作菜单状态。
+    pub message_action: crate::model::MessageActionState,
+    /// 菜单目标（打开时捕获，防窗口漂移后错位）。
+    pub msg_action_target: Option<MessageActionTarget>,
     /// REQ-007 AC-007-15/16：settings 面板。
     pub settings: crate::model::SettingsPanelState,
     /// REQ-007 AC-007-18：skills 目录。
@@ -1494,6 +1549,8 @@ impl Default for AppState {
             query_history: crate::model::SearchHistory::new(50),
             timeline: crate::model::TimelineState::default(),
             show_timeline: false,
+            message_action: crate::model::MessageActionState::default(),
+            msg_action_target: None,
             settings: crate::model::SettingsPanelState::default(),
             skills: crate::model::SkillsCatalogState::default(),
             export: crate::model::ExportState::default(),
@@ -2344,6 +2401,240 @@ impl AppState {
         if error.class() == crate::api::envelope::ErrorClass::PermissionDenied {
             tracing::error!(error = %error, "导出权限不足");
         }
+    }
+
+    // ---------- REQ-007 V0.4 消息动作（AC-007-27/28） ----------
+
+    /// Normal 模式 `m`：以 cursor_block 为锚打开动作菜单。
+    pub fn open_message_actions(&mut self) -> Vec<Cmd> {
+        let Some(sid) = self.active_session.clone() else {
+            self.notice = Some("无活动会话".into());
+            return vec![];
+        };
+        let Some(window) = self.active_window() else {
+            return vec![];
+        };
+        let blocks = window.block_snapshot();
+        let Some(block) = blocks.get(self.cursor_block) else {
+            return vec![];
+        };
+        let seq = block.seq().0;
+        let running = self.active_running();
+        // 是否为「静止轮次末条 user」：cursor 块是 user 且其后无 user。
+        let is_last_user = match block {
+            crate::model::Block::UserMessage { .. } => blocks[self.cursor_block + 1..]
+                .iter()
+                .all(|b| !matches!(b, crate::model::Block::UserMessage { .. })),
+            _ => false,
+        };
+        let (kind, user_text, message_id) = match block {
+            crate::model::Block::UserMessage { content, .. } => {
+                (MsgTargetKind::User, Some(content.clone()), None)
+            }
+            crate::model::Block::AssistantMessage { message_id, .. } => {
+                (MsgTargetKind::Assistant, None, message_id.clone())
+            }
+            _ => {
+                self.notice = Some("该消息行不支持动作（仅 user/assistant 消息）".into());
+                return vec![];
+            }
+        };
+        self.message_action.open_menu(seq);
+        self.msg_action_target = Some(MessageActionTarget {
+            session_id: sid,
+            seq,
+            kind,
+            user_text,
+            message_id,
+            running,
+            is_last_user,
+        });
+        self.mode = Mode::MessageAction;
+        vec![]
+    }
+
+    /// 菜单可用动作（据目标块 + wire 语义）：assistant → feedback±；
+    /// user → retry（重发）+ branch（仅静止轮次末条）。
+    fn msg_available_actions(&self) -> Vec<crate::model::MessageActionKind> {
+        use crate::model::MessageActionKind as K;
+        let Some(t) = &self.msg_action_target else {
+            return vec![];
+        };
+        match t.kind {
+            MsgTargetKind::Assistant => {
+                if t.message_id.is_some() {
+                    vec![K::FeedbackPositive, K::FeedbackNegative]
+                } else {
+                    vec![]
+                }
+            }
+            MsgTargetKind::User => {
+                let mut v = vec![K::Retry];
+                if t.is_last_user && !t.running {
+                    v.push(K::Branch);
+                }
+                v
+            }
+        }
+    }
+
+    fn handle_message_action_command(&mut self, cmd: crate::input::Command) -> Vec<Cmd> {
+        use crate::input::Command as C;
+        match cmd {
+            C::PickerDown | C::PickerUp => {
+                if self.message_action.confirm_running {
+                    // 二次确认态锁定动作，忽略光标移动。
+                    return vec![];
+                }
+                let n = self.msg_available_actions().len();
+                if n == 0 {
+                    return vec![];
+                }
+                if cmd == C::PickerDown {
+                    self.message_action.menu_cursor =
+                        (self.message_action.menu_cursor + 1).min(n - 1);
+                } else {
+                    self.message_action.menu_cursor =
+                        self.message_action.menu_cursor.saturating_sub(1);
+                }
+                vec![]
+            }
+            C::PickerConfirm => {
+                let Some(action) = self
+                    .msg_available_actions()
+                    .get(self.message_action.menu_cursor)
+                    .copied()
+                else {
+                    return vec![];
+                };
+                let Some(target) = self.msg_action_target.clone() else {
+                    return vec![];
+                };
+                // 二次确认态：Enter = 确认执行之前选中的动作（AC-007-28）。
+                if self.message_action.confirm_running {
+                    if self.message_action.confirm(action) {
+                        return self.execute_message_action(action, &target);
+                    }
+                    return vec![];
+                }
+                // 单飞：running 目标先置二次确认；静态直接执行。
+                if !self.message_action.begin(action, target.running) {
+                    return vec![];
+                }
+                if self.message_action.confirm_running {
+                    self.notice = Some("该轮正在运行——Enter 确认执行 / 其它键取消".into());
+                    return vec![];
+                }
+                self.execute_message_action(action, &target)
+            }
+            C::ClosePicker | C::Quit => {
+                if self.message_action.confirm_running {
+                    self.message_action.fail("cancelled".into());
+                }
+                self.message_action.settle();
+                self.msg_action_target = None;
+                self.mode = Mode::Normal;
+                vec![]
+            }
+            _ => vec![],
+        }
+    }
+
+    fn execute_message_action(
+        &mut self,
+        action: crate::model::MessageActionKind,
+        target: &MessageActionTarget,
+    ) -> Vec<Cmd> {
+        match action {
+            crate::model::MessageActionKind::Branch => {
+                self.message_action.settle();
+                self.msg_action_target = None;
+                self.mode = Mode::Normal;
+                vec![Cmd::ForkAtSeq {
+                    session_id: target.session_id.0.clone(),
+                    at_seq: target.seq,
+                }]
+            }
+            crate::model::MessageActionKind::Retry => {
+                let Some(text) = target.user_text.clone() else {
+                    self.message_action.fail("no-user-text".into());
+                    return vec![];
+                };
+                if text.trim().is_empty() {
+                    self.message_action.fail("empty".into());
+                    return vec![];
+                }
+                self.message_action.settle();
+                self.msg_action_target = None;
+                self.mode = Mode::Normal;
+                // 乐观回显 + 重发 prompt（新 requestId，wire 校正：retry=重发）。
+                let request_id = SessionRequestId(crate::api::types::mint_request_id());
+                let sid = target.session_id.clone();
+                self.sessions
+                    .touch(&sid.0, self.window_cap)
+                    .echo(request_id.clone(), &text);
+                self.notice = Some("已重发该消息（retry）".into());
+                let request = PromptRequest {
+                    request_id,
+                    session_id: sid.clone(),
+                    mode: PromptMode::Queue,
+                    content: vec![PromptContentPart::Text { text }],
+                    client_time_zone: None,
+                };
+                vec![Cmd::SendPrompt {
+                    session_id: sid,
+                    request,
+                }]
+            }
+            kind @ (crate::model::MessageActionKind::FeedbackPositive
+            | crate::model::MessageActionKind::FeedbackNegative) => {
+                let Some(mid) = target.message_id.clone() else {
+                    self.message_action.fail("no-message-id".into());
+                    return vec![];
+                };
+                self.message_action.settle();
+                self.msg_action_target = None;
+                self.mode = Mode::Normal;
+                let rating = if kind == crate::model::MessageActionKind::FeedbackPositive {
+                    "positive"
+                } else {
+                    "negative"
+                };
+                vec![Cmd::FeedbackPut {
+                    session_id: target.session_id.0.clone(),
+                    message_id: mid,
+                    rating: rating.to_string(),
+                    note: None,
+                }]
+            }
+        }
+    }
+
+    // ---- 回执 ----
+    pub fn message_branch_done(&mut self, session_id: String) -> Vec<Cmd> {
+        self.notice = Some(format!("已创建分支会话 {session_id}"));
+        self.list_loaded = false;
+        let mut cmds = vec![Cmd::LoadSessionList { cursor: None }];
+        cmds.extend(self.open_session(SessionId(session_id)));
+        cmds
+    }
+
+    pub fn message_action_failed(
+        &mut self,
+        op: crate::model::MessageActionKind,
+        error: &ClientError,
+    ) {
+        self.message_action.fail(error.code());
+        self.notice = Some(format!("{} 失败: {error}", op.as_str()));
+    }
+
+    pub fn feedback_put_done(&mut self) {
+        self.notice = Some("feedback 已提交".into());
+    }
+
+    pub fn feedback_put_failed(&mut self, error: &ClientError) {
+        self.message_action.fail(error.code());
+        self.notice = Some(format!("feedback 提交失败: {error}"));
     }
 
     // ---------- REQ-007 V0.4 @ 提及（AC-007-23；model/mention + api/references） ----------
@@ -3398,6 +3689,20 @@ impl AppState {
                 self.export_failed(&error);
                 vec![]
             }
+            // ---------- REQ-007 V0.4 消息动作回执 ----------
+            AppEvent::MessageBranchDone { session_id } => self.message_branch_done(session_id),
+            AppEvent::MessageActionFailed { op, error } => {
+                self.message_action_failed(op, &error);
+                vec![]
+            }
+            AppEvent::FeedbackPutDone => {
+                self.feedback_put_done();
+                vec![]
+            }
+            AppEvent::FeedbackPutFailed { error } => {
+                self.feedback_put_failed(&error);
+                vec![]
+            }
         }
     }
 
@@ -4115,6 +4420,10 @@ impl AppState {
         if self.mode == Mode::Jobs {
             return self.handle_jobs_command(cmd);
         }
+        // REQ-007：消息动作菜单（AC-007-27/28）。
+        if self.mode == Mode::MessageAction {
+            return self.handle_message_action_command(cmd);
+        }
         // REQ-007：settings / skills（AC-007-15~19）。
         if self.mode == Mode::Settings {
             return self.handle_settings_command(cmd);
@@ -4205,6 +4514,13 @@ impl AppState {
                 // 仅 goal 模态有意义（已分流）；兜底 no-op。
                 vec![]
             }
+            C::OpenMessageActions => {
+                // Normal 模式焦点消息行打开动作菜单（其它模态 no-op）。
+                if self.mode == Mode::Normal {
+                    return self.open_message_actions();
+                }
+                vec![]
+            }
             C::OpenPicker => {
                 self.mode = Mode::Picker;
                 self.picker.open = true;
@@ -4287,10 +4603,11 @@ impl AppState {
                 Mode::Goal => vec![],
                 // REQ-007：jobs Esc 已在 handle_jobs_command 拦截。
                 Mode::Jobs => vec![],
-                // REQ-007：settings/skills/export Esc 已分流。
+                // REQ-007：settings/skills/export/message-action Esc 已分流。
                 Mode::Settings => vec![],
                 Mode::Skills => vec![],
                 Mode::Export => vec![],
+                Mode::MessageAction => vec![],
             },
             C::PickerDown => {
                 if self.approval.list_open && self.mode == Mode::Approval {
@@ -9868,5 +10185,157 @@ mod tests {
         assert!(cmds.is_empty());
         assert_eq!(s.search.query, "", "无历史不回忆");
         s.close_search();
+    }
+
+    // ---------- REQ-007 V0.4 消息动作（AC-007-27/28） ----------
+
+    fn msg_app_with_blocks(
+        rows: Vec<(u64, &'static str, Option<&'static str>)>,
+    ) -> (AppState, SessionId) {
+        // rows: (seq, "user/message"|"assistant/message", content/message_id)
+        let mut s = AppState::default();
+        let sid = SessionId("sess-ma".into());
+        s.active_session = Some(sid.clone());
+        let w = s.sessions.touch(&sid.0, 50);
+        let mut records = Vec::new();
+        for (seq, typ, payload) in rows {
+            let data = if typ == "user/message" {
+                serde_json::json!({"content": payload.unwrap_or("hi")})
+            } else {
+                serde_json::json!({"id": payload.unwrap_or("m1")})
+            };
+            records.push(SessionHistoryRecord::Event {
+                event: SessionWireEvent {
+                    event_type: typ.into(),
+                    seq: Some(SessionSeq(seq)),
+                    time: None,
+                    request_id: None,
+                    ignorable: None,
+                    source_event_seqs: None,
+                    surface_op: None,
+                    data: Some(data),
+                },
+            });
+        }
+        let _ = w.apply(Incoming::Snapshot {
+            cursor: None,
+            records,
+            has_more: false,
+            projections: None,
+        });
+        (s, sid)
+    }
+
+    #[test]
+    fn message_action_user_open_retry_and_branch_ac007_27() {
+        // 末条 user（seq 3）+ assistant（seq 5）。
+        let (mut s, sid) = msg_app_with_blocks(vec![
+            (1, "user/message", Some("你好")),
+            (5, "assistant/message", Some("m5")),
+            (6, "user/message", Some("再来一次")),
+        ]);
+        // cursor 定位到末条 user（window 内块下标 2）。
+        s.cursor_block = 2;
+        let cmds = s.handle_command(crate::input::Command::OpenMessageActions);
+        assert!(cmds.is_empty());
+        assert_eq!(s.mode, Mode::MessageAction);
+        assert_eq!(s.message_action.menu_seq, Some(6));
+        // 动作 = [retry, branch]（末条静止 user）；默认 cursor 0 = retry。
+        // Enter → retry。
+        let cmds = s.handle_command(crate::input::Command::PickerConfirm);
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, Cmd::SendPrompt { session_id, .. } if session_id == &sid)),
+            "retry 重发 prompt"
+        );
+        assert_eq!(s.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn message_action_branch_at_last_user_ac007_27() {
+        let (mut s, sid) = msg_app_with_blocks(vec![
+            (1, "user/message", Some("你好")),
+            (5, "assistant/message", Some("m5")),
+            (6, "user/message", Some("再来一次")),
+        ]);
+        s.cursor_block = 2;
+        let _ = s.handle_command(crate::input::Command::OpenMessageActions);
+        // 移到 branch（index 1）并 Enter。
+        let _ = s.handle_command(crate::input::Command::PickerDown);
+        let cmds = s.handle_command(crate::input::Command::PickerConfirm);
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, Cmd::ForkAtSeq { session_id, at_seq }
+                if session_id == &sid.0 && *at_seq == 6)),
+            "branch fork atSeq=6"
+        );
+    }
+
+    #[test]
+    fn message_action_assistant_feedback_put_ac007_27() {
+        let (mut s, _sid) = msg_app_with_blocks(vec![
+            (1, "user/message", Some("你好")),
+            (5, "assistant/message", Some("m5")),
+        ]);
+        s.cursor_block = 1; // assistant
+        let _ = s.handle_command(crate::input::Command::OpenMessageActions);
+        assert_eq!(s.message_action.menu_seq, Some(5));
+        // actions = [feedback+, feedback-]; Enter → feedback+。
+        let cmds = s.handle_command(crate::input::Command::PickerConfirm);
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, Cmd::FeedbackPut { message_id, rating, .. }
+                if message_id == "m5" && rating == "positive")),
+            "feedback+ put m5"
+        );
+    }
+
+    #[test]
+    fn message_action_running_turn_requires_double_confirm_ac007_28() {
+        let (mut s, sid) = msg_app_with_blocks(vec![(1, "user/message", Some("你好"))]);
+        s.running_sessions.insert(sid.clone());
+        s.cursor_block = 0;
+        let _ = s.handle_command(crate::input::Command::OpenMessageActions);
+        // running：不可 branch；仅 retry。第一次 Enter → confirm 态不发。
+        let cmds = s.handle_command(crate::input::Command::PickerConfirm);
+        assert!(cmds.is_empty(), "运行中第一次 Enter 不执行");
+        assert!(s.message_action.confirm_running);
+        assert_eq!(s.message_action.menu_seq, Some(1));
+        // 第二次 Enter → 确认执行 retry。
+        let cmds = s.handle_command(crate::input::Command::PickerConfirm);
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, Cmd::SendPrompt { session_id, .. } if session_id == &sid)),
+            "二次确认后执行"
+        );
+        // Esc 取消路径：重新打开 → Esc 清态。
+        let _ = s.handle_command(crate::input::Command::OpenMessageActions);
+        let _ = s.handle_command(crate::input::Command::PickerConfirm); // confirm 态
+        assert!(s.message_action.confirm_running);
+        let _ = s.handle_command(crate::input::Command::ClosePicker);
+        assert_eq!(s.mode, Mode::Normal);
+        assert!(s.message_action.menu_seq.is_none());
+        assert!(s.msg_action_target.is_none());
+    }
+
+    #[test]
+    fn message_action_branch_failure_shows_code_ac007_27() {
+        let mut s = AppState {
+            active_session: Some(SessionId("sess-x".into())),
+            ..Default::default()
+        };
+        let _ = s.handle(AppEvent::MessageActionFailed {
+            op: crate::model::MessageActionKind::Branch,
+            error: ClientError::Remote {
+                code: "session/fork-unavailable".into(),
+                message: "不可用".into(),
+                class: ErrorClass::UserFacing,
+            },
+        });
+        assert!(s.notice.as_deref().unwrap_or("").contains("branch 失败"));
+        assert_eq!(
+            s.message_action.last_error_code.as_deref(),
+            Some("session/fork-unavailable")
+        );
     }
 }

@@ -14,6 +14,7 @@ pub mod jobs;
 pub mod layout;
 pub mod markdown;
 pub mod mention;
+pub mod message_action;
 pub mod model_catalog;
 pub mod monitor;
 pub mod outline;
@@ -126,6 +127,8 @@ pub fn render(frame: &mut Frame<'_>, app: &AppState) {
     command_palette::render(frame, areas.center, app);
     // REQ-007：@ 提及（AC-007-23；命令面板之上）。
     mention::render(frame, frame.area(), app);
+    // REQ-007：消息动作菜单（AC-007-27/28）。
+    message_action::render(frame, frame.area(), app);
     // REQ-007：subagent 目录（FR-007-01；`:` 打开）。
     subagent::render(frame, frame.area(), app);
     // REQ-007：goal 面板（FR-007-02）。

@@ -500,10 +500,11 @@ async fn run_connected(eff: Effective, token: String, client: DshClient) -> Resu
                 Mode::Goal => InputMode::Goal,
                 // REQ-007：jobs 只读面板。
                 Mode::Jobs => InputMode::Jobs,
-                // REQ-007：settings / skills / export。
+                // REQ-007：settings / skills / export / message action。
                 Mode::Settings => InputMode::Settings,
                 Mode::Skills => InputMode::Skills,
                 Mode::Export => InputMode::Export,
+                Mode::MessageAction => InputMode::MessageAction,
             };
             if let Some(command) = decoder.decode(mode, input) {
                 commands.extend(app.handle_command(command));
@@ -1054,6 +1055,52 @@ async fn execute_one(
                     generation,
                     error,
                 })),
+            }
+        }
+        // ---------- REQ-007：消息动作（AC-007-27/28） ----------
+        Cmd::ForkAtSeq { session_id, at_seq } => {
+            let Some(client) = client.as_ref() else {
+                let event = AppEvent::MessageActionFailed {
+                    op: dshtui::model::MessageActionKind::Branch,
+                    error: ClientError::Transport("未连接（dsh web 不可达）".into()),
+                };
+                commands.extend(app.handle(event));
+                return;
+            };
+            let sid = dshtui::api::types::SessionId(session_id.clone());
+            match dshtui::api::session::fork(&client.http, &client.base, &sid, Some(at_seq)).await {
+                Ok(v) => commands.extend(app.handle(AppEvent::MessageBranchDone {
+                    session_id: v.session_id,
+                })),
+                Err(error) => commands.extend(app.handle(AppEvent::MessageActionFailed {
+                    op: dshtui::model::MessageActionKind::Branch,
+                    error,
+                })),
+            }
+        }
+        Cmd::FeedbackPut {
+            session_id,
+            message_id,
+            rating,
+            note,
+        } => {
+            let Some(client) = client.as_ref() else {
+                let event = AppEvent::FeedbackPutFailed {
+                    error: ClientError::Transport("未连接（dsh web 不可达）".into()),
+                };
+                commands.extend(app.handle(event));
+                return;
+            };
+            let req = dshtui::api::types::MessageFeedbackPutRequest {
+                session_id,
+                message_id,
+                rating,
+                note,
+                if_version: None,
+            };
+            match dshtui::api::feedback::put(&client.http, &client.base, &req).await {
+                Ok(_) => commands.extend(app.handle(AppEvent::FeedbackPutDone)),
+                Err(error) => commands.extend(app.handle(AppEvent::FeedbackPutFailed { error })),
             }
         }
         // ---------- REQ-007：会话导出（AC-007-17） ----------

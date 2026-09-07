@@ -52,6 +52,8 @@ pub enum InputMode {
     Skills,
     /// REQ-007 V0.4：会话导出（`:export`；AC-007-17）。
     Export,
+    /// REQ-007 V0.4：消息动作菜单（AC-007-27/28；`m` 打开）。
+    MessageAction,
 }
 
 /// Domain commands emitted by the input layer.
@@ -164,6 +166,8 @@ pub enum Command {
     // ---------- REQ-007 V0.4 subagent（AC-007-07~10） ----------
     /// subagent 目录面板 `x`：请求中断所选子代理（二次确认后执行）。
     SubagentInterrupt,
+    /// REQ-007 AC-007-27：对焦点消息行打开动作菜单（分支/重发/feedback）。
+    OpenMessageActions,
     // ---------- REQ-007 V0.4 goal（AC-007-11/12/14） ----------
     GoalCreate,
     GoalEdit,
@@ -255,6 +259,7 @@ impl KeyDecoder {
             InputMode::Settings => self.settings(key),
             InputMode::Skills => self.skills(key),
             InputMode::Export => self.export(key),
+            InputMode::MessageAction => self.message_action(key),
         }
     }
 
@@ -320,6 +325,8 @@ impl KeyDecoder {
                     'M' => Some(Command::OpenModelCatalog),
                     // REQ-006 命令面板（FR-006-03；Notes/04 §3.1 `:`）。
                     ':' => Some(Command::OpenCommandPalette),
+                    // REQ-007 AC-007-27：`m` 消息动作菜单（焦点消息行）。
+                    'm' => Some(Command::OpenMessageActions),
                     _ => None,
                 }
             }
@@ -672,6 +679,20 @@ impl KeyDecoder {
         }
     }
 
+    /// REQ-007 消息动作菜单键位（AC-007-27/28）：j/k 移动、Enter 执行、
+    /// Esc/q 关闭。
+    fn message_action(&mut self, key: KeyEvent) -> Option<Command> {
+        self.pending_g = false;
+        match key.code {
+            KeyCode::Esc => Some(Command::ClosePicker),
+            KeyCode::Char('q') if key.modifiers.is_empty() => Some(Command::ClosePicker),
+            KeyCode::Char('j') if key.modifiers.is_empty() => Some(Command::PickerDown),
+            KeyCode::Char('k') if key.modifiers.is_empty() => Some(Command::PickerUp),
+            KeyCode::Enter if key.modifiers.is_empty() => Some(Command::PickerConfirm),
+            _ => None,
+        }
+    }
+
     /// REQ-007 export 键位（AC-007-17）：路径编辑子阶段（字符/Backspace/
     /// Enter 开始下载/Esc 取消）；下载态 Esc 关闭。
     fn export(&mut self, key: KeyEvent) -> Option<Command> {
@@ -841,6 +862,7 @@ fn default_key_tables() -> std::collections::BTreeMap<InputMode, Vec<(&'static s
             ("toggle_trajectory", '2', ToggleTrajectory),
             ("open_model_catalog", 'M', OpenModelCatalog),
             ("open_command_palette", ':', OpenCommandPalette),
+            ("open_message_actions", 'm', OpenMessageActions),
         ],
     );
     m.insert(
@@ -1084,6 +1106,7 @@ fn mode_name_of(mode: InputMode) -> &'static str {
         InputMode::Settings => "settings",
         InputMode::Skills => "skills",
         InputMode::Export => "export",
+        InputMode::MessageAction => "message_action",
     }
 }
 
