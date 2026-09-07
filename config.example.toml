@@ -8,6 +8,7 @@ token = ""                       # 可选；更推荐环境变量 DSH_TOKEN 或�
 [ui]
 theme = "dark"                   # dark / light（V0.1 仅 dark 生效）
 sidebar_width_cells = 32         # 左栏列数（终端窄时自动收窄/隐藏）
+details_width_cells = 45         # 右栏详情列宽 30–60（V0.3 轨迹详情；默认 45）
 show_turn_rail = false           # 右侧 turn 导航（V0.2）
 tick_ms = 33                     # 帧循环节拍
 

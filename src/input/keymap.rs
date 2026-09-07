@@ -21,6 +21,12 @@ pub enum InputMode {
     Approval,
     /// REQ-004 V0.2：IMAGEVIEW 模式（仅 Kitty 渲染态出现，D-14）。
     ImageView,
+    /// REQ-005 V0.3：Trajectory 视图（D-25：独立模式；详情为内嵌焦点子层，
+    /// 不新增 InputMode——`q`/`y`/`j`/`k` 由 AppState 按 focus 分派）。
+    Trajectory,
+    /// REQ-005：轨迹内过滤输入态（`/` 打开后任意字符进 query；仍在
+    /// Trajectory 模式，模态上不离开轨迹 tab）。
+    TrajectoryFilter,
 }
 
 /// Domain commands emitted by the input layer.
@@ -92,6 +98,15 @@ pub enum Command {
     ImageViewOpenExternal,
     /// `q`：关闭 ImageView 回 transcript（NORMAL）。
     ImageViewClose,
+    // ---------- REQ-005 Trajectory 级键位（D-25/Notes/04 §3.6） ----------
+    /// `gt`（Normal→Trajectory，Trajectory→Chat）：顶部 Tab 切换。
+    ToggleTrajectory,
+    /// `gT` / `1`：切回 Chat Tab。
+    GotoChat,
+    /// `z` / `za`：折叠/展开 turn、assistant 组。
+    ToggleFold,
+    /// `Enter` / `d`：打开选中事件详情（右栏子层）。
+    OpenDetail,
 }
 
 /// Stateful decoder for multi-key Normal-mode commands such as `gg`.
@@ -128,6 +143,18 @@ impl KeyDecoder {
             InputMode::Visual => self.visual(key),
             InputMode::Approval => self.approval(key),
             InputMode::ImageView => self.image_view(key),
+            InputMode::Trajectory => self.trajectory(key),
+            InputMode::TrajectoryFilter => self.trajectory_filter(key),
+        }
+    }
+
+    /// `g` 前缀在按下 g 时置位；第二键 t/T/gg 触发 Tab/顶部命令，其它键清
+    /// 前缀后按普通单键解码（g 后 j → MoveDown，回归语义）。
+    fn g_prefix_key(&mut self, c: char) -> Option<Command> {
+        match c {
+            't' => Some(Command::ToggleTrajectory),
+            'T' => Some(Command::GotoChat),
+            _ => None,
         }
     }
 
@@ -143,33 +170,47 @@ impl KeyDecoder {
                     None
                 }
             }
+            KeyCode::Char(c) if !ctrl => {
+                if self.pending_g {
+                    if let Some(cmd) = self.g_prefix_key(c) {
+                        return Some(cmd);
+                    }
+                    self.pending_g = false; // g+其它键：清前缀，按单键解码
+                }
+                match c {
+                    'j' => Some(Command::MoveDown),
+                    'k' => Some(Command::MoveUp),
+                    'G' => Some(Command::GotoBottom),
+                    'f' => Some(Command::OpenPicker),
+                    'i' => Some(Command::InsertMode),
+                    '?' => Some(Command::OpenHelp),
+                    'q' => Some(Command::Quit),
+                    'r' => Some(Command::RetryProbe),
+                    's' => Some(Command::StopRunning),
+                    'h' => Some(Command::CollapseProject),
+                    'l' => Some(Command::ExpandProject),
+                    'o' => Some(Command::OpenSelected),
+                    // REQ-003 键位（REQ §3 输入契约，D-19 `O` 独立键）。
+                    '/' => Some(Command::StartSearch),
+                    'v' => Some(Command::VisualStart { line: false }),
+                    'V' => Some(Command::VisualStart { line: true }),
+                    'y' => Some(Command::YankContext),
+                    'O' => Some(Command::OpenOutline),
+                    ']' => Some(Command::NextTurn),
+                    '[' => Some(Command::PrevTurn),
+                    // REQ-005 Tab 数字键（`1` Chat / `2` Trajectory）。
+                    '1' => Some(Command::GotoChat),
+                    '2' => Some(Command::ToggleTrajectory),
+                    _ => None,
+                }
+            }
             KeyCode::Char(c) => {
                 self.pending_g = false;
                 match (c, ctrl) {
-                    ('j', false) => Some(Command::MoveDown),
-                    ('k', false) => Some(Command::MoveUp),
                     ('d', true) => Some(Command::HalfPageDown),
                     ('u', true) => Some(Command::HalfPageUp),
-                    ('G', false) => Some(Command::GotoBottom),
-                    ('f', false) => Some(Command::OpenPicker),
-                    ('i', false) => Some(Command::InsertMode),
-                    ('?', false) => Some(Command::OpenHelp),
-                    ('q', false) => Some(Command::Quit),
-                    ('r', false) => Some(Command::RetryProbe),
                     ('c', true) => Some(Command::Quit),
                     ('w', true) => Some(Command::CycleFocus),
-                    ('s', false) => Some(Command::StopRunning),
-                    ('h', false) => Some(Command::CollapseProject),
-                    ('l', false) => Some(Command::ExpandProject),
-                    ('o', false) => Some(Command::OpenSelected),
-                    // REQ-003 键位（REQ §3 输入契约，D-19 `O` 独立键）。
-                    ('/', false) => Some(Command::StartSearch),
-                    ('v', false) => Some(Command::VisualStart { line: false }),
-                    ('V', false) => Some(Command::VisualStart { line: true }),
-                    ('y', false) => Some(Command::YankContext),
-                    ('O', false) => Some(Command::OpenOutline),
-                    (']', false) => Some(Command::NextTurn),
-                    ('[', false) => Some(Command::PrevTurn),
                     _ => None,
                 }
             }
@@ -185,6 +226,86 @@ impl KeyDecoder {
                 self.pending_g = false;
                 None
             }
+        }
+    }
+
+    /// REQ-005 Trajectory 键位（D-25/Notes/04 §3.6）：j/k 事件行上下、
+    /// z/za 折叠、Enter/d 详情、/ 轨迹内过滤、y 复制、q 退出（详情子层语义
+    /// 在 AppState 按 focus 分派）、gt/gT/数字切 Tab、Ctrl+w 焦点循环。
+    fn trajectory(&mut self, key: KeyEvent) -> Option<Command> {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Char('g') if !ctrl => {
+                if self.pending_g {
+                    self.pending_g = false;
+                    Some(Command::GotoTop)
+                } else {
+                    self.pending_g = true;
+                    None
+                }
+            }
+            KeyCode::Char(c) if !ctrl => {
+                if self.pending_g {
+                    if let Some(cmd) = self.g_prefix_key(c) {
+                        return Some(cmd);
+                    }
+                    self.pending_g = false;
+                }
+                match c {
+                    'j' => Some(Command::MoveDown),
+                    'k' => Some(Command::MoveUp),
+                    'z' => Some(Command::ToggleFold),
+                    'd' => Some(Command::OpenDetail),
+                    '/' => Some(Command::StartSearch),
+                    'y' => Some(Command::YankContext),
+                    'q' => Some(Command::Quit),
+                    '1' => Some(Command::GotoChat),
+                    '2' => Some(Command::ToggleTrajectory),
+                    'G' => Some(Command::GotoBottom),
+                    _ => None,
+                }
+            }
+            KeyCode::Char('c') if ctrl => {
+                // S8 修复：非 g 前缀键路径清 pending_g（详情打开后按 t 不再
+                // 误触 gt 切回 Chat；与 normal 模式 Enter/Esc 清理同构）。
+                self.pending_g = false;
+                Some(Command::Quit)
+            }
+            KeyCode::Char('w') if ctrl => {
+                self.pending_g = false;
+                Some(Command::CycleFocus)
+            }
+            KeyCode::Enter if !ctrl => {
+                self.pending_g = false;
+                Some(Command::OpenDetail)
+            }
+            KeyCode::Esc => {
+                self.pending_g = false;
+                Some(Command::ClosePicker)
+            }
+            _ => {
+                self.pending_g = false;
+                None
+            }
+        }
+    }
+
+    /// 轨迹内过滤输入态键位：普通字符进 query，Backspace 删除，Enter 跳转，
+    /// Esc/q 退出，j/k 命中选中移动（Step 4，AC-005-05/13）。
+    /// 注意匹配臂顺序：特殊键必须排在兜底 `Char(c)` 之前，否则被当查询
+    /// 字符吞掉（code-review S1 修复，与 picker 模式同构）。
+    fn trajectory_filter(&mut self, key: KeyEvent) -> Option<Command> {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Char('c') if ctrl => Some(Command::Quit),
+            KeyCode::Enter if !ctrl => Some(Command::PickerConfirm),
+            KeyCode::Esc => Some(Command::ClosePicker),
+            KeyCode::Char('q') if !ctrl => Some(Command::ClosePicker),
+            KeyCode::Char('j') if !ctrl => Some(Command::MoveDown),
+            KeyCode::Char('k') if !ctrl => Some(Command::MoveUp),
+            KeyCode::Backspace => Some(Command::PickerBackspace),
+            KeyCode::Char(c) if !ctrl => Some(Command::PickerInput(c.to_string())),
+            _ => None,
         }
     }
 

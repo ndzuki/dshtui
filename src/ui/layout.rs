@@ -23,11 +23,18 @@ pub struct LayoutAreas {
     pub status: Rect,
 }
 
+/// Details 列宽度默认/边界（Notes/04 §1：45 列默认，可调 30–60）。
+pub const DEFAULT_DETAILS_WIDTH: u16 = 45;
+pub const DETAILS_WIDTH_MIN: u16 = 30;
+pub const DETAILS_WIDTH_MAX: u16 = 60;
+
 /// Split the screen into sidebar, center, optional details, and status areas.
 ///
 /// Details are opt-in and are suppressed when the terminal cannot leave a
 /// useful center column after reserving the sidebar and details widths.
-pub fn split(area: Rect, details_visible: bool) -> LayoutAreas {
+/// `details_width` is clamped to [30, 60] (Notes/04 §1); widths < 120 columns
+/// automatically drop the details column.
+pub fn split(area: Rect, details_visible: bool, details_width: u16) -> LayoutAreas {
     // 状态区两行：第一行字段，第二行快捷键提示（FR-001-05）。
     let vertical = Layout::default()
         .direction(Direction::Vertical)
@@ -36,7 +43,7 @@ pub fn split(area: Rect, details_visible: bool) -> LayoutAreas {
     let body = vertical[0];
     let status = vertical[1];
     let sidebar = sidebar_width(body.width);
-    let details_width = 30u16;
+    let details_width = details_width.clamp(DETAILS_WIDTH_MIN, DETAILS_WIDTH_MAX);
     let can_show_details = details_visible
         && body.width >= 120
         && body.width >= sidebar.saturating_add(details_width).saturating_add(1);
@@ -112,14 +119,36 @@ mod tests {
     #[test]
     fn details_are_hidden_by_default_and_at_narrow_widths() {
         let area = Rect::new(0, 0, 160, 30);
-        assert!(split(area, false).details.is_none());
-        assert!(split(Rect::new(0, 0, 80, 20), true).details.is_none());
-        assert!(split(area, true).details.is_some());
+        assert!(split(area, false, DEFAULT_DETAILS_WIDTH).details.is_none());
+        assert!(split(Rect::new(0, 0, 80, 20), true, DEFAULT_DETAILS_WIDTH)
+            .details
+            .is_none());
+        assert!(split(area, true, DEFAULT_DETAILS_WIDTH).details.is_some());
+    }
+
+    #[test]
+    fn details_width_is_parametrized_and_clamped() {
+        // 默认 45 列可调；宽度 clamp 30–60（Notes/04 §1）。
+        let area = Rect::new(0, 0, 160, 30);
+        let details = split(area, true, DEFAULT_DETAILS_WIDTH)
+            .details
+            .expect("details 显示");
+        assert_eq!(details.width, DEFAULT_DETAILS_WIDTH);
+        let too_small = split(area, true, 10).details.expect("clamp 下限 30");
+        assert_eq!(too_small.width, 30);
+        let too_large = split(area, true, 200).details.expect("clamp 上限 60");
+        assert_eq!(too_large.width, 60);
+        let custom = split(area, true, 36).details.expect("custom 36");
+        assert_eq!(custom.width, 36);
+        // <120 列自动收起。
+        assert!(split(Rect::new(0, 0, 110, 24), true, DEFAULT_DETAILS_WIDTH)
+            .details
+            .is_none());
     }
 
     #[test]
     fn status_area_reserves_two_rows_for_hint_line() {
-        let areas = split(Rect::new(0, 0, 140, 20), false);
+        let areas = split(Rect::new(0, 0, 140, 20), false, DEFAULT_DETAILS_WIDTH);
         assert_eq!(areas.status.height, 2);
         assert_eq!(areas.status.y + areas.status.height, 20);
     }

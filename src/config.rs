@@ -53,6 +53,9 @@ pub struct ServerConfig {
 pub struct UiConfig {
     pub theme: String,
     pub sidebar_width_cells: u16,
+    /// 右栏详情列宽（REQ-005 V0.3，Notes/04 §1：45 默认，30–60 可调；
+    /// clamp 在 `validate` 执行）。
+    pub details_width_cells: u16,
     pub show_turn_rail: bool,
     pub tick_ms: u64,
 }
@@ -85,6 +88,11 @@ const DEFAULT_WINDOW_MESSAGES: usize = 200;
 const DEFAULT_PAGE_SIZE: usize = 50;
 const DEFAULT_TICK_MS: u64 = 33;
 const DEFAULT_SIDEBAR_WIDTH: u16 = 32;
+/// Details 列宽默认 45（Notes/04 §1；与 ui/layout DEFAULT_DETAILS_WIDTH 同值）。
+const DEFAULT_DETAILS_WIDTH_CELLS: u16 = 45;
+/// Details 列宽 clamp 边界（30–60，Notes/04 §1）。
+const DETAILS_WIDTH_CELLS_MIN: u16 = 30;
+const DETAILS_WIDTH_CELLS_MAX: u16 = 60;
 /// 图片缓存预算默认 32MB（REQ-004 §3；pub 供 AppState 默认缓存构造）。
 pub const DEFAULT_CACHE_BYTES: u64 = 32 * 1024 * 1024;
 const DEFAULT_RSS_TARGET_MB: u64 = 80;
@@ -103,6 +111,7 @@ impl Default for UiConfig {
         Self {
             theme: "dark".to_string(),
             sidebar_width_cells: DEFAULT_SIDEBAR_WIDTH,
+            details_width_cells: DEFAULT_DETAILS_WIDTH_CELLS,
             show_turn_rail: false,
             tick_ms: DEFAULT_TICK_MS,
         }
@@ -177,7 +186,7 @@ impl Config {
         })
     }
 
-    fn validate(self) -> Result<Self, ConfigError> {
+    fn validate(mut self) -> Result<Self, ConfigError> {
         if self.perf.window_messages == 0 {
             return Err(ConfigError::InvalidValue {
                 path: PathBuf::new(),
@@ -190,6 +199,12 @@ impl Config {
                 message: "perf.page_size 必须 > 0".to_string(),
             });
         }
+        // REQ-005 §10：详情列宽 clamp 30–60（越界值收敛而非报错，配置无
+        // 破坏性迁移；ui/layout split 亦 clamp 兜底）。
+        self.ui.details_width_cells = self
+            .ui
+            .details_width_cells
+            .clamp(DETAILS_WIDTH_CELLS_MIN, DETAILS_WIDTH_CELLS_MAX);
         Ok(self)
     }
 }
@@ -613,5 +628,37 @@ window_messages = 100
                 }
             }
         }
+    }
+
+    // ---------- REQ-005 Step 6：details_width_cells 配置（Notes/04 §1） ----------
+
+    #[test]
+    fn details_width_default_is_45() {
+        let cfg = Config::default();
+        assert_eq!(cfg.ui.details_width_cells, 45, "默认 45 列（Notes/04 §1）");
+        let (_dir, path) = tmp_config("[ui]\nshow_turn_rail = true\n");
+        let cfg = Config::load(Some(&path)).unwrap();
+        assert_eq!(cfg.ui.details_width_cells, 45, "老配置缺字段默认兜底");
+    }
+
+    #[test]
+    fn details_width_is_clamped_to_30_60() {
+        let (_dir, path) = tmp_config("[ui]\ndetails_width_cells = 10\n");
+        let cfg = Config::load(Some(&path)).unwrap();
+        assert_eq!(cfg.ui.details_width_cells, 30, "越界小值 clamp 到 30");
+        let (_dir, path) = tmp_config("[ui]\ndetails_width_cells = 200\n");
+        let cfg = Config::load(Some(&path)).unwrap();
+        assert_eq!(cfg.ui.details_width_cells, 60, "越界大值 clamp 到 60");
+        let (_dir, path) = tmp_config("[ui]\ndetails_width_cells = 36\n");
+        let cfg = Config::load(Some(&path)).unwrap();
+        assert_eq!(cfg.ui.details_width_cells, 36, "合法值原样保留");
+    }
+
+    #[test]
+    fn effective_carries_details_width_for_injection() {
+        let (_dir, path) = tmp_config("[ui]\ndetails_width_cells = 50\n");
+        let cfg = Config::load(Some(&path)).unwrap();
+        let eff = cfg.resolve(&Cli::default()).unwrap();
+        assert_eq!(eff.ui.details_width_cells, 50, "Effective 注入链携带");
     }
 }

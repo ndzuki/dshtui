@@ -3,6 +3,7 @@
 pub mod approval;
 pub mod chat;
 pub mod composer;
+pub mod detail;
 pub mod image;
 pub mod image_view;
 pub mod layout;
@@ -12,6 +13,8 @@ pub mod picker;
 pub mod search;
 pub mod sidebar;
 pub mod status;
+pub mod tabs;
+pub mod trajectory;
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -21,7 +24,9 @@ use ratatui::Frame;
 
 use crate::app::AppState;
 
-pub use layout::{sidebar_width, split, LayoutAreas};
+pub use layout::{
+    sidebar_width, split, LayoutAreas, DEFAULT_DETAILS_WIDTH, DETAILS_WIDTH_MAX, DETAILS_WIDTH_MIN,
+};
 
 /// 毫秒时间戳 → HH:MM（UTC 换算，纯展示用途；不引入 chrono 等新依赖）。
 pub(crate) fn format_hhmm(ms: i64) -> String {
@@ -33,34 +38,57 @@ pub(crate) fn format_hhmm(ms: i64) -> String {
 
 /// Render one complete frame from read-only application state.
 pub fn render(frame: &mut Frame<'_>, app: &AppState) {
-    let areas = split(frame.area(), app.focus == crate::app::Focus::Details);
+    // REQ-005：详情宽度参数化（Step 6 从 config 注入 AppState；默认 45）。
+    let details_width = app.details_width_cells;
+    let areas = split(
+        frame.area(),
+        app.focus == crate::app::Focus::Details,
+        details_width,
+    );
     sidebar::render(frame, areas.sidebar, app);
+
+    // 中心区顶部 1 行：Tab 条（Chat / Trajectory，Notes/04 §1 header）。
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(1)])
+        .split(areas.center);
+    let tabs_area = vertical[0];
+    let center_body = vertical[1];
+    tabs::render(frame, tabs_area, app);
 
     if app.conn == crate::app::ConnState::StartupFailed {
         let body = Paragraph::new(app.guidance_text())
             .block(Block::default().borders(Borders::ALL).title(" Startup "));
-        frame.render_widget(body, areas.center);
+        frame.render_widget(body, center_body);
     } else if app.is_reconnecting() && app.active_window().is_none() {
         let body = Paragraph::new("Connection lost. Reconnecting…").block(
             Block::default()
                 .borders(Borders::ALL)
                 .title(" Reconnecting "),
         );
-        frame.render_widget(body, areas.center);
+        frame.render_widget(body, center_body);
+    } else if app.mode == crate::app::Mode::Trajectory {
+        trajectory::render(frame, center_body, app);
     } else if app.mode == crate::app::Mode::ImageView {
         // REQ-004：IMAGEVIEW 模式中心区渲染 ImageView（仅 Kitty 出现）。
         image_view::render(
             frame,
-            areas.center,
+            center_body,
             &app.image_view,
             app.image_frame.as_ref(),
         );
     } else {
-        chat::render(frame, areas.center, app);
+        chat::render(frame, center_body, app);
     }
 
     if let Some(details) = areas.details {
-        render_details(frame, details, app);
+        // REQ-005：Trajectory 详情子层渲染右栏详情；否则保持既有 Details
+        // 会话概览。
+        if app.mode == crate::app::Mode::Trajectory && app.traj.detail_open {
+            detail::render(frame, details, app);
+        } else {
+            render_details(frame, details, app);
+        }
     }
     status::render(frame, areas.status, app);
     // composer overlay 覆盖 body 底部、状态条上方（仅 INSERT 可见，REQ-002）。
@@ -199,7 +227,7 @@ mod tests {
             let backend = TestBackend::new(width, 20);
             let mut terminal = Terminal::new(backend).unwrap();
             terminal.draw(|frame| render(frame, &app)).unwrap();
-            let areas = split(Rect::new(0, 0, width, 20), false);
+            let areas = split(Rect::new(0, 0, width, 20), false, DEFAULT_DETAILS_WIDTH);
             assert_eq!(areas.sidebar.width, expected_sidebar);
             assert!(areas.details.is_none());
         }

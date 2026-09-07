@@ -149,6 +149,33 @@ impl ProjectionSnapshot {
             next: self.get_str(&["modelSelection", "next"]),
         }
     }
+
+    /// contextBreakdown 投影明细（system/tools/message tokens，官方 shape
+    /// `[未验证]` 容忍——值可为数字或 `{tokens}` 对象）。只读不自算
+    /// （ADR-008），缺失/未知形状返回空。
+    pub fn context_breakdown(&self) -> Vec<(&'static str, u64)> {
+        let Some(breakdown) = self.raw.get("contextBreakdown") else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for key in ["system", "tools", "message"] {
+            let Some(v) = breakdown.get(key) else {
+                continue;
+            };
+            let tokens = match v {
+                Value::Number(_) => v.as_u64(),
+                Value::Object(map) => map
+                    .get("tokens")
+                    .or_else(|| map.get("token"))
+                    .and_then(Value::as_u64),
+                _ => None,
+            };
+            if let Some(n) = tokens {
+                out.push((key, n));
+            }
+        }
+        out
+    }
 }
 
 #[cfg(test)]
