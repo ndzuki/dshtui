@@ -29,39 +29,62 @@ use std::process::{Command, Stdio};
 /// Prototype of the production editor-run helper.
 fn run_editor_blocking(tmp: &std::path::Path, editor: &str) -> Result<(), String> {
     // 前台子进程继承 stdio：编辑器可交互（raw mode 已由调用方释放）。
-    let status = Command::new(editor)
-        .arg(tmp)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .map_err(|e| format!("无法启动编辑器 {editor}: {e}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "编辑器 {editor} 异常退出（{status}），已安全返回 composer"
-        ))
+    // ETXTBSY（os error 26）规避：并行跑全套件时对刚原子 rename 的脚本 exec
+    // 偶发 "Text file busy"——有界重试（真实 $EDITOR 为用户安装，无此问题）。
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match Command::new(editor)
+            .arg(tmp)
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+        {
+            Ok(status) => {
+                if status.success() {
+                    return Ok(());
+                }
+                return Err(format!(
+                    "编辑器 {editor} 异常退出（{status}），已安全返回 composer"
+                ));
+            }
+            Err(e) => {
+                let text = e.to_string();
+                if attempt < 5 && (text.contains("Text file busy") || text.contains("os error 26"))
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(20 * attempt));
+                    continue;
+                }
+                return Err(format!("无法启动编辑器 {editor}: {e}"));
+            }
+        }
     }
 }
 
 /// 写一个假 editor 脚本：把 $1 文件替换为给定内容，退出码由参数控制。
 fn write_fake_editor(dir: &std::path::Path, name: &str, exit_code: i32) -> std::path::PathBuf {
-    let script = dir.join(name);
-    let mut f = std::fs::File::create(&script).unwrap();
+    // ETXTBSY 规避：写 `.tmp` → sync_all → 关闭 → 原子 rename 成最终名，
+    // exec 路径不再有同进程写打开的 inode（并行跑同进程多线程时实测
+    // "Text file busy (os error 26)"）。
+    let tmp = dir.join(format!("{name}.tmp"));
+    let mut f = std::fs::File::create(&tmp).unwrap();
     writeln!(
         f,
         "#!/bin/bash\nprintf 'EDITED-BODY' > \"$1\"\nexit {exit_code}\n"
     )
     .unwrap();
+    f.sync_all().unwrap();
     drop(f);
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut perm = std::fs::metadata(&script).unwrap().permissions();
+        let mut perm = std::fs::metadata(&tmp).unwrap().permissions();
         perm.set_mode(0o755);
-        std::fs::set_permissions(&script, perm).unwrap();
+        std::fs::set_permissions(&tmp, perm).unwrap();
     }
+    let script = dir.join(name);
+    std::fs::rename(&tmp, &script).unwrap();
     script
 }
 
