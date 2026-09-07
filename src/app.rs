@@ -6984,4 +6984,52 @@ mod tests {
             "fork 成功打开新会话"
         );
     }
+
+    #[test]
+    fn reconnect_approval_replay_dedup_and_op_retry_recovers_ac006_18() {
+        // AC-006-18：断线重连对账——重放审批/操作不产生重复副作用。
+        let mut s = AppState::default();
+        // 审批 granted 后事件重放（断线期间 pending，恢复后同事件重到）→
+        // 队列 granted 去重集拒绝（AC-006-15/18：不重复授权）。
+        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        let ev = ApprovalEvent {
+            client_id: "c-1".into(),
+            event_id: "e-1".into(),
+            raw: serde_json::json!({"type": "approval/request", "reason": "deploy"}),
+        };
+        s.handle(AppEvent::ApprovalRequest { event: ev.clone() });
+        assert_eq!(s.approval.event.as_ref().unwrap().event_id, "e-1");
+        // 决策已发（ApprovalReplied settle granted）。
+        s.handle(AppEvent::ApprovalReplied {
+            outcome: ApprovalOutcome::AllowedOnce,
+        });
+        assert!(s.approval.queue.summary().pending == 0);
+        // 断线重连后同事件重放 → 忽略（granted 去重），不再次授权。
+        let cmds = s.handle(AppEvent::ApprovalRequest { event: ev });
+        assert!(cmds.is_empty(), "重放审批被去重, cmds={cmds:?}");
+        assert!(s.approval.event.is_none(), "granted 事件不再进入展示槽");
+
+        // workspace 写操作断线失败（Transport）→ 本地不漂移、在途清除；
+        // 恢复后重试成功（失败后修正输入重跑不污染）。
+        s.command_palette.op_inflight = Some((String::from("req-r1"), "rename session"));
+        let cmds = s.handle(AppEvent::WorkspaceOpFailed {
+            request_id: "req-r1".into(),
+            op_name: "rename session".into(),
+            error: ClientError::Transport("连接断开".into()),
+        });
+        assert!(cmds.is_empty());
+        assert!(
+            s.command_palette.op_inflight.is_none(),
+            "失败清在途允许重试"
+        );
+        // 恢复路径：重试成功（requestId 新 id apply）。
+        s.command_palette.op_inflight = Some((String::from("req-r2"), "rename session"));
+        let cmds = s.handle(AppEvent::WorkspaceOpDone {
+            request_id: "req-r2".into(),
+            outcome: OpOutcome::Ack,
+        });
+        assert!(cmds
+            .iter()
+            .any(|c| matches!(c, Cmd::LoadSessionList { .. })));
+    }
 }

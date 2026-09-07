@@ -11,7 +11,7 @@ use crate::model::ProjectionSnapshot;
 use crate::ui::layout::{color_depth, ColorDepth};
 
 /// 快捷键提示行（FR-001-05，README 键位口径；[/] 搜索为 REQ-002 预留但仍展示）。
-const HINT_LINE: &str = "[i]输入 [/]搜索 [f]切换 [gt]轨迹 [?]帮助 [q]退出";
+const HINT_LINE: &str = "[i]输入 [/]搜索 [f]切换 [gt]轨迹 [M]模型 [:]命令 [gv]视图 [?]帮助 [q]退出";
 /// IMAGEVIEW 模式提示行（REQ-004 D-14/05 §10：`o` 系统查看器 `y` 复制路径
 /// `q` 关闭）。
 const IMAGE_HINT_LINE: &str = "[o]系统查看器 [y]复制路径 [q]关闭";
@@ -557,15 +557,18 @@ mod tests {
     fn shortcut_hint_line_shown_when_wide_enough() {
         let mut app = AppState::default();
         app.conn = ConnState::Ready;
-        let backend = TestBackend::new(60, 2);
+        let backend = TestBackend::new(130, 2);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| render(frame, Rect::new(0, 0, 60, 2), &app))
+            .draw(|frame| render(frame, Rect::new(0, 0, 130, 2), &app))
             .unwrap();
         let rendered = rendered_text(&terminal);
         assert!(rendered.contains("[i]输入"), "rendered={rendered}");
         assert!(rendered.contains("[/]搜索"), "rendered={rendered}");
         assert!(rendered.contains("[f]切换"), "rendered={rendered}");
+        assert!(rendered.contains("[M]模型"), "rendered={rendered}");
+        assert!(rendered.contains("[:]命令"), "rendered={rendered}");
+        assert!(rendered.contains("[gv]视图"), "rendered={rendered}");
         assert!(rendered.contains("[?]帮助"), "rendered={rendered}");
         assert!(rendered.contains("[q]退出"), "rendered={rendered}");
     }

@@ -209,4 +209,53 @@ mod tests {
             default_effort: None,
         };
     }
+
+    #[test]
+    fn local_filter_1000_models_is_instant_ac006_01() {
+        // AC-006-01 即时性：本地 nucleo 过滤在千级目录下 <30ms（对齐
+        // REQ-C03 / picker 1042 条口径）。
+        let mut idx = CatalogIndex::new();
+        let mut groups = Vec::new();
+        for p in 0..10 {
+            let models = (0..100)
+                .map(|m| crate::api::types::ModelCatalogModel {
+                    id: format!("model-{p}-{m}"),
+                    name: format!("Model {p} {m} deploy"),
+                    description: None,
+                    reasoning: None,
+                })
+                .collect();
+            groups.push(crate::api::types::ModelProviderGroup {
+                id: format!("prov-{p}"),
+                name: format!("Provider {p}"),
+                models,
+            });
+        }
+        let catalog = crate::api::types::ModelCatalog {
+            default: None,
+            routable_providers: vec![],
+            groups,
+            failures: vec![],
+        };
+        idx.rebuild(&catalog);
+        assert_eq!(idx.len(), 1000);
+        let start = std::time::Instant::now();
+        let hits = idx.query("deploy");
+        let elapsed = start.elapsed();
+        assert_eq!(hits.len(), 1000, "所有模型名含 deploy");
+        assert!(
+            hits[0].model_id.contains("model-0-0"),
+            "按 provider/model 序返回"
+        );
+        // 单模型命中（model_id 前缀候选，fuzzy 首项最高分在 5-7x 组）。
+        let one = idx.query("model-5-7");
+        assert!(!one.is_empty());
+        assert!(one[0].model_id.starts_with("model-5-7"));
+        assert!(
+            elapsed.as_millis() < 30,
+            "本地目录过滤过慢: {} ms",
+            elapsed.as_millis()
+        );
+        eprintln!("catalog_filter_1000: {} ms", elapsed.as_millis());
+    }
 }
