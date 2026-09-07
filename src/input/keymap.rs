@@ -40,6 +40,8 @@ pub enum InputMode {
     Monitor,
     /// REQ-007 V0.4：@ 提及候选（composer INSERT 内 `@` 触发；AC-007-23）。
     Mention,
+    /// REQ-007 V0.4：subagent 目录面板（`:subagents`；AC-007-07~10）。
+    Subagent,
 }
 
 /// Domain commands emitted by the input layer.
@@ -149,6 +151,9 @@ pub enum Command {
     OpenCommandPalette,
     /// INSERT 中 `Tab`：呼出命令面板并预填当前 `/` 斜杠命令词（补全）。
     ComposerTabComplete,
+    // ---------- REQ-007 V0.4 subagent（AC-007-07~10） ----------
+    /// subagent 目录面板 `x`：请求中断所选子代理（二次确认后执行）。
+    SubagentInterrupt,
 }
 
 /// Stateful decoder for multi-key Normal-mode commands such as `gg`.
@@ -227,6 +232,7 @@ impl KeyDecoder {
             InputMode::CommandPalette => self.command_palette(key),
             InputMode::Monitor => self.monitor(key),
             InputMode::Mention => self.mention(key),
+            InputMode::Subagent => self.subagent(key),
         }
     }
 
@@ -611,6 +617,21 @@ impl KeyDecoder {
         }
     }
 
+    /// REQ-007 subagent 目录键位（AC-007-07~10）：j/k 移动、Enter 展开/折叠
+    /// （has_children 拉取子目录）、x 中断（二次确认在 reducer）、Esc/q 关闭。
+    fn subagent(&mut self, key: KeyEvent) -> Option<Command> {
+        self.pending_g = false;
+        match key.code {
+            KeyCode::Esc => Some(Command::ClosePicker),
+            KeyCode::Char('q') if key.modifiers.is_empty() => Some(Command::ClosePicker),
+            KeyCode::Enter if key.modifiers.is_empty() => Some(Command::PickerConfirm),
+            KeyCode::Char('j') if key.modifiers.is_empty() => Some(Command::PickerDown),
+            KeyCode::Char('k') if key.modifiers.is_empty() => Some(Command::PickerUp),
+            KeyCode::Char('x') if key.modifiers.is_empty() => Some(Command::SubagentInterrupt),
+            _ => None,
+        }
+    }
+
     /// REQ-009 MONITOR 键位（FR-009-04，vim 风格）：`j/k` 焦点、`gg/G` 首尾、
     /// `Enter` 详情、`c` 问答、`f` 加油、`l` 定位、`s` KB 统计、`/` 过滤、
     /// `q` 退出、`?` 帮助。Chat/Filter 输入态复用 Insert 语义（Esc/Enter/
@@ -951,6 +972,7 @@ fn mode_name_of(mode: InputMode) -> &'static str {
         | InputMode::ModelCatalog
         | InputMode::CommandPalette
         | InputMode::Mention => "input(不可覆盖)",
+        InputMode::Subagent => "subagent",
     }
 }
 

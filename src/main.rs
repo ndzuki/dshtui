@@ -489,6 +489,8 @@ async fn run_connected(eff: Effective, token: String, client: DshClient) -> Resu
                 Mode::CommandPalette => InputMode::CommandPalette,
                 // REQ-007：@ 提及（AC-007-23）。
                 Mode::Mention => InputMode::Mention,
+                // REQ-007：subagent 目录（FR-007-01）。
+                Mode::Subagent => InputMode::Subagent,
             };
             if let Some(command) = decoder.decode(mode, input) {
                 commands.extend(app.handle_command(command));
@@ -1014,6 +1016,63 @@ async fn execute_one(
             app.last_error = Some("外部编辑器需主循环内联处理".into());
         }
         // ---------- REQ-007：@ 提及两源拉取（AC-007-23） ----------
+        // ---------- REQ-007：subagent 目录（FR-007-01，AC-007-07~10） ----------
+        Cmd::FetchSubagentList {
+            parent_id,
+            generation,
+        } => {
+            let Some(client) = client.as_ref() else {
+                let event = AppEvent::SubagentListFailed {
+                    parent_id,
+                    generation,
+                    error: ClientError::Transport("未连接（dsh web 不可达）".into()),
+                };
+                commands.extend(app.handle(event));
+                return;
+            };
+            match dshtui::api::subagents::list(&client.http, &client.base, &parent_id).await {
+                Ok(catalog) => commands.extend(app.handle(AppEvent::SubagentListed {
+                    parent_id,
+                    generation,
+                    catalog,
+                })),
+                Err(error) => commands.extend(app.handle(AppEvent::SubagentListFailed {
+                    parent_id,
+                    generation,
+                    error,
+                })),
+            }
+        }
+        Cmd::SubagentInterrupt {
+            child_id,
+            parent_id,
+        } => {
+            let Some(client) = client.as_ref() else {
+                let event = AppEvent::SubagentInterruptDone {
+                    child_id,
+                    error: Some(ClientError::Transport("未连接（dsh web 不可达）".into())),
+                };
+                commands.extend(app.handle(event));
+                return;
+            };
+            match dshtui::api::subagents::interrupt_by_parent(
+                &client.http,
+                &client.base,
+                &child_id,
+                &parent_id,
+            )
+            .await
+            {
+                Ok(_) => commands.extend(app.handle(AppEvent::SubagentInterruptDone {
+                    child_id,
+                    error: None,
+                })),
+                Err(error) => commands.extend(app.handle(AppEvent::SubagentInterruptDone {
+                    child_id,
+                    error: Some(error),
+                })),
+            }
+        }
         Cmd::FetchMentionCandidates {
             generation,
             agent_id,

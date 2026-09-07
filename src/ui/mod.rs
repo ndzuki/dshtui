@@ -18,6 +18,7 @@ pub mod picker;
 pub mod search;
 pub mod sidebar;
 pub mod status;
+pub mod subagent;
 pub mod tabs;
 pub mod theme;
 pub mod trajectory;
@@ -110,6 +111,8 @@ pub fn render(frame: &mut Frame<'_>, app: &AppState) {
     command_palette::render(frame, areas.center, app);
     // REQ-007：@ 提及（AC-007-23；命令面板之上）。
     mention::render(frame, frame.area(), app);
+    // REQ-007：subagent 目录（FR-007-01；`:` 打开）。
+    subagent::render(frame, frame.area(), app);
     // FR-001-07：帮助 overlay 最后渲染，位于 picker 之上。
     render_help(frame, frame.area(), app);
 }

@@ -71,6 +71,8 @@ pub enum Mode {
     CommandPalette,
     /// @ 提及候选（REQ-007 AC-007-23；composer INSERT 内 `@` 触发）。
     Mention,
+    /// subagent 目录（REQ-007 FR-007-01；`:subagents` 打开）。
+    Subagent,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -347,6 +349,8 @@ pub enum PaletteAction {
     ToggleTheme,
     /// REQ-007：`:` `edit` —— 用 $EDITOR 编辑当前 composer 草稿（AC-007-25）。
     EditWithEditor,
+    /// REQ-007：`:subagents` 打开子代理目录（FR-007-01）。
+    OpenSubagents,
 }
 
 /// 会话/workspace 写操作（REQ-006 FR-006-02 操作半；wire 端点 Step 1 已封装）。
@@ -594,6 +598,11 @@ impl CommandPaletteState {
                 label: "edit",
                 desc: "用 $EDITOR 编辑当前草稿（AC-007-25；composer 打开时可用）",
                 action: PaletteAction::EditWithEditor,
+            },
+            CommandPaletteItem::Local {
+                label: "subagents",
+                desc: "子代理目录（FR-007-01；需要活动会话）",
+                action: PaletteAction::OpenSubagents,
             },
             CommandPaletteItem::V04 {
                 label: "keymap",
@@ -974,6 +983,21 @@ pub enum AppEvent {
         generation: u64,
         error: ClientError,
     },
+    // ---------- REQ-007 V0.4 subagent 回执 ----------
+    SubagentListed {
+        parent_id: String,
+        generation: u64,
+        catalog: crate::api::types::SubagentCatalog,
+    },
+    SubagentListFailed {
+        parent_id: String,
+        generation: u64,
+        error: ClientError,
+    },
+    SubagentInterruptDone {
+        child_id: String,
+        error: Option<ClientError>,
+    },
 }
 
 /// Orchestration commands emitted by the reducer (executed by the run loop).
@@ -1110,6 +1134,17 @@ pub enum Cmd {
         agent_id: String,
         query: String,
     },
+    // ---------- REQ-007 V0.4 subagent（AC-007-07~10） ----------
+    /// `subagents/list(parentId)` 拉取（generation 单飞）。
+    FetchSubagentList {
+        parent_id: String,
+        generation: u64,
+    },
+    /// `subagents/interruptByParent`（位置参数：child/parent/mode）。
+    SubagentInterrupt {
+        child_id: String,
+        parent_id: String,
+    },
 }
 
 #[derive(Debug)]
@@ -1194,6 +1229,8 @@ pub struct AppState {
     /// REQ-007 AC-007-24：本次发送在途的图片附件（submit 预检通过后暂存；
     /// 发送后清空）。
     pub pending_image_attachments: Vec<crate::model::ImageAttachment>,
+    /// REQ-007 FR-007-01：subagent 目录树（AC-007-07~10）。
+    pub subagents: crate::model::SubagentViewState,
     page_guard: PageGuard,
     /// 模型目录 fetch 单飞 generation（REQ-006 FR-006-01）：打开时自增，
     /// stale 响应（overlay 已关/已重开）直接丢弃（模式 15 in-flight 去重）。
@@ -1300,6 +1337,7 @@ impl Default for AppState {
             external_edit: crate::model::ExternalEditState::default(),
             mention: crate::model::MentionState::default(),
             pending_image_attachments: Vec::new(),
+            subagents: crate::model::SubagentViewState::default(),
             page_guard: PageGuard::default(),
             catalog_generation: 0,
             want_backfill: false,
@@ -1528,6 +1566,125 @@ impl AppState {
             tmp_path: tmp,
             editor,
         }]
+    }
+
+    // ---------- REQ-007 V0.4 subagent 目录（AC-007-07~10；FR-007-01） ----------
+
+    /// `:subagents`：以活动会话为父打开目录并拉取直属 children。
+    pub fn open_subagents(&mut self) -> Vec<Cmd> {
+        let Some(sid) = self.active_session.clone() else {
+            self.notice = Some("请先用 f/o 打开会话再查看子代理".into());
+            return vec![];
+        };
+        self.subagents.open(&sid.0);
+        self.mode = Mode::Subagent;
+        self.fetch_subagent_list(sid.0.clone())
+    }
+
+    /// 拉取 `subagents/list(parent_id)`（generation 单飞）。
+    fn fetch_subagent_list(&mut self, parent_id: String) -> Vec<Cmd> {
+        self.subagents.loading = true;
+        self.subagents.last_error_code = None;
+        let gen = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        vec![Cmd::FetchSubagentList {
+            parent_id,
+            generation: gen,
+        }]
+    }
+
+    /// 子代理目录命令分流（j/k 移动、Enter 展开/折叠、x 中断二次确认、
+    /// Esc/q 关闭）。
+    fn handle_subagent_command(&mut self, cmd: crate::input::Command) -> Vec<Cmd> {
+        use crate::input::Command as C;
+        if self.subagents.interrupt_target.is_some() {
+            // 中断二次确认态：Enter 确认、其它键取消。
+            match cmd {
+                C::PickerConfirm => {
+                    let (child, parent) = {
+                        let child = self.subagents.interrupt_target.clone().unwrap();
+                        let parent = self.subagents.parent_session_id.clone().unwrap_or_default();
+                        (child, parent)
+                    };
+                    self.subagents.interrupt_target = None;
+                    self.subagents.last_error_code = None;
+                    return vec![Cmd::SubagentInterrupt {
+                        child_id: child,
+                        parent_id: parent,
+                    }];
+                }
+                C::ClosePicker | C::PickerDown | C::PickerUp => {
+                    self.subagents.interrupt_target = None;
+                    return vec![];
+                }
+                _ => return vec![],
+            }
+        }
+        match cmd {
+            C::PickerDown => {
+                let rows = self.subagents.flatten().len();
+                if rows > 0 {
+                    self.subagents.selected = (self.subagents.selected + 1).min(rows - 1);
+                }
+                vec![]
+            }
+            C::PickerUp => {
+                self.subagents.selected = self.subagents.selected.saturating_sub(1);
+                vec![]
+            }
+            C::PickerConfirm => {
+                let Some(id) = self.subagents.selected_id() else {
+                    return vec![];
+                };
+                // 展开/折叠（has_children）→ 需要时拉取。
+                match self.subagents.toggle_expand(&id) {
+                    Some((true, target)) => self.fetch_subagent_list(target),
+                    _ => vec![],
+                }
+            }
+            C::SubagentInterrupt => {
+                let Some(id) = self.subagents.selected_id() else {
+                    return vec![];
+                };
+                // 仅可中断 continuable/running child（非根/非诊断）。
+                self.subagents.interrupt_target = Some(id);
+                self.notice = Some("中断所选子代理？Enter 确认 / 其它键取消".into());
+                vec![]
+            }
+            C::ClosePicker | C::Quit => {
+                self.subagents.close();
+                self.mode = Mode::Normal;
+                vec![]
+            }
+            _ => vec![],
+        }
+    }
+
+    /// 列表回执（generation 校验：过期丢弃）。
+    pub fn subagents_listed(
+        &mut self,
+        parent_id: String,
+        catalog: crate::api::types::SubagentCatalog,
+    ) {
+        self.subagents.set_catalog(&parent_id, catalog);
+    }
+
+    pub fn subagents_list_failed(&mut self, _parent_id: String, error: &ClientError) {
+        self.subagents.loading = false;
+        self.subagents.last_error_code = Some(error.code());
+    }
+
+    /// 中断回执：成功/失败均清目标；失败展示 error.code（权限不自动重试）。
+    pub fn subagents_interrupt_done(&mut self, child_id: String, error: Option<&ClientError>) {
+        if let Some(e) = error {
+            self.subagents.last_error_code = Some(e.code());
+            self.notice = Some(format!("中断子代理 {child_id} 失败: {e}"));
+        } else {
+            self.subagents.last_error_code = None;
+            self.notice = Some(format!("已请求中断子代理 {child_id}"));
+        }
     }
 
     // ---------- REQ-007 V0.4 @ 提及（AC-007-23；model/mention + api/references） ----------
@@ -2502,6 +2659,23 @@ impl AppState {
                 self.mention_candidates_failed(generation, &error);
                 vec![]
             }
+            // ---------- REQ-007 V0.4 subagent 回执 ----------
+            AppEvent::SubagentListed {
+                parent_id, catalog, ..
+            } => {
+                self.subagents_listed(parent_id, catalog);
+                vec![]
+            }
+            AppEvent::SubagentListFailed {
+                parent_id, error, ..
+            } => {
+                self.subagents_list_failed(parent_id, &error);
+                vec![]
+            }
+            AppEvent::SubagentInterruptDone { child_id, error } => {
+                self.subagents_interrupt_done(child_id, error.as_ref());
+                vec![]
+            }
         }
     }
 
@@ -3192,6 +3366,10 @@ impl AppState {
             }
             self.mode = Mode::Insert; // 落回 INSERT 后再走主 match
         }
+        // REQ-007：subagent 目录模态命令分流（AC-007-07~10）。
+        if self.mode == Mode::Subagent {
+            return self.handle_subagent_command(cmd);
+        }
         match cmd {
             C::MoveDown
             | C::MoveUp
@@ -3243,6 +3421,11 @@ impl AppState {
                 } else {
                     self.scroll(cmd)
                 }
+            }
+            C::SubagentInterrupt => {
+                // 仅 subagent 模态上下文有意义（已在 handle_subagent_command
+                // 分流）；此处兜底 no-op。
+                vec![]
             }
             C::OpenPicker => {
                 self.mode = Mode::Picker;
@@ -3320,6 +3503,8 @@ impl AppState {
                 // REQ-007：@ 提及 Esc 已在 handle_mention_command 拦截
                 // （此 arm 不可达，保穷尽性）。
                 Mode::Mention => vec![],
+                // REQ-007：subagent Esc 已在 handle_subagent_command 拦截。
+                Mode::Subagent => vec![],
             },
             C::PickerDown => {
                 if self.approval.list_open && self.mode == Mode::Approval {
@@ -4486,6 +4671,7 @@ impl AppState {
                             // 面板已关闭；返回 :edit 起始 Cmd（若在 INSERT）。
                             self.external_edit_begin()
                         }
+                        PaletteAction::OpenSubagents => self.open_subagents(),
                         PaletteAction::ForkSession
                         | PaletteAction::RenameSession
                         | PaletteAction::ArchiveSession
@@ -8190,5 +8376,157 @@ mod tests {
             s.notice
         );
         let _ = std::fs::remove_dir_all(&_dir);
+    }
+
+    // ---------- REQ-007 V0.4 subagent 目录（AC-007-07~10） ----------
+
+    #[test]
+    fn subagents_open_fetch_and_expand_ac007() {
+        let mut s = AppState {
+            active_session: Some(SessionId("p1".into())),
+            ..Default::default()
+        };
+        // 打开面板 → fetch 父目录。
+        let _ = s.handle_command(crate::input::Command::OpenCommandPalette);
+        s.command_palette.query = "subagents".into();
+        let idx = s
+            .command_palette
+            .filtered()
+            .iter()
+            .position(|i| {
+                matches!(
+                    i,
+                    CommandPaletteItem::Local {
+                        label: "subagents",
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        s.command_palette.selection = idx;
+        let cmds = s.handle_command(crate::input::Command::PickerConfirm);
+        assert_eq!(s.mode, Mode::Subagent, "进入 subagent 模态");
+        assert!(s.subagents.visible);
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, Cmd::FetchSubagentList { .. })),
+            "打开即拉取"
+        );
+        // 拉取回执。
+        let gen = 1;
+        let _ = s.handle(AppEvent::SubagentListed {
+            parent_id: "p1".into(),
+            generation: gen,
+            catalog: crate::api::types::SubagentCatalog {
+                entries: vec![crate::api::types::SubagentListEntry::Child {
+                    id: "c1".into(),
+                    activity: "running".into(),
+                    has_children: true,
+                    mode: Some("continuable".into()),
+                    label: None,
+                }],
+                parent_available: true,
+            },
+        });
+        assert!(!s.subagents.loading);
+        assert_eq!(s.subagents.roots.len(), 1);
+        // Enter 展开 has_children → fetch 子。
+        s.subagents.selected = 0;
+        let cmds = s.handle_command(crate::input::Command::PickerConfirm);
+        assert!(cmds
+            .iter()
+            .any(|c| matches!(c, Cmd::FetchSubagentList { parent_id, .. } if parent_id == "c1")));
+    }
+
+    #[test]
+    fn subagents_interrupt_requires_confirm_and_emits_cmd_ac007_09() {
+        let mut s = AppState {
+            active_session: Some(SessionId("p1".into())),
+            ..Default::default()
+        };
+        s.subagents.open("p1");
+        s.mode = Mode::Subagent;
+        s.subagents.set_catalog(
+            "p1",
+            crate::api::types::SubagentCatalog {
+                entries: vec![crate::api::types::SubagentListEntry::Child {
+                    id: "c1".into(),
+                    activity: "running".into(),
+                    has_children: false,
+                    mode: Some("continuable".into()),
+                    label: None,
+                }],
+                parent_available: true,
+            },
+        );
+        // x → 二次确认态（不发命令）。
+        let cmds = s.handle_command(crate::input::Command::SubagentInterrupt);
+        assert!(cmds.is_empty(), "确认前不发");
+        assert_eq!(s.subagents.interrupt_target.as_deref(), Some("c1"));
+        // Esc 取消。
+        let _ = s.handle_command(crate::input::Command::ClosePicker);
+        assert!(s.subagents.interrupt_target.is_none());
+        // 再 x + Enter 确认 → 发 interrupt。
+        let _ = s.handle_command(crate::input::Command::SubagentInterrupt);
+        let cmds = s.handle_command(crate::input::Command::PickerConfirm);
+        assert!(
+            cmds.iter().any(
+                |c| matches!(c, Cmd::SubagentInterrupt { child_id, parent_id }
+                if child_id == "c1" && parent_id == "p1")
+            ),
+            "确认后发位置参数 interrupt"
+        );
+    }
+
+    #[test]
+    fn subagents_interrupt_failure_surfaces_error_code_ac007_09() {
+        let mut s = AppState {
+            active_session: Some(SessionId("p1".into())),
+            ..Default::default()
+        };
+        let _ = s.handle(AppEvent::SubagentInterruptDone {
+            child_id: "c1".into(),
+            error: Some(ClientError::Remote {
+                code: "PERMISSION_DENIED".into(),
+                message: "无权限".into(),
+                class: ErrorClass::PermissionDenied,
+            }),
+        });
+        assert_eq!(
+            s.subagents.last_error_code.as_deref(),
+            Some("PERMISSION_DENIED")
+        );
+        assert!(!s.subagents.interrupt_target.is_some());
+        // 恢复路径：成功回执清错误。
+        let _ = s.handle(AppEvent::SubagentInterruptDone {
+            child_id: "c1".into(),
+            error: None,
+        });
+        assert_eq!(s.subagents.last_error_code, None);
+    }
+
+    #[test]
+    fn subagents_list_failed_shows_code_panel_open_ac007_08() {
+        let mut s = AppState {
+            active_session: Some(SessionId("p1".into())),
+            ..Default::default()
+        };
+        s.subagents.open("p1");
+        s.mode = Mode::Subagent;
+        let _ = s.handle(AppEvent::SubagentListFailed {
+            parent_id: "p1".into(),
+            generation: 1,
+            error: ClientError::Remote {
+                code: "gateway/agent-busy".into(),
+                message: "忙".into(),
+                class: ErrorClass::UserFacing,
+            },
+        });
+        assert!(!s.subagents.loading);
+        assert_eq!(
+            s.subagents.last_error_code.as_deref(),
+            Some("gateway/agent-busy")
+        );
+        assert_eq!(s.mode, Mode::Subagent, "失败面板保持可重试/Esc");
     }
 }

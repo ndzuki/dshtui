@@ -111,6 +111,86 @@ impl SubagentViewState {
         }
     }
 
+    /// 选中行对应 node 的 id（depth-first 平铺定位）。
+    pub fn selected_id(&self) -> Option<String> {
+        self.flatten().get(self.selected).map(|r| r.node.id.clone())
+    }
+
+    /// 定位并可能展开一个子代理：返回 (needs_fetch, target_id)。
+    /// - node 有 has_children 且 children 未展开 → 预置空 children + nav_path
+    ///   追加并请求拉取（needs_fetch=true）；
+    /// - node 有 has_children 且已展开 → 折叠（children=None，从 nav_path 移除）；
+    /// - 无 children 语义（诊断/叶子）→ needs_fetch=false。
+    pub fn toggle_expand(&mut self, id: &str) -> Option<(bool, String)> {
+        // 在平铺层找到该 node 的祖先路径并修改。
+        let target: Option<(Vec<String>, bool)> = {
+            fn find(
+                nodes: &[SubagentNode],
+                path: &[String],
+                id: &str,
+                out: &mut Vec<(Vec<String>, bool)>,
+            ) {
+                for n in nodes {
+                    let mut p = path.to_vec();
+                    p.push(n.id.clone());
+                    if n.id == id {
+                        out.push((p.clone(), n.has_children));
+                        return;
+                    }
+                    if let Some(ch) = &n.children {
+                        find(ch, &p, id, out);
+                    }
+                }
+            }
+            let mut found = Vec::new();
+            find(&self.roots, &[], id, &mut found);
+            found.pop()
+        };
+        let (ancestors, has_children) = target?;
+        if !has_children {
+            return Some((false, id.to_string())); // 叶子：无子目录
+        }
+        // 深挖到目标 node：ancestors 不含 id 自身（父链）。
+        let parent_chain = &ancestors[..ancestors.len().saturating_sub(1)];
+        let mut container: &mut Vec<SubagentNode> = &mut self.roots;
+        let mut target: Option<&mut SubagentNode> = None;
+        for a in parent_chain {
+            let Some(pos) = container.iter().position(|n| n.id == *a) else {
+                return Some((false, id.to_string()));
+            };
+            let Some(children) = container[pos].children.as_mut() else {
+                return Some((false, id.to_string()));
+            };
+            container = children;
+        }
+        if let Some(pos) = container.iter().position(|n| n.id == id) {
+            target = container.get_mut(pos);
+        }
+        if let Some(node) = target {
+            if node.children.is_some() {
+                // 折叠。
+                node.children = None;
+                self.nav_path.retain(|p| p != id);
+                return Some((false, id.to_string()));
+            }
+            node.children = Some(Vec::new());
+        }
+        if !self.nav_path.contains(&id.to_string()) {
+            self.nav_path.push(id.to_string());
+        }
+        Some((true, id.to_string()))
+    }
+
+    /// 面包屑：当前导航路径根 → 深（root/parent + expanded ids）。
+    pub fn breadcrumbs(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Some(root) = self.parent_session_id.clone() {
+            out.push(root);
+        }
+        out.extend(self.nav_path.iter().cloned());
+        out
+    }
+
     /// Depth-first flattened rows (for list rendering & cursor navigation).
     pub fn flatten(&self) -> Vec<SubagentNodeRef<'_>> {
         fn walk<'a>(nodes: &'a [SubagentNode], depth: usize, out: &mut Vec<SubagentNodeRef<'a>>) {
@@ -275,5 +355,57 @@ mod tests {
         parents.insert("b".into(), (None, Some("a".into())));
         let crumbs = lineage_breadcrumbs("a", &parents);
         assert!(crumbs.len() <= 65, "防环有界，得到 {}", crumbs.len());
+    }
+
+    #[test]
+    fn toggle_expand_collapse_and_breadcrumbs() {
+        use crate::api::types::SubagentListEntry;
+        fn child(id: &str, hc: bool) -> SubagentListEntry {
+            SubagentListEntry::Child {
+                id: id.into(),
+                activity: "inactive".into(),
+                has_children: hc,
+                mode: Some("continuable".into()),
+                label: None,
+            }
+        }
+        let mut v = SubagentViewState::default();
+        v.open("p1");
+        v.set_catalog(
+            "p1",
+            SubagentCatalog {
+                entries: vec![child("c1", true), child("c2", false)],
+                parent_available: true,
+            },
+        );
+        // 展开 c1 → needs_fetch + nav_path + children 占位。
+        let (need, id) = v.toggle_expand("c1").unwrap();
+        assert!(need);
+        assert_eq!(id, "c1");
+        assert_eq!(v.nav_path, vec!["c1"]);
+        // 拉回 c1 的子目录。
+        v.set_catalog(
+            "c1",
+            SubagentCatalog {
+                entries: vec![child("gc1", false)],
+                parent_available: true,
+            },
+        );
+        let rows = v.flatten();
+        assert_eq!(rows.len(), 3, "p1 根 2 + c1 子 1");
+        assert_eq!(rows[0].node.id, "c1");
+        assert_eq!(rows[1].node.id, "gc1", "c1 子行紧跟父后");
+        assert_eq!(rows[1].depth, 1);
+        assert_eq!(rows[2].node.id, "c2");
+        // 面包屑 root→c1。
+        assert_eq!(v.breadcrumbs(), vec!["p1", "c1"]);
+        // 折叠 c1。
+        let (need, _) = v.toggle_expand("c1").unwrap();
+        assert!(!need);
+        assert!(v.nav_path.is_empty());
+        assert_eq!(v.flatten().len(), 2);
+        // 叶子 c2 不拉取。
+        let (need, _) = v.toggle_expand("c2").unwrap();
+        assert!(!need);
     }
 }
