@@ -9,6 +9,7 @@ pub mod detail;
 pub mod goal;
 pub mod image;
 pub mod image_view;
+pub mod jobs;
 pub mod layout;
 pub mod markdown;
 pub mod mention;
@@ -116,6 +117,8 @@ pub fn render(frame: &mut Frame<'_>, app: &AppState) {
     subagent::render(frame, frame.area(), app);
     // REQ-007：goal 面板（FR-007-02）。
     goal::render(frame, frame.area(), app);
+    // REQ-007：jobs 只读面板。
+    jobs::render(frame, frame.area(), app);
     // FR-001-07：帮助 overlay 最后渲染，位于 picker 之上。
     render_help(frame, frame.area(), app);
 }

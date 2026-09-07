@@ -44,6 +44,8 @@ pub enum InputMode {
     Subagent,
     /// REQ-007 V0.4：goal 面板（`:goal`；AC-007-11/12/14）。
     Goal,
+    /// REQ-007 V0.4：jobs 只读面板（`:jobs`；AC-007-13）。
+    Jobs,
 }
 
 /// Domain commands emitted by the input layer.
@@ -243,6 +245,7 @@ impl KeyDecoder {
             InputMode::Mention => self.mention(key),
             InputMode::Subagent => self.subagent(key),
             InputMode::Goal => self.goal(key),
+            InputMode::Jobs => self.jobs(key),
         }
     }
 
@@ -642,6 +645,19 @@ impl KeyDecoder {
         }
     }
 
+    /// REQ-007 jobs 只读面板键位（AC-007-13）：j/k 移动、Esc/q 关闭。
+    /// 官方 0.1.2-rc.1 无停止端点 → 无停止控制（wire 校正）。
+    fn jobs(&mut self, key: KeyEvent) -> Option<Command> {
+        self.pending_g = false;
+        match key.code {
+            KeyCode::Esc => Some(Command::ClosePicker),
+            KeyCode::Char('q') if key.modifiers.is_empty() => Some(Command::ClosePicker),
+            KeyCode::Char('j') if key.modifiers.is_empty() => Some(Command::PickerDown),
+            KeyCode::Char('k') if key.modifiers.is_empty() => Some(Command::PickerUp),
+            _ => None,
+        }
+    }
+
     /// REQ-007 goal 面板键位（AC-007-11/12/14）：无输入子阶段时
     /// c=create / e=edit objective / p=pause / r=resume / x=complete /
     /// d=clear(二次确认) / Esc·q 关闭；create/edit 输入子阶段字符进 buffer。
@@ -1007,6 +1023,7 @@ fn mode_name_of(mode: InputMode) -> &'static str {
         | InputMode::Mention => "input(不可覆盖)",
         InputMode::Subagent => "subagent",
         InputMode::Goal => "goal",
+        InputMode::Jobs => "jobs",
     }
 }
 

@@ -188,6 +188,15 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
             if running { " ●run" } else { " ○idle" },
             Style::default().fg(if running { Color::Green } else { Color::Gray }),
         ));
+        // REQ-007 AC-007-13：jobs 指示位（control 镜像 active 计数，ADR-008
+        // 只读不自算总量）。
+        let jobs_active = app.jobs.active_count();
+        if jobs_active > 0 {
+            spans.push(Span::styled(
+                format!(" jobs:{jobs_active}"),
+                Style::default().fg(Color::Yellow),
+            ));
+        }
         // 本地停止转场（AC-002-05）：requested 且官方投影仍 running →
         // 「停止中」；投影翻转即结束（FollowSnapshot 清空 requested）。
         if running && app.stop.requested_session.as_ref() == app.active_session.as_ref() {

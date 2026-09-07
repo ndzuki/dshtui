@@ -493,6 +493,8 @@ async fn run_connected(eff: Effective, token: String, client: DshClient) -> Resu
                 Mode::Subagent => InputMode::Subagent,
                 // REQ-007：goal 面板。
                 Mode::Goal => InputMode::Goal,
+                // REQ-007：jobs 只读面板。
+                Mode::Jobs => InputMode::Jobs,
             };
             if let Some(command) = decoder.decode(mode, input) {
                 commands.extend(app.handle_command(command));

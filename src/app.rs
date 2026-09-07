@@ -75,6 +75,8 @@ pub enum Mode {
     Subagent,
     /// goal 面板（REQ-007 FR-007-02 half；`:goal` 打开）。
     Goal,
+    /// jobs 只读面板（REQ-007 FR-007-02 half；`:jobs` 打开）。
+    Jobs,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -355,6 +357,8 @@ pub enum PaletteAction {
     OpenSubagents,
     /// REQ-007：`:goal` 打开 goal 面板（FR-007-02）。
     OpenGoal,
+    /// REQ-007：`:jobs` 打开 jobs 只读面板。
+    OpenJobs,
 }
 
 /// 会话/workspace 写操作（REQ-006 FR-006-02 操作半；wire 端点 Step 1 已封装）。
@@ -646,6 +650,11 @@ impl CommandPaletteState {
                 label: "goal",
                 desc: "goal 面板（单例；create/edit/pause/resume/complete/clear）",
                 action: PaletteAction::OpenGoal,
+            },
+            CommandPaletteItem::Local {
+                label: "jobs",
+                desc: "jobs 只读列表（官方无停止，指引 web）",
+                action: PaletteAction::OpenJobs,
             },
             CommandPaletteItem::V04 {
                 label: "keymap",
@@ -1293,6 +1302,8 @@ pub struct AppState {
     pub goals: crate::model::GoalPanelState,
     /// goal create/edit 输入子阶段是否激活（buffer 在 GoalPanelState）。
     pub goal_input: bool,
+    /// REQ-007 AC-007-13：jobs 只读镜像（session/control 帧维护）。
+    pub jobs: crate::model::JobsPanelState,
     page_guard: PageGuard,
     /// 模型目录 fetch 单飞 generation（REQ-006 FR-006-01）：打开时自增，
     /// stale 响应（overlay 已关/已重开）直接丢弃（模式 15 in-flight 去重）。
@@ -1402,6 +1413,7 @@ impl Default for AppState {
             subagents: crate::model::SubagentViewState::default(),
             goals: crate::model::GoalPanelState::default(),
             goal_input: false,
+            jobs: crate::model::JobsPanelState::default(),
             page_guard: PageGuard::default(),
             catalog_generation: 0,
             want_backfill: false,
@@ -1944,6 +1956,55 @@ impl AppState {
             self.refresh_goal_from_projection();
         } else {
             self.notice = Some(format!("goal {} 失败: {error}", op.op_kind().as_str()));
+        }
+    }
+
+    // ---------- REQ-007 V0.4 jobs 只读（AC-007-13） ----------
+
+    pub fn open_jobs_panel(&mut self) -> Vec<Cmd> {
+        self.jobs.open();
+        self.mode = Mode::Jobs;
+        vec![]
+    }
+
+    fn handle_jobs_command(&mut self, cmd: crate::input::Command) -> Vec<Cmd> {
+        use crate::input::Command as C;
+        match cmd {
+            C::PickerDown => {
+                self.jobs.move_selection(1);
+                vec![]
+            }
+            C::PickerUp => {
+                self.jobs.move_selection(-1);
+                vec![]
+            }
+            C::ClosePicker | C::Quit => {
+                self.jobs.close();
+                self.mode = Mode::Normal;
+                vec![]
+            }
+            _ => vec![],
+        }
+    }
+
+    /// 从 control 帧更新 jobs 镜像（全量替换语义：baseline.jobs / `jobs`
+    /// 替换帧；空数组清镜像——不伪造数字，ADR-008）。
+    pub fn jobs_control_item(&mut self, session_id: &SessionId, item: &ControlItem) {
+        match item {
+            ControlItem::Baseline { jobs, .. } => {
+                let jobs = crate::api::session::parse_jobs(jobs);
+                if !jobs.is_empty() {
+                    self.jobs.replace(jobs);
+                } else if self.jobs.visible {
+                    // baseline 无 jobs（未运行）→ 面板仍显示空态。
+                    self.jobs.replace(Vec::new());
+                }
+                let _ = session_id;
+            }
+            ControlItem::Jobs { jobs } => {
+                self.jobs.replace(crate::api::session::parse_jobs(jobs));
+            }
+            _ => {}
         }
     }
 
@@ -2592,6 +2653,8 @@ impl AppState {
                 vec![]
             }
             AppEvent::ControlItem { session_id, item } => {
+                // REQ-007：jobs 镜像维护（AC-007-13；只读，无停止控制）。
+                self.jobs_control_item(&session_id, &item);
                 // 只消费官方 projection 的 running 事实（ADR-008）；其余
                 // queue/jobs 帧本版本不解释。
                 if let ControlItem::Baseline { projections, .. } = item {
@@ -3661,6 +3724,10 @@ impl AppState {
         if self.mode == Mode::Goal {
             return self.handle_goal_command(cmd);
         }
+        // REQ-007：jobs 只读面板（AC-007-13）。
+        if self.mode == Mode::Jobs {
+            return self.handle_jobs_command(cmd);
+        }
         match cmd {
             C::MoveDown
             | C::MoveUp
@@ -3807,6 +3874,8 @@ impl AppState {
                 Mode::Subagent => vec![],
                 // REQ-007：goal Esc 已在 handle_goal_command 拦截。
                 Mode::Goal => vec![],
+                // REQ-007：jobs Esc 已在 handle_jobs_command 拦截。
+                Mode::Jobs => vec![],
             },
             C::PickerDown => {
                 if self.approval.list_open && self.mode == Mode::Approval {
@@ -4975,6 +5044,7 @@ impl AppState {
                         }
                         PaletteAction::OpenSubagents => self.open_subagents(),
                         PaletteAction::OpenGoal => self.open_goal_panel(),
+                        PaletteAction::OpenJobs => self.open_jobs_panel(),
                         PaletteAction::ForkSession
                         | PaletteAction::RenameSession
                         | PaletteAction::ArchiveSession
@@ -8968,5 +9038,101 @@ mod tests {
             cmds.iter().any(|c| matches!(c, Cmd::GoalOp { op: GoalMutation::Create { objective, .. }, .. } if objective == "新目标")),
             "create 发目标文本"
         );
+    }
+
+    // ---------- REQ-007 V0.4 jobs 只读（AC-007-13） ----------
+
+    #[test]
+    fn jobs_control_frames_maintain_readonly_mirror_ac007_13() {
+        let mut s = AppState::default();
+        let sid = SessionId("sess-j".into());
+        // baseline.jobs per-session 数组。
+        let item = ControlItem::Baseline {
+            queues: serde_json::json!([]),
+            jobs: serde_json::json!({"sess-j": [
+                {"id": "j1", "kind": "tool/call", "label": "跑测试",
+                 "status": "running", "startedAt": 1}
+            ]}),
+            projections: serde_json::json!({"running": true}),
+            raw: serde_json::json!({}),
+        };
+        let _ = s.handle(AppEvent::ControlItem {
+            session_id: sid.clone(),
+            item,
+        });
+        assert_eq!(s.jobs.jobs.len(), 1);
+        assert_eq!(s.jobs.active_count(), 1);
+        // jobs 替换帧：全量替换。
+        let item = ControlItem::Jobs {
+            jobs: serde_json::json!([
+                {"id": "j2", "kind": "k", "label": "lint", "status": "completed"}
+            ]),
+        };
+        let _ = s.handle(AppEvent::ControlItem {
+            session_id: sid.clone(),
+            item,
+        });
+        assert_eq!(s.jobs.jobs.len(), 1, "全量替换");
+        assert_eq!(s.jobs.jobs[0].id, "j2");
+        // 空数组清镜像（不伪造数字）。
+        let item = ControlItem::Jobs {
+            jobs: serde_json::json!([]),
+        };
+        let _ = s.handle(AppEvent::ControlItem {
+            session_id: sid.clone(),
+            item,
+        });
+        assert!(s.jobs.jobs.is_empty());
+    }
+
+    #[test]
+    fn jobs_panel_open_move_close_ac007_13() {
+        let mut s = AppState::default();
+        let _ = s.handle_command(crate::input::Command::OpenCommandPalette);
+        s.command_palette.query = "jobs".into();
+        let idx = s
+            .command_palette
+            .filtered()
+            .iter()
+            .position(|i| matches!(i, CommandPaletteItem::Local { label: "jobs", .. }))
+            .unwrap();
+        s.command_palette.selection = idx;
+        let _cmds = s.handle_command(crate::input::Command::PickerConfirm);
+        assert_eq!(s.mode, Mode::Jobs);
+        assert!(s.jobs.visible);
+        // 无停止键：Esc 关闭回 Normal。
+        let _ = s.handle_command(crate::input::Command::ClosePicker);
+        assert_eq!(s.mode, Mode::Normal);
+        assert!(!s.jobs.visible);
+    }
+
+    #[test]
+    fn jobs_replacement_frame_full_swap_and_status_chip_data_ac007_13() {
+        use crate::api::types::{SessionJob, SessionJobStatus};
+        let mut s = AppState::default();
+        s.jobs.replace(vec![
+            SessionJob {
+                id: "j1".into(),
+                kind: "k".into(),
+                label: "a".into(),
+                status: Some(SessionJobStatus::Running),
+                ..Default::default()
+            },
+            SessionJob {
+                id: "j2".into(),
+                kind: "k".into(),
+                label: "b".into(),
+                status: Some(SessionJobStatus::Stopping),
+                ..Default::default()
+            },
+            SessionJob {
+                id: "j3".into(),
+                kind: "k".into(),
+                label: "c".into(),
+                status: Some(SessionJobStatus::Killed),
+                ..Default::default()
+            },
+        ]);
+        assert_eq!(s.jobs.active_count(), 2, "running+stopping 计入");
     }
 }
