@@ -1335,6 +1335,13 @@ pub enum Cmd {
         child_id: String,
         max_messages: usize,
     },
+    /// REQ-007 AC-007-01/10：父→子 `subagents/prompt`（child 打开态发送）。
+    SendSubagentPrompt {
+        parent_id: String,
+        child_id: String,
+        request_id: String,
+        content: Vec<PromptContentPart>,
+    },
 }
 
 #[derive(Debug)]
@@ -1440,6 +1447,9 @@ pub struct AppState {
     /// REQ-007 AC-007-01：待打开的 subagent child（open_follow 用 subagent
     /// address；由 main 消费一次后清空）。
     pub pending_subagent_open: Option<(String, String)>,
+    /// REQ-007 AC-007-01/10：child session → parent session 映射（child
+    /// 打开时记录；composer 发送经 subagents/prompt 路由，父→子消息块可见）。
+    pub subagent_parents: std::collections::HashMap<String, String>,
     /// REQ-007 AC-007-15/16：settings 面板。
     pub settings: crate::model::SettingsPanelState,
     /// REQ-007 AC-007-18：skills 目录。
@@ -1562,6 +1572,7 @@ impl Default for AppState {
             message_action: crate::model::MessageActionState::default(),
             msg_action_target: None,
             pending_subagent_open: None,
+            subagent_parents: std::collections::HashMap::new(),
             settings: crate::model::SettingsPanelState::default(),
             skills: crate::model::SkillsCatalogState::default(),
             export: crate::model::ExportState::default(),
@@ -1825,6 +1836,8 @@ impl AppState {
         // 把 OpenFollow 换成 OpenFollowSubagent（child 日志经 subagent
         // address follow；control 对子代理不适用）。
         self.pending_subagent_open = Some((parent.clone(), id.clone()));
+        // 记录 child→parent（发送路由用；普通会话打开会清除该 child 条目）。
+        self.subagent_parents.insert(id.clone(), parent.clone());
         cmds.retain(|c| !matches!(c, Cmd::OpenControl { .. }));
         for c in &mut cmds {
             if let Cmd::OpenFollow {
@@ -1841,6 +1854,13 @@ impl AppState {
             }
         }
         cmds
+    }
+
+    /// 当前活动会话是否为已打开的 subagent child（发送路由 AC-007-01）。
+    pub fn active_subagent_parent(&self) -> Option<(String, String)> {
+        let sid = self.active_session.as_ref()?.0.clone();
+        let parent = self.subagent_parents.get(&sid)?.clone();
+        Some((parent, sid))
     }
 
     /// 拉取 `subagents/list(parent_id)`（generation 单飞）。
@@ -4114,6 +4134,17 @@ impl AppState {
         if content.is_empty() {
             // 全部行都是图片但读取为空不应发生（前面已校验）；兜底纯文本。
             content.push(PromptContentPart::Text { text });
+        }
+        // REQ-007 AC-007-01/10：child 打开态发送 → 父→子 subagents/prompt
+        // （agent 作用域 childSessionId；父→子消息以普通消息块可见）。普通
+        // 会话仍走 session/prompt。
+        if let Some((parent_id, child_id)) = self.active_subagent_parent() {
+            return vec![Cmd::SendSubagentPrompt {
+                parent_id,
+                child_id,
+                request_id: request_id.0.clone(),
+                content,
+            }];
         }
         let request = PromptRequest {
             request_id: request_id.clone(),
@@ -10575,5 +10606,53 @@ mod tests {
         assert!(s.image_view.pager.is_none() || s.image_view.pager.as_ref().unwrap().total == 1);
         s.image_view.close();
         assert!(s.image_view.pager.is_none());
+    }
+
+    // ---------- REQ-007 V0.4 父→子发送（AC-007-01/10） ----------
+
+    #[test]
+    fn subagent_child_submit_routes_to_subagents_prompt_ac007_01_10() {
+        let mut s = AppState::default();
+        let child = SessionId("c1".into());
+        s.active_session = Some(child.clone());
+        s.composer.visible = true;
+        s.composer.active_session = Some(child.clone());
+        s.draft = Some(DraftState {
+            text: "子代理继续".into(),
+            cursor: 0,
+            bound_session: child.clone(),
+        });
+        // 登记 child→parent（模拟目录打开）。
+        s.subagent_parents.insert("c1".into(), "p1".into());
+        s.mode = Mode::Insert;
+        let cmds = s.submit_input(PromptMode::Queue);
+        // 断言路由到 SendSubagentPrompt 而非 SendPrompt。
+        assert!(
+            cmds.iter().any(|c| matches!(
+                c,
+                Cmd::SendSubagentPrompt { parent_id, child_id, content, .. }
+                    if parent_id == "p1" && child_id == "c1"
+                    && matches!(&content[0], PromptContentPart::Text { text } if text == "子代理继续")
+            )),
+            "child 发送走 subagents/prompt: {cmds:?}"
+        );
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Cmd::SendPrompt { .. })),
+            "不误走 session/prompt"
+        );
+        // 普通会话仍走 SendPrompt。
+        let mut s2 = AppState::default();
+        let sid = SessionId("sess-n".into());
+        s2.active_session = Some(sid.clone());
+        s2.composer.visible = true;
+        s2.composer.active_session = Some(sid.clone());
+        s2.draft = Some(DraftState {
+            text: "你好".into(),
+            cursor: 0,
+            bound_session: sid.clone(),
+        });
+        s2.mode = Mode::Insert;
+        let cmds2 = s2.submit_input(PromptMode::Queue);
+        assert!(cmds2.iter().any(|c| matches!(c, Cmd::SendPrompt { .. })));
     }
 }

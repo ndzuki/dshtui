@@ -17,7 +17,7 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use dshtui::api::session;
-use dshtui::api::types::{SessionAddress, SessionId, SessionSeq};
+use dshtui::api::types::{SessionAddress, SessionId, SessionRequestId, SessionSeq};
 use dshtui::api::workspace;
 use dshtui::api::{Backoff, ClientError, DshClient, Mux};
 use dshtui::app::{AppEvent, AppState, Cmd, Mode};
@@ -729,6 +729,45 @@ async fn execute_one(
                 },
             };
             commands.extend(app.handle(event));
+        }
+        // REQ-007 AC-007-01/10：父→子发送（subagents/prompt）。
+        Cmd::SendSubagentPrompt {
+            parent_id,
+            child_id,
+            request_id,
+            content,
+        } => {
+            let Some(client) = client.as_ref() else {
+                let event = AppEvent::PromptFailed {
+                    session_id: SessionId(child_id.clone()),
+                    request_id: SessionRequestId(request_id.clone()),
+                    error: ClientError::Transport("未连接（dsh web 不可达）".into()),
+                };
+                commands.extend(app.handle(event));
+                return;
+            };
+            let req = dshtui::api::types::SubagentPromptRequest {
+                request_id: request_id.clone(),
+                parent_session_id: parent_id,
+                child_session_id: child_id.clone(),
+                mode: "continuable".into(),
+                content,
+            };
+            match dshtui::api::subagents::prompt(&client.http, &client.base, &req).await {
+                Ok(receipt) => {
+                    tracing::debug!(child = %child_id, message_id = ?receipt.message_id, "subagents/prompt accepted");
+                    // 复用 PromptAccepted（child 窗口回显对账）。
+                    commands.extend(app.handle(AppEvent::PromptAccepted {
+                        session_id: SessionId(child_id.clone()),
+                        request_id: SessionRequestId(request_id.clone()),
+                    }));
+                }
+                Err(error) => commands.extend(app.handle(AppEvent::PromptFailed {
+                    session_id: SessionId(child_id.clone()),
+                    request_id: SessionRequestId(request_id.clone()),
+                    error,
+                })),
+            }
         }
         Cmd::SendPrompt {
             session_id,
