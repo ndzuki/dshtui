@@ -6,6 +6,7 @@ pub mod chat;
 pub mod command_palette;
 pub mod composer;
 pub mod detail;
+pub mod export;
 pub mod goal;
 pub mod image;
 pub mod image_view;
@@ -121,9 +122,10 @@ pub fn render(frame: &mut Frame<'_>, app: &AppState) {
     goal::render(frame, frame.area(), app);
     // REQ-007：jobs 只读面板。
     jobs::render(frame, frame.area(), app);
-    // REQ-007：settings / skills 面板。
+    // REQ-007：settings / skills / export 面板。
     settings::render(frame, frame.area(), app);
     skills::render(frame, frame.area(), app);
+    export::render(frame, frame.area(), app);
     // FR-001-07：帮助 overlay 最后渲染，位于 picker 之上。
     render_help(frame, frame.area(), app);
 }

@@ -81,6 +81,8 @@ pub enum Mode {
     Settings,
     /// skills 目录（REQ-007 FR-007-03 half；`:skills` 打开）。
     Skills,
+    /// 会话导出（REQ-007 FR-007-04；`:export` 打开）。
+    Export,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -367,6 +369,8 @@ pub enum PaletteAction {
     OpenSettings,
     /// REQ-007：`:skills` 打开 skills 目录。
     OpenSkills,
+    /// REQ-007：`:export` 打开会话导出。
+    OpenExport,
 }
 
 /// 会话/workspace 写操作（REQ-006 FR-006-02 操作半；wire 端点 Step 1 已封装）。
@@ -674,9 +678,10 @@ impl CommandPaletteState {
                 label: "keymap",
                 desc: "键位编辑（V0.4）",
             },
-            CommandPaletteItem::V04 {
+            CommandPaletteItem::Local {
                 label: "export",
-                desc: "导出/存档（V0.4）",
+                desc: "导出会话 ZIP（官方 /api/session.export）",
+                action: PaletteAction::OpenExport,
             },
         ]
     }
@@ -1094,6 +1099,13 @@ pub enum AppEvent {
     SkillsListFailed {
         error: ClientError,
     },
+    ExportDone {
+        bytes: u64,
+        path: std::path::PathBuf,
+    },
+    ExportFailed {
+        error: ClientError,
+    },
 }
 
 /// Orchestration commands emitted by the reducer (executed by the run loop).
@@ -1257,6 +1269,11 @@ pub enum Cmd {
         value: serde_json::Value,
         revision: u64,
     },
+    /// 会话导出：官方同源 HTTP `/api/session.export` 流式落盘。
+    ExportSession {
+        session_id: String,
+        path: std::path::PathBuf,
+    },
 }
 
 #[derive(Debug)]
@@ -1353,6 +1370,8 @@ pub struct AppState {
     pub settings: crate::model::SettingsPanelState,
     /// REQ-007 AC-007-18：skills 目录。
     pub skills: crate::model::SkillsCatalogState,
+    /// REQ-007 AC-007-17：会话导出。
+    pub export: crate::model::ExportState,
     page_guard: PageGuard,
     /// 模型目录 fetch 单飞 generation（REQ-006 FR-006-01）：打开时自增，
     /// stale 响应（overlay 已关/已重开）直接丢弃（模式 15 in-flight 去重）。
@@ -1465,6 +1484,7 @@ impl Default for AppState {
             jobs: crate::model::JobsPanelState::default(),
             settings: crate::model::SettingsPanelState::default(),
             skills: crate::model::SkillsCatalogState::default(),
+            export: crate::model::ExportState::default(),
             page_guard: PageGuard::default(),
             catalog_generation: 0,
             want_backfill: false,
@@ -2240,6 +2260,77 @@ impl AppState {
                 vec![]
             }
             _ => vec![],
+        }
+    }
+
+    // ---------- REQ-007 V0.4 会话导出（AC-007-17；官方 HTTP 路由） ----------
+
+    pub fn open_export_panel(&mut self) -> Vec<Cmd> {
+        let Some(sid) = self.active_session.clone() else {
+            self.notice = Some("请先用 f/o 打开会话再导出".into());
+            return vec![];
+        };
+        let default = format!("dshtui-export-{}.zip", sid.0);
+        self.export.open(&sid.0, &default);
+        self.mode = Mode::Export;
+        vec![]
+    }
+
+    fn handle_export_command(&mut self, cmd: crate::input::Command) -> Vec<Cmd> {
+        use crate::input::Command as C;
+        match cmd {
+            C::PickerInput(t) => {
+                if self.export.phase == crate::model::export::ExportPhase::PickingPath {
+                    self.export.path.push_str(&t);
+                }
+                vec![]
+            }
+            C::PickerBackspace => {
+                if self.export.phase == crate::model::export::ExportPhase::PickingPath {
+                    self.export.path.pop();
+                }
+                vec![]
+            }
+            C::PickerConfirm => {
+                if !self.export.begin_download() {
+                    self.notice = Some("路径为空或在途".into());
+                    return vec![];
+                }
+                let Some(sid) = self.export.session_id.clone() else {
+                    return vec![];
+                };
+                let path = std::path::PathBuf::from(self.export.path.clone());
+                vec![Cmd::ExportSession {
+                    session_id: sid,
+                    path,
+                }]
+            }
+            C::ClosePicker | C::Quit => {
+                if self.export.phase == crate::model::export::ExportPhase::Downloading
+                    || self.export.phase == crate::model::export::ExportPhase::Rebuilding
+                {
+                    self.export.cancelled = true;
+                    self.notice = Some("导出已取消——在途下载完成后临时文件自动清理".into());
+                }
+                self.export.close();
+                self.mode = Mode::Normal;
+                vec![]
+            }
+            _ => vec![],
+        }
+    }
+
+    pub fn export_done(&mut self, bytes: u64, path: &std::path::Path) {
+        self.export.mark_progress(bytes);
+        self.export.finish();
+        self.notice = Some(format!("导出完成: {}（{} 字节）", path.display(), bytes));
+    }
+
+    pub fn export_failed(&mut self, error: &ClientError) {
+        self.export.fail(error.code());
+        self.notice = Some(format!("导出失败: {error}"));
+        if error.class() == crate::api::envelope::ErrorClass::PermissionDenied {
+            tracing::error!(error = %error, "导出权限不足");
         }
     }
 
@@ -3287,6 +3378,14 @@ impl AppState {
                 self.skills_list_failed(&error);
                 vec![]
             }
+            AppEvent::ExportDone { bytes, path } => {
+                self.export_done(bytes, &path);
+                vec![]
+            }
+            AppEvent::ExportFailed { error } => {
+                self.export_failed(&error);
+                vec![]
+            }
         }
     }
 
@@ -3996,6 +4095,10 @@ impl AppState {
         if self.mode == Mode::Skills {
             return self.handle_skills_command(cmd);
         }
+        // REQ-007：export（AC-007-17）。
+        if self.mode == Mode::Export {
+            return self.handle_export_command(cmd);
+        }
         match cmd {
             C::MoveDown
             | C::MoveUp
@@ -4144,9 +4247,10 @@ impl AppState {
                 Mode::Goal => vec![],
                 // REQ-007：jobs Esc 已在 handle_jobs_command 拦截。
                 Mode::Jobs => vec![],
-                // REQ-007：settings/skills Esc 已分流。
+                // REQ-007：settings/skills/export Esc 已分流。
                 Mode::Settings => vec![],
                 Mode::Skills => vec![],
+                Mode::Export => vec![],
             },
             C::PickerDown => {
                 if self.approval.list_open && self.mode == Mode::Approval {
@@ -5318,6 +5422,7 @@ impl AppState {
                         PaletteAction::OpenJobs => self.open_jobs_panel(),
                         PaletteAction::OpenSettings => self.open_settings_panel(),
                         PaletteAction::OpenSkills => self.open_skills_panel(),
+                        PaletteAction::OpenExport => self.open_export_panel(),
                         PaletteAction::ForkSession
                         | PaletteAction::RenameSession
                         | PaletteAction::ArchiveSession
@@ -9544,5 +9649,96 @@ mod tests {
         // 关闭。
         let _ = s.handle_command(crate::input::Command::ClosePicker);
         assert_eq!(s.mode, Mode::Normal);
+    }
+
+    // ---------- REQ-007 V0.4 会话导出（AC-007-17） ----------
+
+    #[test]
+    fn export_open_edit_path_and_start_download_ac007_17() {
+        let mut s = AppState {
+            active_session: Some(SessionId("sess-x".into())),
+            ..Default::default()
+        };
+        let _ = s.handle_command(crate::input::Command::OpenCommandPalette);
+        s.command_palette.query = "export".into();
+        let idx = s
+            .command_palette
+            .filtered()
+            .iter()
+            .position(|i| {
+                matches!(
+                    i,
+                    CommandPaletteItem::Local {
+                        label: "export",
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        s.command_palette.selection = idx;
+        let _cmds = s.handle_command(crate::input::Command::PickerConfirm);
+        assert_eq!(s.mode, Mode::Export);
+        assert!(s.export.visible);
+        // 路径编辑：清默认 + 输入。
+        for _ in 0..s.export.path.len() {
+            let _ = s.handle_command(crate::input::Command::PickerBackspace);
+        }
+        for c in "/tmp/out.zip".chars() {
+            let _ = s.handle_command(crate::input::Command::PickerInput(c.to_string()));
+        }
+        assert_eq!(s.export.path, "/tmp/out.zip");
+        // Enter → 开始下载发命令。
+        let cmds = s.handle_command(crate::input::Command::PickerConfirm);
+        assert!(cmds
+            .iter()
+            .any(|c| matches!(c, Cmd::ExportSession { session_id, path }
+            if session_id == "sess-x" && path.to_string_lossy() == "/tmp/out.zip")));
+        // 成功回执。
+        let _ = s.handle(AppEvent::ExportDone {
+            bytes: 1234,
+            path: std::path::PathBuf::from("/tmp/out.zip"),
+        });
+        assert!(s.export.phase == crate::model::export::ExportPhase::Done);
+    }
+
+    #[test]
+    fn export_failure_surfaces_code_and_can_retry_ac007_17() {
+        let mut s = AppState {
+            active_session: Some(SessionId("sess-x".into())),
+            ..Default::default()
+        };
+        s.export.open("sess-x", "out.zip");
+        s.mode = Mode::Export;
+        assert!(s.export.begin_download());
+        let _ = s.handle(AppEvent::ExportFailed {
+            error: ClientError::Remote {
+                code: "PERMISSION_DENIED".into(),
+                message: "no".into(),
+                class: ErrorClass::PermissionDenied,
+            },
+        });
+        assert!(s.export.phase == crate::model::export::ExportPhase::Failed);
+        assert_eq!(
+            s.export.last_error_code.as_deref(),
+            Some("PERMISSION_DENIED")
+        );
+        // 恢复路径：重开重试可再下载。
+        assert!(s.export.begin_download(), "失败后可重试（幂等）");
+    }
+
+    #[test]
+    fn export_close_during_download_marks_cancel_ac007_17() {
+        let mut s = AppState::default();
+        s.export.open("sess-x", "out.zip");
+        s.mode = Mode::Export;
+        assert!(s.export.begin_download());
+        let _ = s.handle_command(crate::input::Command::ClosePicker);
+        assert!(
+            s.notice.as_deref().unwrap_or("").contains("导出已取消"),
+            "取消提示, notice={:?}",
+            s.notice
+        );
+        assert_eq!(s.mode, Mode::Normal);
+        assert!(!s.export.visible);
     }
 }

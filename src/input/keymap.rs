@@ -50,6 +50,8 @@ pub enum InputMode {
     Settings,
     /// REQ-007 V0.4：skills 目录（`:skills`；AC-007-18）。
     Skills,
+    /// REQ-007 V0.4：会话导出（`:export`；AC-007-17）。
+    Export,
 }
 
 /// Domain commands emitted by the input layer.
@@ -252,6 +254,7 @@ impl KeyDecoder {
             InputMode::Jobs => self.jobs(key),
             InputMode::Settings => self.settings(key),
             InputMode::Skills => self.skills(key),
+            InputMode::Export => self.export(key),
         }
     }
 
@@ -669,6 +672,22 @@ impl KeyDecoder {
         }
     }
 
+    /// REQ-007 export 键位（AC-007-17）：路径编辑子阶段（字符/Backspace/
+    /// Enter 开始下载/Esc 取消）；下载态 Esc 关闭。
+    fn export(&mut self, key: KeyEvent) -> Option<Command> {
+        self.pending_g = false;
+        match key.code {
+            KeyCode::Esc => Some(Command::ClosePicker),
+            KeyCode::Char('q') if key.modifiers.is_empty() => Some(Command::ClosePicker),
+            KeyCode::Enter if key.modifiers.is_empty() => Some(Command::PickerConfirm),
+            KeyCode::Backspace => Some(Command::PickerBackspace),
+            KeyCode::Char(c) if key.modifiers.is_empty() => {
+                Some(Command::PickerInput(c.to_string()))
+            }
+            _ => None,
+        }
+    }
+
     /// REQ-007 skills 目录键位（AC-007-18）：j/k 移动、y 复制引用 `/name`、
     /// Esc/q 关闭。
     fn skills(&mut self, key: KeyEvent) -> Option<Command> {
@@ -1064,6 +1083,7 @@ fn mode_name_of(mode: InputMode) -> &'static str {
         InputMode::Jobs => "jobs",
         InputMode::Settings => "settings",
         InputMode::Skills => "skills",
+        InputMode::Export => "export",
     }
 }
 

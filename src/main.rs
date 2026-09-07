@@ -495,9 +495,10 @@ async fn run_connected(eff: Effective, token: String, client: DshClient) -> Resu
                 Mode::Goal => InputMode::Goal,
                 // REQ-007：jobs 只读面板。
                 Mode::Jobs => InputMode::Jobs,
-                // REQ-007：settings / skills。
+                // REQ-007：settings / skills / export。
                 Mode::Settings => InputMode::Settings,
                 Mode::Skills => InputMode::Skills,
+                Mode::Export => InputMode::Export,
             };
             if let Some(command) = decoder.decode(mode, input) {
                 commands.extend(app.handle_command(command));
@@ -1048,6 +1049,30 @@ async fn execute_one(
                     generation,
                     error,
                 })),
+            }
+        }
+        // ---------- REQ-007：会话导出（AC-007-17） ----------
+        Cmd::ExportSession { session_id, path } => {
+            let Some(client) = client.as_ref() else {
+                let event = AppEvent::ExportFailed {
+                    error: ClientError::Transport("未连接（dsh web 不可达）".into()),
+                };
+                commands.extend(app.handle(event));
+                return;
+            };
+            match dshtui::api::export::download_export(
+                &client.http,
+                &client.base,
+                &session_id,
+                &path,
+            )
+            .await
+            {
+                Ok(receipt) => commands.extend(app.handle(AppEvent::ExportDone {
+                    bytes: receipt.bytes,
+                    path: receipt.final_path,
+                })),
+                Err(error) => commands.extend(app.handle(AppEvent::ExportFailed { error })),
             }
         }
         // ---------- REQ-007：settings / skills（AC-007-15~19） ----------
