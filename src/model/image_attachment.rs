@@ -88,6 +88,39 @@ pub fn media_type_from_path(path: &str) -> Result<MediaType, String> {
     Ok(MediaType(mt.to_string()))
 }
 
+/// Does this trimmed text look like a LOCAL path (never a remote URL)?
+/// Guard for "不把远程路径当本地读取" (AC-007-24): http(s):// and
+/// `dsh-attachment:`/session refs are not local paths.
+pub fn looks_like_local_path(line: &str) -> bool {
+    let t = line.trim();
+    if t.is_empty() || t.contains(char::is_whitespace) {
+        return false;
+    }
+    if t.contains("://") || t.contains("dsh-session:") || t.starts_with('@') {
+        return false; // URL / mention / session ref
+    }
+    // 绝对/相对/家目录/Windows 盘符形态。
+    t.starts_with('/')
+        || t.starts_with("./")
+        || t.starts_with("../")
+        || t.starts_with("~/")
+        || t.as_bytes()
+            .first()
+            .is_some_and(|c| c.is_ascii_alphabetic())
+            && t.as_bytes().get(1) == Some(&b':')
+}
+
+/// Classify composer draft lines that are image-path candidates: a whole-line
+/// trimmed token that looks local AND has a supported image extension.
+/// Non-candidate lines (prose, URLs, other paths) stay as text — never
+/// attempted as local file reads.
+pub fn image_path_lines(text: &str) -> Vec<&str> {
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && looks_like_local_path(l) && media_type_from_path(l).is_ok())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -137,5 +170,27 @@ mod tests {
         assert!(!s.inflight);
         s.inflight = true;
         assert!(s.inflight);
+    }
+
+    #[test]
+    fn classify_image_lines_and_local_path_guard_ac007_24() {
+        // 绝对路径 png/jpg/webp/gif 识别；URL/mention/含空白行不识别。
+        assert_eq!(
+            image_path_lines(
+                "/home/nd/a.png\n看一下这个图\nhttps://x.com/b.png\n@[s](dsh-session:s1)\n./c.jpeg"
+            ),
+            vec!["/home/nd/a.png", "./c.jpeg"]
+        );
+        assert_eq!(
+            image_path_lines("/a.txt\n/a.svg\nplain text here"),
+            Vec::<&str>::new()
+        );
+        assert_eq!(image_path_lines(""), Vec::<&str>::new());
+        // 路径判定防远程/引用误读。
+        assert!(!looks_like_local_path("https://x/y.png"));
+        assert!(!looks_like_local_path("@[部署](dsh-session:s1)"));
+        assert!(!looks_like_local_path("two words.png"));
+        assert!(looks_like_local_path("/abs/x.png"));
+        assert!(looks_like_local_path("C:\\x.png"));
     }
 }

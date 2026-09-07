@@ -1191,6 +1191,9 @@ pub struct AppState {
     pub external_edit: crate::model::ExternalEditState,
     /// REQ-007 AC-007-23：@ 提及候选（files+sessions 两源）。
     pub mention: crate::model::MentionState,
+    /// REQ-007 AC-007-24：本次发送在途的图片附件（submit 预检通过后暂存；
+    /// 发送后清空）。
+    pub pending_image_attachments: Vec<crate::model::ImageAttachment>,
     page_guard: PageGuard,
     /// 模型目录 fetch 单飞 generation（REQ-006 FR-006-01）：打开时自增，
     /// stale 响应（overlay 已关/已重开）直接丢弃（模式 15 in-flight 去重）。
@@ -1232,6 +1235,23 @@ pub struct AppState {
     view_temp_path: Option<std::path::PathBuf>,
     /// Non-Kitty viewer request target; stale completions must not launch a viewer.
     pub pending_viewer: Option<(SessionId, SessionSeq, AttachmentId)>,
+}
+
+/// REQ-007 AC-007-24：读取本地图片文件 → base64 inline ImageAttachment。
+/// 只读真实本地文件（路径须经 image_path_lines 预筛，URL/引用不落此路径）。
+/// 失败返回稳定可断言的中文错误串。
+fn read_image_attachment(path: &str) -> Result<crate::model::ImageAttachment, String> {
+    use base64::Engine as _;
+    let mt = crate::model::image_attachment::media_type_from_path(path)?;
+    let bytes = std::fs::read(path)
+        .map_err(|e| format!("图片读取失败（{path}）: {e}——已保留草稿，可修正后重发"))?;
+    let data_base64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    Ok(crate::model::ImageAttachment {
+        path: path.to_string(),
+        media_type: mt,
+        data_base64,
+        bytes: bytes.len(),
+    })
 }
 
 impl Default for AppState {
@@ -1279,6 +1299,7 @@ impl Default for AppState {
             keymap_override_lines: Vec::new(),
             external_edit: crate::model::ExternalEditState::default(),
             mention: crate::model::MentionState::default(),
+            pending_image_attachments: Vec::new(),
             page_guard: PageGuard::default(),
             catalog_generation: 0,
             want_backfill: false,
@@ -2699,6 +2720,9 @@ impl AppState {
     /// minted, the optimistic echo lands immediately, INSERT exits and
     /// exactly one `Cmd::SendPrompt` is produced; empty input (whitespace
     /// included) stays in INSERT and sends nothing (AC-002-02/03/13).
+    /// REQ-007 AC-007-24：整行本地图片路径（supported ext）→ 读取+base64 →
+    /// Image part（顺序 `[images..., text]`）；任何图片候选读取/超限失败 →
+    /// 保留草稿在 INSERT，可读提示，不自动重试。
     pub fn submit_input(&mut self, mode: PromptMode) -> Vec<Cmd> {
         if self.mode != Mode::Insert || !self.composer.visible {
             return vec![];
@@ -2706,18 +2730,67 @@ impl AppState {
         let Some(sid) = self.composer.active_session.clone() else {
             return vec![];
         };
-        let Some(d) = self.draft.as_mut() else {
-            return vec![];
+        let draft_text = {
+            let Some(d) = self.draft.as_mut() else {
+                return vec![];
+            };
+            if d.text.trim().is_empty() {
+                // Empty input: send nothing, stay in INSERT (AC-002-03).
+                return vec![];
+            }
+            d.text.clone()
         };
-        if d.text.trim().is_empty() {
-            // Empty input: send nothing, stay in INSERT (AC-002-03).
-            return vec![];
+        // ---------- AC-007-24：图片附件预检（失败保留草稿不发送） ----------
+        let image_lines = crate::model::image_attachment::image_path_lines(&draft_text);
+        if !image_lines.is_empty() {
+            let mut attachments: Vec<crate::model::ImageAttachment> = Vec::new();
+            for path in image_lines {
+                match read_image_attachment(path) {
+                    Ok(att) => attachments.push(att),
+                    Err(msg) => {
+                        self.notice = Some(msg);
+                        return vec![]; // 保留草稿在 INSERT
+                    }
+                }
+            }
+            // 官方 imageLimits 校验（投影缺省 → 无限制不强制）。
+            let limits = self.active_window().map(|w| {
+                crate::model::ProjectionSnapshot::new(w.projections().clone()).image_limits()
+            });
+            let state = crate::model::ImageAttachmentState {
+                pending: attachments.clone(),
+                inflight: false,
+                last_error_code: None,
+            };
+            let err = state.validate(
+                limits
+                    .as_ref()
+                    .and_then(|l| l.max_image_bytes.map(|v| v as usize)),
+                limits
+                    .as_ref()
+                    .and_then(|l| l.max_images_per_message.map(|v| v as usize)),
+                if limits.as_ref().is_some_and(|l| !l.media_types.is_empty()) {
+                    Some(&limits.as_ref().unwrap().media_types)
+                } else {
+                    None
+                },
+            );
+            if let Err(msg) = err {
+                self.notice = Some(msg);
+                return vec![]; // 保留草稿在 INSERT（不自动重试）
+            }
+            self.pending_image_attachments = attachments;
         }
         // take-once + single command queue = minimal in-flight guard
         // (pattern 15 lesson: unconverged async signals need in-flight
         // dedup; AC-002-13 blocks double-Enter).
-        let text = std::mem::take(&mut d.text);
-        d.cursor = 0;
+        let text = {
+            let Some(d) = self.draft.as_mut() else {
+                return vec![];
+            };
+            d.cursor = 0;
+            std::mem::take(&mut d.text)
+        };
         self.mode = Mode::Normal;
         self.composer.visible = false;
         self.composer.steer = false;
@@ -2729,15 +2802,61 @@ impl AppState {
         self.history.reset_nav();
         let request_id = SessionRequestId(crate::api::types::mint_request_id());
         // Optimistic echo: visible within one frame, occupies no seq
-        // (AC-002-02).
+        // (AC-002-02). 有图片时 echo 保留文本摘要（图片路径不展开）。
+        let echo_text = if self.pending_image_attachments.is_empty() {
+            text.clone()
+        } else {
+            let n = self.pending_image_attachments.len();
+            let base = text
+                .lines()
+                .filter(|l| {
+                    crate::model::image_attachment::image_path_lines(&text)
+                        .iter()
+                        .all(|p| l.trim() != *p)
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            if base.trim().is_empty() {
+                format!("[{} 张图片]", n)
+            } else {
+                format!("[{} 张图片] {}", n, base.trim())
+            }
+        };
         self.sessions
             .touch(&sid.0, self.window_cap)
-            .echo(request_id.clone(), &text);
+            .echo(request_id.clone(), &echo_text);
+        // content 顺序 `[image parts..., text]`（官方 web）。
+        let mut content: Vec<PromptContentPart> = Vec::new();
+        for att in std::mem::take(&mut self.pending_image_attachments) {
+            content.push(PromptContentPart::Image {
+                media_type: att.media_type.0,
+                data: att.data_base64,
+                name: std::path::Path::new(&att.path)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned()),
+            });
+        }
+        let text_part = text
+            .lines()
+            .filter(|l| {
+                crate::model::image_attachment::image_path_lines(&text)
+                    .iter()
+                    .all(|p| l.trim() != *p)
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !text_part.trim().is_empty() {
+            content.push(PromptContentPart::Text { text: text_part });
+        }
+        if content.is_empty() {
+            // 全部行都是图片但读取为空不应发生（前面已校验）；兜底纯文本。
+            content.push(PromptContentPart::Text { text });
+        }
         let request = PromptRequest {
             request_id: request_id.clone(),
             session_id: sid.clone(),
             mode,
-            content: vec![PromptContentPart::Text { text }],
+            content,
             client_time_zone: None,
         };
         vec![Cmd::SendPrompt {
@@ -7936,5 +8055,140 @@ mod tests {
         assert!(!s.mention.loading, "失败停 loading");
         assert_eq!(s.mention.last_error_code.as_deref(), Some("transport"));
         assert_eq!(s.mode, Mode::Mention, "失败不崩，可 Esc 手动输入");
+    }
+
+    // ---------- REQ-007 V0.4 图片附件发送（AC-007-24） ----------
+
+    fn temp_img(tag: &str, content: &[u8]) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("dshtui-img-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("photo.png");
+        std::fs::write(&file, content).unwrap();
+        (dir, file)
+    }
+
+    #[test]
+    fn submit_with_image_path_line_emits_image_part_ac007_24() {
+        use base64::Engine as _;
+        let (_dir, file) = temp_img("ok", b"\x89PNG-not-real-but-ok");
+        let path = file.to_string_lossy().into_owned();
+        let mut s = AppState::default();
+        let sid = SessionId("sess-i".into());
+        s.mode = Mode::Insert;
+        s.composer.visible = true;
+        s.composer.active_session = Some(sid.clone());
+        s.draft = Some(DraftState {
+            text: format!("看这张图\n{path}"),
+            cursor: 0,
+            bound_session: sid.clone(),
+        });
+        let cmds = s.submit_input(PromptMode::Queue);
+        let cmd = cmds
+            .iter()
+            .find(|c| matches!(c, Cmd::SendPrompt { .. }))
+            .expect("发出发送");
+        let (sid2, request) = match cmd {
+            Cmd::SendPrompt {
+                session_id,
+                request,
+            } => (session_id, request),
+            _ => unreachable!(),
+        };
+        assert_eq!(sid2, &sid);
+        // content 顺序 [image..., text]。
+        assert!(
+            matches!(&request.content[0], PromptContentPart::Image { .. }),
+            "首部为 Image part"
+        );
+        let text_len = request
+            .content
+            .iter()
+            .filter(|p| matches!(p, PromptContentPart::Text { .. }))
+            .count();
+        assert_eq!(text_len, 1, "文本部分保留（不含图片行）");
+        match &request.content[0] {
+            PromptContentPart::Image {
+                media_type, data, ..
+            } => {
+                assert_eq!(media_type, "image/png");
+                let decoded = base64::engine::general_purpose::STANDARD
+                    .decode(data)
+                    .unwrap();
+                assert_eq!(decoded, b"\x89PNG-not-real-but-ok");
+            }
+            _ => unreachable!(),
+        }
+        assert!(s.pending_image_attachments.is_empty(), "发送后清空在途");
+        let _ = std::fs::remove_dir_all(&_dir);
+    }
+
+    #[test]
+    fn submit_image_read_failure_keeps_draft_in_insert_ac007_24() {
+        let mut s = AppState::default();
+        let sid = SessionId("sess-i".into());
+        s.mode = Mode::Insert;
+        s.composer.visible = true;
+        s.composer.active_session = Some(sid.clone());
+        s.draft = Some(DraftState {
+            text: "/nonexistent/nope.png".into(),
+            cursor: 0,
+            bound_session: sid.clone(),
+        });
+        let cmds = s.submit_input(PromptMode::Queue);
+        assert!(cmds.is_empty(), "失败不发命令");
+        assert_eq!(s.mode, Mode::Insert, "保留 INSERT");
+        assert!(s.composer.visible, "composer 保留");
+        assert_eq!(
+            s.draft.as_ref().map(|d| d.text.as_str()),
+            Some("/nonexistent/nope.png")
+        );
+        assert!(s.notice.as_deref().unwrap_or("").contains("图片读取失败"));
+        // 恢复路径：修正为有效图片后能正常发送（不被旧失败污染）。
+        let (_dir, file) = temp_img("rec", b"abc");
+        s.draft.as_mut().unwrap().text = file.to_string_lossy().into_owned();
+        s.notice = None;
+        let cmds = s.submit_input(PromptMode::Queue);
+        assert!(
+            cmds.iter().any(|c| matches!(c, Cmd::SendPrompt { .. })),
+            "恢复后可发送"
+        );
+        let _ = std::fs::remove_dir_all(&_dir);
+    }
+
+    #[test]
+    fn submit_image_over_limit_blocks_with_notice_ac007_24() {
+        let (_dir, file) = temp_img("big", b"1234567890");
+        let path = file.to_string_lossy().into_owned();
+        let mut s = AppState::default();
+        let sid = SessionId("sess-i".into());
+        s.active_session = Some(sid.clone());
+        s.mode = Mode::Insert;
+        s.composer.visible = true;
+        s.composer.active_session = Some(sid.clone());
+        s.draft = Some(DraftState {
+            text: path.clone(),
+            cursor: 0,
+            bound_session: sid.clone(),
+        });
+        // 造 imageLimits 投影：单张 ≤5 字节 → 超限。
+        let window = s.sessions.touch(&sid.0, 50);
+        let _ = window.apply(Incoming::Snapshot {
+            cursor: None,
+            records: vec![],
+            has_more: false,
+            projections: Some(serde_json::json!({
+                "imageLimits": {"maxImageBytes": 5, "maxImagesPerMessage": 1,
+                                "mediaTypes": ["image/png"]}
+            })),
+        });
+        let cmds = s.submit_input(PromptMode::Queue);
+        assert!(cmds.is_empty(), "超限不发");
+        assert_eq!(s.mode, Mode::Insert);
+        assert!(
+            s.notice.as_deref().unwrap_or("").contains("上限"),
+            "notice={:?}",
+            s.notice
+        );
+        let _ = std::fs::remove_dir_all(&_dir);
     }
 }

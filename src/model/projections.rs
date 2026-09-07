@@ -71,6 +71,15 @@ pub struct ModelSelection {
     pub next: Option<String>,
 }
 
+/// imageLimits projection（REQ-007 AC-007-24；官方 `{maxImageBytes,
+/// maxImagesPerMessage, mediaTypes}`，`[未验证]` 宽容读取）。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ImageLimits {
+    pub max_image_bytes: Option<u64>,
+    pub max_images_per_message: Option<u64>,
+    pub media_types: Vec<String>,
+}
+
 /// Normalize one `modelSelection.lastUsed|next` value to a display string
 /// (string passthrough / object `provider/model`). Missing/unknown → None.
 fn wire_model_display(value: Option<&Value>) -> Option<String> {
@@ -285,6 +294,28 @@ impl ProjectionSnapshot {
             p.get("active").and_then(Value::as_bool).unwrap_or(false),
             p.get("pending").and_then(Value::as_bool).unwrap_or(false),
         ))
+    }
+
+    /// imageLimits projection（缺字段/未知形状 → 全 None/空 = 无限制语义，
+    /// 发送侧不强制校验）。
+    pub fn image_limits(&self) -> ImageLimits {
+        let Some(l) = self.raw.get("imageLimits") else {
+            return ImageLimits::default();
+        };
+        ImageLimits {
+            max_image_bytes: l.get("maxImageBytes").and_then(Value::as_u64),
+            max_images_per_message: l.get("maxImagesPerMessage").and_then(Value::as_u64),
+            media_types: l
+                .get("mediaTypes")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .map(String::from)
+                        .collect()
+                })
+                .unwrap_or_default(),
+        }
     }
 
     /// Subagent activity projection (`subagentTiming` / per-child) — `[未验证]`
