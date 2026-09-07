@@ -77,6 +77,10 @@ pub enum Mode {
     Goal,
     /// jobs 只读面板（REQ-007 FR-007-02 half；`:jobs` 打开）。
     Jobs,
+    /// settings 面板（REQ-007 FR-007-03 half；`:settings` 打开）。
+    Settings,
+    /// skills 目录（REQ-007 FR-007-03 half；`:skills` 打开）。
+    Skills,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -359,6 +363,10 @@ pub enum PaletteAction {
     OpenGoal,
     /// REQ-007：`:jobs` 打开 jobs 只读面板。
     OpenJobs,
+    /// REQ-007：`:settings` 打开 settings 面板。
+    OpenSettings,
+    /// REQ-007：`:skills` 打开 skills 目录。
+    OpenSkills,
 }
 
 /// 会话/workspace 写操作（REQ-006 FR-006-02 操作半；wire 端点 Step 1 已封装）。
@@ -627,9 +635,15 @@ impl CommandPaletteState {
                 desc: "删除光标所在 workspace（危险，二次确认）",
                 action: PaletteAction::DeleteWorkspace,
             },
-            CommandPaletteItem::V04 {
+            CommandPaletteItem::Local {
                 label: "settings",
-                desc: "设置面板（V0.4）",
+                desc: "settings 白名单编辑（AC-007-15/16）",
+                action: PaletteAction::OpenSettings,
+            },
+            CommandPaletteItem::Local {
+                label: "skills",
+                desc: "skills 目录只读 + 复制引用（AC-007-18）",
+                action: PaletteAction::OpenSkills,
             },
             CommandPaletteItem::Local {
                 label: "theme",
@@ -1060,6 +1074,26 @@ pub enum AppEvent {
         op: GoalMutation,
         error: ClientError,
     },
+    SettingsDescribed {
+        value: crate::api::types::SettingsDescribeValue,
+    },
+    SettingsDescribeFailed {
+        error: ClientError,
+    },
+    SettingsUpdated {
+        ns: String,
+        view: crate::api::types::SettingsNamespaceView,
+    },
+    SettingsUpdateFailed {
+        ns: String,
+        error: ClientError,
+    },
+    SkillsListed {
+        value: crate::api::types::SkillListValue,
+    },
+    SkillsListFailed {
+        error: ClientError,
+    },
 }
 
 /// Orchestration commands emitted by the reducer (executed by the run loop).
@@ -1212,6 +1246,17 @@ pub enum Cmd {
         request_id: String,
         op: GoalMutation,
     },
+    /// `settings/describe` 拉取（打开面板时一次）。
+    FetchSettingsDescribe,
+    /// `skills/list(sessionId)` 拉取。
+    FetchSkillsList,
+    /// `settings/update(ns, patch, expectedRevision)`（白名单 key 编辑 CAS）。
+    SettingsUpdate {
+        ns: String,
+        key: String,
+        value: serde_json::Value,
+        revision: u64,
+    },
 }
 
 #[derive(Debug)]
@@ -1304,6 +1349,10 @@ pub struct AppState {
     pub goal_input: bool,
     /// REQ-007 AC-007-13：jobs 只读镜像（session/control 帧维护）。
     pub jobs: crate::model::JobsPanelState,
+    /// REQ-007 AC-007-15/16：settings 面板。
+    pub settings: crate::model::SettingsPanelState,
+    /// REQ-007 AC-007-18：skills 目录。
+    pub skills: crate::model::SkillsCatalogState,
     page_guard: PageGuard,
     /// 模型目录 fetch 单飞 generation（REQ-006 FR-006-01）：打开时自增，
     /// stale 响应（overlay 已关/已重开）直接丢弃（模式 15 in-flight 去重）。
@@ -1414,6 +1463,8 @@ impl Default for AppState {
             goals: crate::model::GoalPanelState::default(),
             goal_input: false,
             jobs: crate::model::JobsPanelState::default(),
+            settings: crate::model::SettingsPanelState::default(),
+            skills: crate::model::SkillsCatalogState::default(),
             page_guard: PageGuard::default(),
             catalog_generation: 0,
             want_backfill: false,
@@ -2005,6 +2056,190 @@ impl AppState {
                 self.jobs.replace(crate::api::session::parse_jobs(jobs));
             }
             _ => {}
+        }
+    }
+
+    // ---------- REQ-007 V0.4 settings + skills（AC-007-15~19） ----------
+
+    /// 白名单可编辑 key 集（镜像 web UI；描述树只读展示其余标量）。
+    pub const SETTINGS_WHITELIST: [&'static str; 7] = [
+        "locale.preference",
+        "ui-theme.preference",
+        "ui-theme.fontSize",
+        "ui-chat.transcriptView",
+        "ui-conversation.busyEnter",
+        "agent-presets.default",
+        "permission.defaultPreset",
+    ];
+
+    pub fn open_settings_panel(&mut self) -> Vec<Cmd> {
+        self.settings.open();
+        self.mode = Mode::Settings;
+        vec![Cmd::FetchSettingsDescribe]
+    }
+
+    pub fn settings_described(&mut self, value: crate::api::types::SettingsDescribeValue) {
+        let mut rows = Vec::new();
+        for ns in &value.namespaces {
+            let user = ns.user.as_ref();
+            rows.extend(crate::model::flatten_namespace_rows(
+                &ns.ns,
+                &ns.value,
+                user,
+                &ns.secrets,
+                ns.revision,
+                &Self::SETTINGS_WHITELIST,
+            ));
+        }
+        self.settings.set_rows(rows, value.writable);
+    }
+
+    pub fn settings_describe_failed(&mut self, error: &ClientError) {
+        self.settings.loading = false;
+        self.settings.last_error_code = Some(error.code());
+    }
+
+    pub fn settings_updated(
+        &mut self,
+        _ns: &str,
+        _view: &crate::api::types::SettingsNamespaceView,
+    ) {
+        self.settings.edit_key = None;
+        self.settings.edit_buffer.clear();
+        self.notice = Some("settings 已更新（expectedRevision CAS）".into());
+        // 重新 describe 拉新 revision（视图刷新）。
+        self.settings.loading = true;
+    }
+
+    pub fn settings_update_failed(&mut self, _ns: &str, error: &ClientError) {
+        self.settings.last_error_code = Some(error.code());
+        self.notice = Some(format!("settings 更新失败: {error}"));
+        // CAS 冲突：清编辑态要求重拉 describe（不自动重试）。
+        if error.code().contains("CONFLICT") || error.code().contains("STALE") {
+            self.settings.edit_key = None;
+        }
+    }
+
+    /// settings 面板命令分流：编辑子阶段（Enter 提交/字符/Backspace/Esc）；
+    /// 列表态 j/k 移动、Enter 进编辑、Esc/q 关闭。
+    fn handle_settings_command(&mut self, cmd: crate::input::Command) -> Vec<Cmd> {
+        use crate::input::Command as C;
+        if self.settings.edit_key.is_some() {
+            match cmd {
+                C::PickerInput(t) => {
+                    self.settings.edit_buffer.push_str(&t);
+                    vec![]
+                }
+                C::PickerBackspace => {
+                    self.settings.edit_buffer.pop();
+                    vec![]
+                }
+                C::PickerConfirm => {
+                    let (ns, key, value, rev) = {
+                        let row = self
+                            .settings
+                            .rows
+                            .iter()
+                            .find(|r| Some(r.key.as_str()) == self.settings.edit_key.as_deref())
+                            .cloned();
+                        let Some(row) = row else {
+                            return vec![];
+                        };
+                        let mut parts = row.key.splitn(2, '.');
+                        let ns = parts.next().unwrap_or("").to_string();
+                        let key = parts.next().unwrap_or("").to_string();
+                        let value = serde_json::Value::String(self.settings.edit_buffer.clone());
+                        (ns, key, value, row.revision)
+                    };
+                    self.settings.edit_key = None;
+                    self.settings.edit_buffer.clear();
+                    vec![Cmd::SettingsUpdate {
+                        ns,
+                        key,
+                        value,
+                        revision: rev,
+                    }]
+                }
+                C::ClosePicker | C::Quit => {
+                    self.settings.edit_key = None;
+                    self.settings.edit_buffer.clear();
+                    vec![]
+                }
+                _ => vec![],
+            }
+        } else {
+            match cmd {
+                C::PickerDown => {
+                    self.settings.move_selection(1);
+                    vec![]
+                }
+                C::PickerUp => {
+                    self.settings.move_selection(-1);
+                    vec![]
+                }
+                C::PickerConfirm => {
+                    let Some(row) = self.settings.rows.get(self.settings.selected).cloned() else {
+                        return vec![];
+                    };
+                    if !self.settings.writable || row.secret {
+                        self.notice = Some("该 key 只读展示（白名单外/secret 不可编辑）".into());
+                        return vec![];
+                    }
+                    self.settings.edit_key = Some(row.key);
+                    self.settings.edit_buffer = row.value_display.clone();
+                    vec![]
+                }
+                C::ClosePicker | C::Quit => {
+                    self.settings.close();
+                    self.mode = Mode::Normal;
+                    vec![]
+                }
+                _ => vec![],
+            }
+        }
+    }
+
+    pub fn open_skills_panel(&mut self) -> Vec<Cmd> {
+        self.skills.open();
+        self.mode = Mode::Skills;
+        vec![Cmd::FetchSkillsList]
+    }
+
+    pub fn skills_listed(&mut self, value: crate::api::types::SkillListValue) {
+        self.skills.set_items(value.skills);
+    }
+
+    pub fn skills_list_failed(&mut self, error: &ClientError) {
+        self.skills.loading = false;
+        self.skills.last_error_code = Some(error.code());
+    }
+
+    /// skills 面板命令分流：j/k 移动、y 复制引用、Esc/q 关闭。
+    fn handle_skills_command(&mut self, cmd: crate::input::Command) -> Vec<Cmd> {
+        use crate::input::Command as C;
+        match cmd {
+            C::PickerDown => {
+                self.skills.move_selection(1);
+                vec![]
+            }
+            C::PickerUp => {
+                self.skills.move_selection(-1);
+                vec![]
+            }
+            C::YankContext => {
+                if let Some(ref_text) = self.skills.copy_ref() {
+                    self.notice = Some(format!("已复制 {ref_text}（执行走 / 斜杠入口）"));
+                    vec![Cmd::CopyToClipboard { text: ref_text }]
+                } else {
+                    vec![]
+                }
+            }
+            C::ClosePicker | C::Quit => {
+                self.skills.close();
+                self.mode = Mode::Normal;
+                vec![]
+            }
+            _ => vec![],
         }
     }
 
@@ -3026,6 +3261,32 @@ impl AppState {
                 self.goal_op_failed(&request_id, &op, &error);
                 vec![]
             }
+            // ---------- REQ-007 V0.4 settings + skills 回执 ----------
+            AppEvent::SettingsDescribed { value } => {
+                self.settings_described(value);
+                vec![]
+            }
+            AppEvent::SettingsDescribeFailed { error } => {
+                self.settings_describe_failed(&error);
+                vec![]
+            }
+            AppEvent::SettingsUpdated { ns, view } => {
+                self.settings_updated(&ns, &view);
+                // 更新成功 → 重拉 describe 同步 revision。
+                vec![Cmd::FetchSettingsDescribe]
+            }
+            AppEvent::SettingsUpdateFailed { ns, error } => {
+                self.settings_update_failed(&ns, &error);
+                vec![]
+            }
+            AppEvent::SkillsListed { value } => {
+                self.skills_listed(value);
+                vec![]
+            }
+            AppEvent::SkillsListFailed { error } => {
+                self.skills_list_failed(&error);
+                vec![]
+            }
         }
     }
 
@@ -3728,6 +3989,13 @@ impl AppState {
         if self.mode == Mode::Jobs {
             return self.handle_jobs_command(cmd);
         }
+        // REQ-007：settings / skills（AC-007-15~19）。
+        if self.mode == Mode::Settings {
+            return self.handle_settings_command(cmd);
+        }
+        if self.mode == Mode::Skills {
+            return self.handle_skills_command(cmd);
+        }
         match cmd {
             C::MoveDown
             | C::MoveUp
@@ -3876,6 +4144,9 @@ impl AppState {
                 Mode::Goal => vec![],
                 // REQ-007：jobs Esc 已在 handle_jobs_command 拦截。
                 Mode::Jobs => vec![],
+                // REQ-007：settings/skills Esc 已分流。
+                Mode::Settings => vec![],
+                Mode::Skills => vec![],
             },
             C::PickerDown => {
                 if self.approval.list_open && self.mode == Mode::Approval {
@@ -5045,6 +5316,8 @@ impl AppState {
                         PaletteAction::OpenSubagents => self.open_subagents(),
                         PaletteAction::OpenGoal => self.open_goal_panel(),
                         PaletteAction::OpenJobs => self.open_jobs_panel(),
+                        PaletteAction::OpenSettings => self.open_settings_panel(),
+                        PaletteAction::OpenSkills => self.open_skills_panel(),
                         PaletteAction::ForkSession
                         | PaletteAction::RenameSession
                         | PaletteAction::ArchiveSession
@@ -7901,7 +8174,18 @@ mod tests {
     fn palette_v04_and_local_actions() {
         let mut s = AppState::default();
         s.handle_command(C::OpenCommandPalette);
-        // V0.4 占位：Enter 不执行，仅提示，面板保持。
+        // settings 已是真实动作（V0.4 占位仅剩 keymap/export）。
+        let has_settings = s.command_palette.filtered().iter().any(|i| {
+            matches!(
+                i,
+                CommandPaletteItem::Local {
+                    label: "settings",
+                    ..
+                }
+            )
+        });
+        assert!(has_settings, "settings 已转真实入口");
+        // 仍为 V0.4 占位项（keymap）：Enter 不执行，仅提示，面板保持。
         let idx = s
             .command_palette
             .filtered()
@@ -7910,7 +8194,7 @@ mod tests {
                 matches!(
                     i,
                     CommandPaletteItem::V04 {
-                        label: "settings",
+                        label: "keymap",
                         ..
                     }
                 )
@@ -9134,5 +9418,131 @@ mod tests {
             },
         ]);
         assert_eq!(s.jobs.active_count(), 2, "running+stopping 计入");
+    }
+
+    // ---------- REQ-007 V0.4 settings + skills（AC-007-15~19） ----------
+
+    #[test]
+    fn settings_describe_flattens_whitelist_and_edit_cas_ac007_15_16() {
+        let mut s = AppState::default();
+        s.open_settings_panel();
+        assert_eq!(s.mode, Mode::Settings);
+        // describe 回执：白名单行。
+        let _ = s.handle(AppEvent::SettingsDescribed {
+            value: crate::api::types::SettingsDescribeValue {
+                writable: true,
+                has_document: true,
+                namespaces: vec![crate::api::types::SettingsNamespaceView {
+                    ns: "locale".into(),
+                    schema: serde_json::json!({}),
+                    value: serde_json::json!({"preference": "zh-CN"}),
+                    base: None,
+                    user: Some(serde_json::json!({"preference": "zh-CN"})),
+                    applies: "live".into(),
+                    secrets: vec![],
+                    revision: 7,
+                }],
+            },
+        });
+        assert!(!s.settings.loading);
+        assert_eq!(s.settings.rows.len(), 1, "白名单 locale.preference");
+        assert_eq!(s.settings.rows[0].value_display, "zh-CN");
+        assert!(s.settings.rows[0].user_set);
+        // Enter 编辑 → 输入 → Enter 提交 CAS。
+        let _ = s.handle_command(crate::input::Command::PickerConfirm);
+        assert!(s.settings.edit_key.is_some());
+        let _ = s.handle_command(crate::input::Command::PickerBackspace);
+        let _ = s.handle_command(crate::input::Command::PickerBackspace);
+        let _ = s.handle_command(crate::input::Command::PickerBackspace);
+        let _ = s.handle_command(crate::input::Command::PickerBackspace);
+        let _ = s.handle_command(crate::input::Command::PickerBackspace);
+        let _ = s.handle_command(crate::input::Command::PickerInput("en-US".into()));
+        let cmds = s.handle_command(crate::input::Command::PickerConfirm);
+        assert!(
+            cmds.iter().any(
+                |c| matches!(c, Cmd::SettingsUpdate { ns, key, revision, .. }
+                if ns == "locale" && key == "preference" && *revision == 7)
+            ),
+            "CAS revision 上送"
+        );
+        // 失败（stale/conflict）→ 错误显示 + 清编辑态。
+        let _ = s.handle(AppEvent::SettingsUpdateFailed {
+            ns: "locale".into(),
+            error: ClientError::Remote {
+                code: "SETTINGS_STALE_REVISION".into(),
+                message: "stale".into(),
+                class: ErrorClass::UserFacing,
+            },
+        });
+        assert_eq!(
+            s.settings.last_error_code.as_deref(),
+            Some("SETTINGS_STALE_REVISION")
+        );
+        assert!(s.settings.edit_key.is_none());
+    }
+
+    #[test]
+    fn settings_whitelist_only_and_secret_guard_ac007_16() {
+        // flatten_namespace_rows 只产出白名单 key（模块已测）；面板 Enter 在
+        // secret/只读行拒绝编辑。
+        let mut s = AppState::default();
+        s.settings.open();
+        s.settings.set_rows(
+            vec![crate::model::SettingsRow {
+                key: "credentials.token".into(),
+                namespace: "credentials".into(),
+                value_display: "••• (set)".into(),
+                user_set: true,
+                secret: true,
+                revision: 1,
+            }],
+            true,
+        );
+        s.mode = Mode::Settings;
+        let _ = s.handle_command(crate::input::Command::PickerConfirm);
+        assert!(s.settings.edit_key.is_none(), "secret 行拒绝编辑");
+        assert!(s.notice.as_deref().unwrap_or("").contains("只读"));
+    }
+
+    #[test]
+    fn skills_open_list_copy_ref_and_close_ac007_18() {
+        let mut s = AppState::default();
+        let sid = SessionId("sess-sk".into());
+        s.active_session = Some(sid.clone());
+        s.open_skills_panel();
+        assert_eq!(s.mode, Mode::Skills);
+        let _ = s.handle(AppEvent::SkillsListed {
+            value: crate::api::types::SkillListValue {
+                skills: vec![crate::api::types::SkillEntry {
+                    name: "bash".into(),
+                    description: "执行 shell".into(),
+                    when_to_use: None,
+                    model_invocable: true,
+                }],
+            },
+        });
+        assert_eq!(s.skills.items.len(), 1);
+        // y 复制引用 → CopyToClipboard。
+        let cmds = s.handle_command(crate::input::Command::YankContext);
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, Cmd::CopyToClipboard { text } if text == "/bash")),
+            "复制 /name"
+        );
+        // 失败 → error.code，面板保持。
+        let _ = s.handle(AppEvent::SkillsListFailed {
+            error: ClientError::Remote {
+                code: "PERMISSION_DENIED".into(),
+                message: "no".into(),
+                class: ErrorClass::PermissionDenied,
+            },
+        });
+        assert_eq!(
+            s.skills.last_error_code.as_deref(),
+            Some("PERMISSION_DENIED")
+        );
+        // 关闭。
+        let _ = s.handle_command(crate::input::Command::ClosePicker);
+        assert_eq!(s.mode, Mode::Normal);
     }
 }

@@ -18,7 +18,9 @@ pub mod monitor;
 pub mod outline;
 pub mod picker;
 pub mod search;
+pub mod settings;
 pub mod sidebar;
+pub mod skills;
 pub mod status;
 pub mod subagent;
 pub mod tabs;
@@ -119,6 +121,9 @@ pub fn render(frame: &mut Frame<'_>, app: &AppState) {
     goal::render(frame, frame.area(), app);
     // REQ-007：jobs 只读面板。
     jobs::render(frame, frame.area(), app);
+    // REQ-007：settings / skills 面板。
+    settings::render(frame, frame.area(), app);
+    skills::render(frame, frame.area(), app);
     // FR-001-07：帮助 overlay 最后渲染，位于 picker 之上。
     render_help(frame, frame.area(), app);
 }

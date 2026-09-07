@@ -495,6 +495,9 @@ async fn run_connected(eff: Effective, token: String, client: DshClient) -> Resu
                 Mode::Goal => InputMode::Goal,
                 // REQ-007：jobs 只读面板。
                 Mode::Jobs => InputMode::Jobs,
+                // REQ-007：settings / skills。
+                Mode::Settings => InputMode::Settings,
+                Mode::Skills => InputMode::Skills,
             };
             if let Some(command) = decoder.decode(mode, input) {
                 commands.extend(app.handle_command(command));
@@ -1045,6 +1048,72 @@ async fn execute_one(
                     generation,
                     error,
                 })),
+            }
+        }
+        // ---------- REQ-007：settings / skills（AC-007-15~19） ----------
+        Cmd::FetchSettingsDescribe => {
+            let Some(client) = client.as_ref() else {
+                let event = AppEvent::SettingsDescribeFailed {
+                    error: ClientError::Transport("未连接（dsh web 不可达）".into()),
+                };
+                commands.extend(app.handle(event));
+                return;
+            };
+            match dshtui::api::settings::describe(&client.http, &client.base).await {
+                Ok(value) => commands.extend(app.handle(AppEvent::SettingsDescribed { value })),
+                Err(error) => {
+                    commands.extend(app.handle(AppEvent::SettingsDescribeFailed { error }))
+                }
+            }
+        }
+        Cmd::FetchSkillsList => {
+            let Some(client) = client.as_ref() else {
+                let event = AppEvent::SkillsListFailed {
+                    error: ClientError::Transport("未连接（dsh web 不可达）".into()),
+                };
+                commands.extend(app.handle(event));
+                return;
+            };
+            let Some(sid) = app.active_session.clone() else {
+                let event = AppEvent::SkillsListFailed {
+                    error: ClientError::Transport("无活动会话".into()),
+                };
+                commands.extend(app.handle(event));
+                return;
+            };
+            match dshtui::api::skills::list(&client.http, &client.base, &sid.0).await {
+                Ok(value) => commands.extend(app.handle(AppEvent::SkillsListed { value })),
+                Err(error) => commands.extend(app.handle(AppEvent::SkillsListFailed { error })),
+            }
+        }
+        Cmd::SettingsUpdate {
+            ns,
+            key,
+            value,
+            revision,
+        } => {
+            let Some(client) = client.as_ref() else {
+                let event = AppEvent::SettingsUpdateFailed {
+                    ns,
+                    error: ClientError::Transport("未连接（dsh web 不可达）".into()),
+                };
+                commands.extend(app.handle(event));
+                return;
+            };
+            let patch = serde_json::json!({ key: value });
+            match dshtui::api::settings::update(
+                &client.http,
+                &client.base,
+                &ns,
+                patch,
+                Some(revision),
+            )
+            .await
+            {
+                Ok(view) => commands.extend(app.handle(AppEvent::SettingsUpdated { ns, view })),
+                Err(error) => {
+                    commands.extend(app.handle(AppEvent::SettingsUpdateFailed { ns, error }))
+                }
             }
         }
         // ---------- REQ-007：goal 写操作（FR-007-02，AC-007-11/12/14） ----------

@@ -46,6 +46,10 @@ pub enum InputMode {
     Goal,
     /// REQ-007 V0.4：jobs 只读面板（`:jobs`；AC-007-13）。
     Jobs,
+    /// REQ-007 V0.4：settings 面板（`:settings`；AC-007-15/16）。
+    Settings,
+    /// REQ-007 V0.4：skills 目录（`:skills`；AC-007-18）。
+    Skills,
 }
 
 /// Domain commands emitted by the input layer.
@@ -246,6 +250,8 @@ impl KeyDecoder {
             InputMode::Subagent => self.subagent(key),
             InputMode::Goal => self.goal(key),
             InputMode::Jobs => self.jobs(key),
+            InputMode::Settings => self.settings(key),
+            InputMode::Skills => self.skills(key),
         }
     }
 
@@ -645,6 +651,38 @@ impl KeyDecoder {
         }
     }
 
+    /// REQ-007 settings 面板键位（AC-007-15/16）：j/k 移动、Enter 进入编辑/
+    /// 提交（编辑子阶段字符/Backspace）、Esc/q 关闭/取消。
+    fn settings(&mut self, key: KeyEvent) -> Option<Command> {
+        self.pending_g = false;
+        match key.code {
+            KeyCode::Esc => Some(Command::ClosePicker),
+            KeyCode::Char('q') if key.modifiers.is_empty() => Some(Command::ClosePicker),
+            KeyCode::Char('j') if key.modifiers.is_empty() => Some(Command::PickerDown),
+            KeyCode::Char('k') if key.modifiers.is_empty() => Some(Command::PickerUp),
+            KeyCode::Enter if key.modifiers.is_empty() => Some(Command::PickerConfirm),
+            KeyCode::Backspace => Some(Command::PickerBackspace),
+            KeyCode::Char(c) if key.modifiers.is_empty() => {
+                Some(Command::PickerInput(c.to_string()))
+            }
+            _ => None,
+        }
+    }
+
+    /// REQ-007 skills 目录键位（AC-007-18）：j/k 移动、y 复制引用 `/name`、
+    /// Esc/q 关闭。
+    fn skills(&mut self, key: KeyEvent) -> Option<Command> {
+        self.pending_g = false;
+        match key.code {
+            KeyCode::Esc => Some(Command::ClosePicker),
+            KeyCode::Char('q') if key.modifiers.is_empty() => Some(Command::ClosePicker),
+            KeyCode::Char('j') if key.modifiers.is_empty() => Some(Command::PickerDown),
+            KeyCode::Char('k') if key.modifiers.is_empty() => Some(Command::PickerUp),
+            KeyCode::Char('y') if key.modifiers.is_empty() => Some(Command::YankContext),
+            _ => None,
+        }
+    }
+
     /// REQ-007 jobs 只读面板键位（AC-007-13）：j/k 移动、Esc/q 关闭。
     /// 官方 0.1.2-rc.1 无停止端点 → 无停止控制（wire 校正）。
     fn jobs(&mut self, key: KeyEvent) -> Option<Command> {
@@ -1024,6 +1062,8 @@ fn mode_name_of(mode: InputMode) -> &'static str {
         InputMode::Subagent => "subagent",
         InputMode::Goal => "goal",
         InputMode::Jobs => "jobs",
+        InputMode::Settings => "settings",
+        InputMode::Skills => "skills",
     }
 }
 
