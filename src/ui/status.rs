@@ -11,7 +11,7 @@ use crate::model::ProjectionSnapshot;
 use crate::ui::layout::{color_depth, ColorDepth};
 
 /// 快捷键提示行（FR-001-05，README 键位口径；[/] 搜索为 REQ-002 预留但仍展示）。
-const HINT_LINE: &str = "[i]输入 [/]搜索 [f]切换 [?]帮助 [q]退出";
+const HINT_LINE: &str = "[i]输入 [/]搜索 [f]切换 [gt]轨迹 [?]帮助 [q]退出";
 /// IMAGEVIEW 模式提示行（REQ-004 D-14/05 §10：`o` 系统查看器 `y` 复制路径
 /// `q` 关闭）。
 const IMAGE_HINT_LINE: &str = "[o]系统查看器 [y]复制路径 [q]关闭";

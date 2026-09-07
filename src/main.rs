@@ -315,6 +315,8 @@ async fn run_connected(eff: Effective, token: String, client: DshClient) -> Resu
     // REQ-004：启动检测一次 Kitty 能力（06 §6）+ 注入图片缓存预算。
     app.kitty_capable = dshtui::ui::image::kitty_supported();
     app.set_cache_budget(eff.perf.cache_bytes);
+    // REQ-005：详情列宽从 `[ui].details_width_cells` 注入（默认 45）。
+    app.details_width_cells = eff.ui.details_width_cells;
     let mut decoder = KeyDecoder::new();
     let mut client = Some(client);
     let mut mux: Option<Mux> = None;
