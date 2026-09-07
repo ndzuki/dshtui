@@ -12,7 +12,7 @@ use ratatui::style::Color;
 /// resolve through `Palette::color(role)`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Role {
-    // (Ord via derive)
+    // (Ord 由 derive 按声明序生成；无依赖外部排序)
     /// Normal foreground (default text).
     Normal,
     /// Accent (mode indicator, active highlights).
@@ -148,8 +148,7 @@ impl Palette {
             }
             resolved.insert(role, color);
         }
-        // Unknown roles in the override map are preserved-but-warned (config
-        // keeps them; the UI never crashes).
+        // 覆盖表里未知角色保留但警告（配置项不丢弃；UI 永不崩溃）。
         for key in overrides.keys() {
             if Role::from_key(key).is_none() {
                 warnings.push(format!("未知 palette 角色：{key:?}（忽略）"));

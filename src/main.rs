@@ -1102,8 +1102,9 @@ async fn execute_one(
             };
             commands.extend(app.handle(event));
         }
-        // ---------- REQ-007：主题切换持久化（AC-007-20/ADR-010） ----------
-        // 内联处理：此 arm 不应到达（run_connected 循环已拦截）。
+        // ---------- REQ-007 `:edit`（AC-007-25） ----------
+        // 内联处理（raw mode 挂起）：此 arm 不应到达（run_connected 循环已
+        // 拦截 Cmd::ExternalEdit）。
         Cmd::ExternalEdit { .. } => {
             app.last_error = Some("外部编辑器需主循环内联处理".into());
         }

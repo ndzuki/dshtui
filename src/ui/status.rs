@@ -178,6 +178,14 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         if let Some(title) = title {
             spans.push(Span::raw(format!(" {}", truncate(&title, 24))));
         }
+        // REQ-007 AC-007-01/07：打开中的 subagent child 状态条标 lineage
+        // （`◉subagent ▸ parent`，仅用登记实据）。
+        if let Some((parent_id, _child_id)) = app.active_subagent_parent() {
+            spans.push(Span::styled(
+                format!(" ◉subagent ▸ {parent_id}"),
+                Style::default().fg(Color::Cyan),
+            ));
+        }
         if let Some(cwd) = cwd {
             spans.push(Span::styled(
                 format!(" {}", truncate(&cwd, 30)),
@@ -734,5 +742,51 @@ mod tests {
             .unwrap();
         let text = rendered_text(&terminal);
         assert!(text.contains("◉plan"), "plan active chip, text={text}");
+    }
+
+    #[test]
+    fn subagent_child_lineage_shows_in_status_ac007_01_07() {
+        let mut app = crate::app::AppState::default();
+        let sid = crate::api::types::SessionId("c1".into());
+        app.active_session = Some(sid.clone());
+        // 打开 child 时登记 parent（open_subagent_child 写入）。
+        app.subagent_parents.insert("c1".into(), "p1".into());
+        let w = app.sessions.touch(&sid.0, 50);
+        let _ = w.apply(crate::model::Incoming::Snapshot {
+            cursor: None,
+            records: vec![],
+            has_more: false,
+            projections: Some(serde_json::json!({"running": false})),
+        });
+        let backend = ratatui::backend::TestBackend::new(120, 3);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render(frame, frame.area(), &app))
+            .unwrap();
+        let text = rendered_text(&terminal);
+        assert!(
+            text.contains("◉subagent ▸ p1"),
+            "child 打开态状态条显示 lineage, text={text}"
+        );
+        // 普通会话（未登记 parent）不显示该标记。
+        let mut app2 = crate::app::AppState::default();
+        let sid2 = crate::api::types::SessionId("s1".into());
+        app2.active_session = Some(sid2.clone());
+        let w2 = app2.sessions.touch(&sid2.0, 50);
+        let _ = w2.apply(crate::model::Incoming::Snapshot {
+            cursor: None,
+            records: vec![],
+            has_more: false,
+            projections: Some(serde_json::json!({"running": false})),
+        });
+        let mut terminal2 =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 3)).unwrap();
+        terminal2
+            .draw(|frame| render(frame, frame.area(), &app2))
+            .unwrap();
+        assert!(
+            !rendered_text(&terminal2).contains("subagent"),
+            "普通会话无 subagent 标记"
+        );
     }
 }
