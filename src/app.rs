@@ -343,6 +343,8 @@ pub enum PaletteAction {
     /// REQ-007：`:` theme 切换（dark↔light，立即重绘 + save_theme 持久化，
     /// AC-007-20）。
     ToggleTheme,
+    /// REQ-007：`:` `edit` —— 用 $EDITOR 编辑当前 composer 草稿（AC-007-25）。
+    EditWithEditor,
 }
 
 /// 会话/workspace 写操作（REQ-006 FR-006-02 操作半；wire 端点 Step 1 已封装）。
@@ -585,6 +587,11 @@ impl CommandPaletteState {
                 label: "theme",
                 desc: "主题切换 dark↔light（AC-007-20）",
                 action: PaletteAction::ToggleTheme,
+            },
+            CommandPaletteItem::Local {
+                label: "edit",
+                desc: "用 $EDITOR 编辑当前草稿（AC-007-25；composer 打开时可用）",
+                action: PaletteAction::EditWithEditor,
             },
             CommandPaletteItem::V04 {
                 label: "keymap",
@@ -945,6 +952,14 @@ pub enum AppEvent {
         op_name: String,
         error: ClientError,
     },
+    // ---------- REQ-007 V0.4 `:edit`（AC-007-25，prototype 验证） ----------
+    /// 外部编辑器退出后的回执（main 释放/恢复 raw mode 并执行 $EDITOR）。
+    ExternalEditDone {
+        ok: bool,
+        tmp_path: std::path::PathBuf,
+        text: String,
+        message: String,
+    },
 }
 
 /// Orchestration commands emitted by the reducer (executed by the run loop).
@@ -1068,6 +1083,12 @@ pub enum Cmd {
         theme: String,
         palette: std::collections::BTreeMap<String, String>,
     },
+    /// `:edit` 外部编辑器（main 内联：TerminalSession 释放/恢复 raw mode +
+    /// 前台运行 $EDITOR，AC-007-25）。
+    ExternalEdit {
+        tmp_path: std::path::PathBuf,
+        editor: String,
+    },
 }
 
 #[derive(Debug)]
@@ -1145,6 +1166,8 @@ pub struct AppState {
     /// REQ-007 AC-007-21：生效 `[keymap]` 覆盖差异行（帮助面板联动；
     /// 空 = 内置键位无覆盖）。
     pub keymap_override_lines: Vec<String>,
+    /// REQ-007 AC-007-25：外部编辑器挂起/回填状态机（`edit with $EDITOR`）。
+    pub external_edit: crate::model::ExternalEditState,
     page_guard: PageGuard,
     /// 模型目录 fetch 单飞 generation（REQ-006 FR-006-01）：打开时自增，
     /// stale 响应（overlay 已关/已重开）直接丢弃（模式 15 in-flight 去重）。
@@ -1231,6 +1254,7 @@ impl Default for AppState {
             palette: crate::ui::theme::Palette::default(),
             palette_overrides: std::collections::BTreeMap::new(),
             keymap_override_lines: Vec::new(),
+            external_edit: crate::model::ExternalEditState::default(),
             page_guard: PageGuard::default(),
             catalog_generation: 0,
             want_backfill: false,
@@ -1384,6 +1408,125 @@ impl AppState {
     pub fn clear_all_drafts(&mut self) {
         self.drafts.clear_all();
         self.draft_dirty = true;
+    }
+
+    // ---------- REQ-007 V0.4 `:edit` 外部编辑器（AC-007-25，prototype ✅） ----------
+
+    /// 解析 `$EDITOR`（`$VISUAL` 优先，回退 `$EDITOR`）；两者皆无 → None。
+    fn resolve_editor() -> Option<String> {
+        std::env::var("VISUAL")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .or_else(|| {
+                std::env::var("EDITOR")
+                    .ok()
+                    .filter(|v| !v.trim().is_empty())
+            })
+    }
+
+    /// 起始 `:edit`：把当前 composer 草稿写入 state 目录临时文件并挂起主循环
+    /// （返回 Cmd::ExternalEdit，main 释放 raw mode → 前台 $EDITOR → 恢复）。
+    pub fn external_edit_begin(&mut self) -> Vec<Cmd> {
+        if !self.composer.visible {
+            self.notice = Some("先打开 composer（i）再用 :edit 编辑草稿".into());
+            return vec![];
+        }
+        let Some(sid) = self.composer.active_session.clone() else {
+            self.notice = Some("无活动 composer 会话".into());
+            return vec![];
+        };
+        let draft_text = self
+            .draft
+            .as_ref()
+            .map(|d| d.text.clone())
+            .unwrap_or_default();
+        let Some(editor) = Self::resolve_editor() else {
+            self.notice = Some("未设置 $EDITOR（export EDITOR=vim）".into());
+            return vec![];
+        };
+        // 临时文件放 state 目录（~/.local/state/dshtui/，与主进程同文件系统；
+        // 编辑器子进程同一进程内可见——规避 /tmp 跨调用坑，TASK-002-pitfall）。
+        let base = crate::config::default_state_path();
+        let dir = base
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            self.notice = Some(format!("无法创建 state 目录: {e}"));
+            return vec![];
+        }
+        let tmp = dir.join(format!(
+            "edit-{}-{}.md",
+            sid.0,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0)
+        ));
+        if let Err(e) = std::fs::write(&tmp, &draft_text) {
+            self.notice = Some(format!("临时草稿写入失败: {e}"));
+            return vec![];
+        }
+        // 挂起模型（capture 原草稿供失败恢复）+ 退 composer 模态（编辑器占用屏）。
+        if !self.external_edit.suspend(
+            &draft_text,
+            tmp.to_string_lossy().into_owned(),
+            Some(editor.clone()),
+        ) {
+            self.notice = Some("已有 :edit 在运行".into());
+            return vec![];
+        }
+        self.mode = Mode::Normal;
+        self.composer.visible = false;
+        self.composer.active_session = None;
+        vec![Cmd::ExternalEdit {
+            tmp_path: tmp,
+            editor,
+        }]
+    }
+
+    /// 编辑器退出回执：成功 → 回填 composer 并恢复 INSERT；失败 → 保留原草稿
+    /// 安全回 composer（可读错误）。
+    pub fn external_edit_done(
+        &mut self,
+        ok: bool,
+        tmp_path: &std::path::Path,
+        text: &str,
+        message: &str,
+    ) {
+        let _ = std::fs::remove_file(tmp_path); // 会话内清理临时文件
+        let sid = self
+            .draft
+            .as_ref()
+            .map(|d| d.bound_session.clone())
+            .or_else(|| self.composer.active_session.clone());
+        if ok {
+            self.external_edit.settle();
+            self.draft = Some(DraftState {
+                text: text.to_string(),
+                cursor: text.chars().count(),
+                bound_session: sid.unwrap_or_else(|| SessionId(String::new())),
+            });
+            self.mode = Mode::Insert;
+            self.composer.visible = true;
+            self.composer.active_session = self.draft.as_ref().map(|d| d.bound_session.clone());
+            self.notice = Some("外部编辑器内容已回填 composer".into());
+        } else {
+            self.external_edit.fail(message.to_string());
+            // 保留原草稿（suspended_text 为空则新空草稿），恢复 INSERT。
+            let restored = self.external_edit.suspended_text.clone();
+            if let Some(sid) = sid {
+                self.draft = Some(DraftState {
+                    text: restored,
+                    cursor: 0,
+                    bound_session: sid,
+                });
+                self.mode = Mode::Insert;
+                self.composer.visible = true;
+                self.composer.active_session = self.draft.as_ref().map(|d| d.bound_session.clone());
+            }
+            self.last_error = Some(format!(":edit 失败: {message}"));
+        }
     }
 
     // ---------- reducer ----------
@@ -2171,6 +2314,16 @@ impl AppState {
                         tracing::warn!(error = %error, "{op_name} 失败");
                     }
                 }
+                vec![]
+            }
+            // ---------- REQ-007 V0.4 `:edit` 回执（AC-007-25） ----------
+            AppEvent::ExternalEditDone {
+                ok,
+                tmp_path,
+                text,
+                message,
+            } => {
+                self.external_edit_done(ok, &tmp_path, &text, &message);
                 vec![]
             }
         }
@@ -4033,6 +4186,10 @@ impl AppState {
                                 theme: self.palette.theme.clone(),
                                 palette: self.palette_overrides.clone(),
                             }]
+                        }
+                        PaletteAction::EditWithEditor => {
+                            // 面板已关闭；返回 :edit 起始 Cmd（若在 INSERT）。
+                            self.external_edit_begin()
                         }
                         PaletteAction::ForkSession
                         | PaletteAction::RenameSession
@@ -7360,5 +7517,123 @@ mod tests {
         assert_eq!(reg.session_ids().len(), 2);
         reg.clear_all();
         assert!(reg.is_empty());
+    }
+
+    // ---------- REQ-007 V0.4 `:edit`（AC-007-25） ----------
+
+    #[test]
+    fn external_edit_begin_requires_open_composer_ac007_25() {
+        let mut s = AppState::default();
+        // 未打开 composer → 提示不发命令。
+        let cmds = s.external_edit_begin();
+        assert!(cmds.is_empty());
+        assert!(s.notice.as_deref().unwrap_or("").contains("composer"));
+    }
+
+    #[test]
+    fn external_edit_begin_writes_tmp_and_emits_cmd_ac007_25() {
+        // 隔离 $EDITOR（静态锁防并行 env 竞争）。
+        static EDITOR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = EDITOR_LOCK.lock().unwrap();
+        let prev = std::env::var("EDITOR").ok();
+        let prev_visual = std::env::var("VISUAL").ok();
+        std::env::remove_var("VISUAL");
+        std::env::set_var("EDITOR", "/bin/true");
+        let mut s = AppState::default();
+        let sid = SessionId("sess-e".into());
+        s.composer.visible = true;
+        s.composer.active_session = Some(sid.clone());
+        s.draft = Some(DraftState {
+            text: "正在编辑的草稿".into(),
+            cursor: 3,
+            bound_session: sid.clone(),
+        });
+        let cmds = s.external_edit_begin();
+        let cmd = cmds
+            .iter()
+            .find(|c| matches!(c, Cmd::ExternalEdit { .. }))
+            .expect("发出 ExternalEdit");
+        let (tmp, editor) = match cmd {
+            Cmd::ExternalEdit { tmp_path, editor } => (tmp_path.clone(), editor.clone()),
+            _ => unreachable!(),
+        };
+        assert_eq!(editor, "/bin/true");
+        assert_eq!(
+            std::fs::read_to_string(&tmp).unwrap(),
+            "正在编辑的草稿",
+            "草稿写入临时文件"
+        );
+        assert_eq!(
+            s.external_edit.phase,
+            crate::model::external_edit::ExternalEditPhase::Editing
+        );
+        assert_eq!(s.mode, Mode::Normal, "编辑期间退 composer 模态");
+        let _ = std::fs::remove_file(&tmp);
+        match prev {
+            Some(v) => std::env::set_var("EDITOR", v),
+            None => std::env::remove_var("EDITOR"),
+        }
+        match prev_visual {
+            Some(v) => std::env::set_var("VISUAL", v),
+            None => std::env::remove_var("VISUAL"),
+        }
+    }
+
+    #[test]
+    fn external_edit_done_success_refills_composer_ac007_25() {
+        let dir = std::env::temp_dir().join(format!("dshtui-edit-done-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = dir.join("draft.md");
+        let mut s = AppState::default();
+        let sid = SessionId("sess-e".into());
+        s.composer.visible = false;
+        s.draft = Some(DraftState {
+            text: "old".into(),
+            cursor: 0,
+            bound_session: sid.clone(),
+        });
+        // 模拟 main：suspend + editor 写回 + ExternalEditDone。
+        s.external_edit
+            .suspend("old", tmp.to_string_lossy().into_owned(), Some("x".into()));
+        std::fs::write(&tmp, "EDITED-CONTENT").unwrap();
+        s.external_edit_done(true, &tmp, "EDITED-CONTENT", "");
+        assert_eq!(
+            s.draft.as_ref().map(|d| d.text.as_str()),
+            Some("EDITED-CONTENT"),
+            "成功回填 composer"
+        );
+        assert_eq!(s.mode, Mode::Insert);
+        assert!(s.composer.visible);
+        assert!(!tmp.exists(), "临时文件会话内清理");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn external_edit_done_failure_keeps_original_draft_ac007_25() {
+        let dir = std::env::temp_dir().join(format!("dshtui-edit-fail-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = dir.join("draft.md");
+        let mut s = AppState::default();
+        let sid = SessionId("sess-f".into());
+        s.composer.visible = false;
+        s.draft = Some(DraftState {
+            text: "原草稿".into(),
+            cursor: 0,
+            bound_session: sid.clone(),
+        });
+        s.external_edit.suspend(
+            "原草稿",
+            tmp.to_string_lossy().into_owned(),
+            Some("bad-editor".into()),
+        );
+        s.external_edit_done(false, &tmp, "", "编辑器 bad-editor 异常退出（exit 3）");
+        assert_eq!(
+            s.draft.as_ref().map(|d| d.text.as_str()),
+            Some("原草稿"),
+            "失败保留原草稿（恢复路径不污染）"
+        );
+        assert!(s.last_error.as_deref().unwrap_or("").contains(":edit 失败"));
+        assert_eq!(s.mode, Mode::Insert);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

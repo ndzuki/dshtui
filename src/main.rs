@@ -413,6 +413,36 @@ async fn run_connected(eff: Effective, token: String, client: DshClient) -> Resu
 
         // One command per iteration: list pagination renders between pages.
         if let Some(command) = commands.pop_front() {
+            // REQ-007 `:edit`（AC-007-25）：需要 TerminalSession 释放/恢复
+            // raw mode，主循环内联处理（execute_one 无 terminal 访问）。
+            if let Cmd::ExternalEdit { tmp_path, editor } = &command {
+                let mut outcome = Err(String::from("编辑器未运行"));
+                match terminal.suspend_for_editor() {
+                    Ok(()) => {
+                        outcome = run_editor_blocking(tmp_path, editor);
+                        if let Err(e) = terminal.resume_from_editor() {
+                            app.last_error = Some(format!("终端恢复失败: {e}"));
+                        }
+                    }
+                    Err(e) => {
+                        app.last_error = Some(format!("终端挂起失败: {e}"));
+                    }
+                }
+                let (ok, text, message) = match outcome {
+                    Ok(()) => {
+                        let text = std::fs::read_to_string(tmp_path).unwrap_or_default();
+                        (true, text, String::new())
+                    }
+                    Err(msg) => (false, String::new(), msg),
+                };
+                commands.extend(app.handle(AppEvent::ExternalEditDone {
+                    ok,
+                    tmp_path: tmp_path.clone(),
+                    text,
+                    message,
+                }));
+                continue;
+            }
             execute_one(
                 command,
                 &client,
@@ -489,6 +519,25 @@ fn flush_drafts(app: &mut AppState) {
             }
         }
         Err(e) => eprintln!("警告: drafts.toml 序列化失败: {e}"),
+    }
+}
+
+/// REQ-007 AC-007-25（prototype ✅）：前台运行 `$EDITOR <tmp>`（继承 stdio，
+/// raw mode 已由 TerminalSession::suspend_for_editor 释放）。错误串可断言。
+fn run_editor_blocking(tmp: &std::path::Path, editor: &str) -> Result<(), String> {
+    let status = std::process::Command::new(editor)
+        .arg(tmp)
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .status()
+        .map_err(|e| format!("无法启动编辑器 {editor}: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "编辑器 {editor} 异常退出（{status}），草稿已保留可重试"
+        ))
     }
 }
 
@@ -958,6 +1007,10 @@ async fn execute_one(
             commands.extend(app.handle(event));
         }
         // ---------- REQ-007：主题切换持久化（AC-007-20/ADR-010） ----------
+        // 内联处理：此 arm 不应到达（run_connected 循环已拦截）。
+        Cmd::ExternalEdit { .. } => {
+            app.last_error = Some("外部编辑器需主循环内联处理".into());
+        }
         Cmd::SaveUiTheme { theme, palette } => {
             let result = dshtui::config::save_theme_config(config_path, &theme, &palette);
             match result {
@@ -1569,6 +1622,23 @@ impl TerminalSession {
         Ok(Self {
             terminal: Terminal::new(backend)?,
         })
+    }
+
+    /// `:edit`（AC-007-25，prototype ✅）：释放 raw mode + 退出 alt-screen，
+    /// 让前台 `$EDITOR` 可交互；与 `enter()` 完全互逆，无需新终端框架。
+    fn suspend_for_editor(&mut self) -> io::Result<()> {
+        disable_raw_mode()?;
+        execute!(self.terminal.backend_mut(), LeaveAlternateScreen)?;
+        self.terminal.show_cursor()?;
+        Ok(())
+    }
+
+    /// 编辑器退出后恢复 raw mode + 重进 alt-screen（与挂起前一致）。
+    fn resume_from_editor(&mut self) -> io::Result<()> {
+        enable_raw_mode()?;
+        execute!(self.terminal.backend_mut(), EnterAlternateScreen)?;
+        self.terminal.clear()?;
+        Ok(())
     }
 }
 
