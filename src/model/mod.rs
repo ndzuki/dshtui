@@ -10,6 +10,7 @@ pub mod image;
 pub mod projections;
 pub mod search;
 pub mod session;
+pub mod trajectory;
 pub mod workspace;
 pub mod yank;
 

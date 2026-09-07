@@ -423,3 +423,591 @@ fn image_block_identity_is_extracted_from_block_image_only() {
     })
     .is_none());
 }
+
+// ============================================================================
+// REQ-005 V0.3 轨迹投影（TASK-005 Step 1）—— Seam = TrajectoryWindow 公共方法
+// （apply/view/toggle_group/row/group_of/raw_rows），纯内存无 IO（计划 Step 1
+// 测试 Seam 行）。验收：AC-005-02/06/07/08/12。
+// ============================================================================
+
+use dshtui::api::types::ChunkRow;
+use dshtui::model::trajectory::{
+    FoldState, GroupId, RowId, TrajEffect, TrajIncoming, TrajKind, TrajectoryStore,
+    TrajectoryWindow,
+};
+
+/// 轨迹行事件构造（含官方 wire 字段实读映射：callId/arguments/message/error/
+/// meta/usage/request-header reason，REQ-005 FR-005-02/03 事实修正）。
+fn traj_event(seq: u64, event_type: &str, data: serde_json::Value) -> SessionWireEvent {
+    SessionWireEvent {
+        event_type: event_type.to_string(),
+        seq: Some(SessionSeq(seq)),
+        time: Some(1_700_000_000_000 + seq as i64),
+        request_id: None,
+        ignorable: None,
+        source_event_seqs: None,
+        surface_op: None,
+        data: Some(data),
+    }
+}
+
+fn traj_record(seq: u64, event_type: &str, data: serde_json::Value) -> SessionHistoryRecord {
+    SessionHistoryRecord::Event {
+        event: traj_event(seq, event_type, data),
+    }
+}
+
+/// 27 turn / 1144 step 合成轨迹 fixture（每 turn 一轮 user→step→assistant→
+/// tool/call→tool/result，边界事件齐全；复用 REQ-001 §8 27turn 口径，D-26）。
+fn synth_trajectory(turns: u64, steps: usize) -> Vec<SessionHistoryRecord> {
+    let mut seq = 1u64;
+    let mut out = Vec::with_capacity(steps * 6 + turns as usize * 2);
+    let mut step_done = 0usize;
+    for turn in 1..=turns {
+        out.push(traj_record(
+            seq,
+            "turn/start",
+            serde_json::json!({"turn": turn, "reason": "user-prompt"}),
+        ));
+        seq += 1;
+        let mut step = 1u64;
+        while step_done < steps {
+            out.push(traj_record(
+                seq,
+                "user/message",
+                serde_json::json!({"turn": turn, "step": step, "content": format!("user {turn}-{step}")}),
+            ));
+            seq += 1;
+            out.push(traj_record(
+                seq,
+                "step/start",
+                serde_json::json!({"turn": turn, "step": step, "reason": "max"}),
+            ));
+            seq += 1;
+            out.push(traj_record(
+                seq,
+                "assistant/message",
+                serde_json::json!({
+                    "turn": turn, "step": step,
+                    "content": format!("assistant {turn}-{step}"),
+                    "usage": {"input": 10, "output": 20, "cacheRead": 5, "cacheWrite": 3, "think": 7},
+                }),
+            ));
+            seq += 1;
+            out.push(traj_record(
+                seq,
+                "tool/call",
+                serde_json::json!({"turn": turn, "step": step, "callId": format!("c{turn}-{step}"), "name": "bash", "arguments": "{\"command\":\"ls\"}"}),
+            ));
+            seq += 1;
+            out.push(traj_record(
+                seq,
+                "tool/result",
+                serde_json::json!({"turn": turn, "step": step, "callId": format!("c{turn}-{step}"), "message": "ok", "meta": {"diff": "x"}}),
+            ));
+            seq += 1;
+            out.push(traj_record(
+                seq,
+                "step/end",
+                serde_json::json!({"turn": turn, "step": step}),
+            ));
+            seq += 1;
+            step += 1;
+            step_done += 1;
+        }
+        out.push(traj_record(
+            seq,
+            "turn/end",
+            serde_json::json!({"turn": turn, "reason": "stop"}),
+        ));
+        seq += 1;
+    }
+    out
+}
+
+#[test]
+fn trajectory_snapshot_projects_boundary_rows_and_chunks_ac005_06() {
+    // AC-005-06：TrajectoryWindow 独立投影保留边界行（step/start、step/end、
+    // turn/start、turn/end、request/header）+ packed chunk rows，无逐 delta
+    // 展开（D-23）。
+    let mut w = TrajectoryWindow::new(200);
+    let records = vec![
+        traj_record(
+            1,
+            "request/header",
+            serde_json::json!({"reason": "initial"}),
+        ),
+        traj_record(2, "turn/start", serde_json::json!({"turn": 1})),
+        traj_record(
+            3,
+            "user/message",
+            serde_json::json!({"turn": 1, "step": 1, "content": "部署排查"}),
+        ),
+        traj_record(
+            4,
+            "step/start",
+            serde_json::json!({"turn": 1, "step": 1, "reason": "max"}),
+        ),
+        traj_record(
+            5,
+            "assistant/message",
+            serde_json::json!({"turn": 1, "step": 1}),
+        ),
+        SessionHistoryRecord::Chunks {
+            event: ChunkRow::TextChunks(dshtui::api::types::ChunkData {
+                texts: vec!["packed".into(), " chunks".into()],
+                turn: Some(1),
+                step: Some(1),
+                ..Default::default()
+            }),
+        },
+        traj_record(
+            6,
+            "tool/call",
+            serde_json::json!({"turn": 1, "step": 1, "callId": "c1", "name": "bash", "arguments": "{}"}),
+        ),
+        traj_record(
+            7,
+            "tool/result",
+            serde_json::json!({"turn": 1, "step": 1, "callId": "c1", "message": "ok", "meta": {"diff": "a"}}),
+        ),
+        traj_record(8, "step/end", serde_json::json!({"turn": 1, "step": 1})),
+        traj_record(
+            9,
+            "turn/end",
+            serde_json::json!({"turn": 1, "reason": "stop"}),
+        ),
+        traj_record(
+            10,
+            "compaction/summary",
+            serde_json::json!({"summary": "pruned 2 turns"}),
+        ),
+    ];
+    let eff = w.apply(TrajIncoming::Snapshot {
+        cursor: None,
+        records,
+        has_more: false,
+        projections: None,
+    });
+    assert_eq!(eff, TrajEffect::Rebuilt);
+    let kinds: Vec<TrajKind> = w.raw_rows().map(|r| r.kind()).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            TrajKind::RequestHeader,
+            TrajKind::TurnStart,
+            TrajKind::UserMessage,
+            TrajKind::StepStart,
+            TrajKind::AssistantMessage,
+            TrajKind::ToolCall,
+            TrajKind::ToolResult,
+            TrajKind::StepEnd,
+            TrajKind::TurnEnd,
+            TrajKind::Compaction,
+        ],
+        "边界行全部保留、无逐 delta 展开"
+    );
+    // packed chunks 汇总进 assistant 摘要（不是独立行）。
+    let asst = w
+        .raw_rows()
+        .find(|r| r.kind() == TrajKind::AssistantMessage)
+        .unwrap();
+    assert_eq!(asst.summary(), "packed chunks");
+    // 字段级映射：callId/arguments/meta/error/usage/reason。
+    let call = w
+        .raw_rows()
+        .find(|r| r.kind() == TrajKind::ToolCall)
+        .unwrap();
+    assert_eq!(call.call_id(), Some("c1"));
+    assert_eq!(call.name(), Some("bash"));
+    assert_eq!(
+        call.args_raw().and_then(|v| v.as_str()),
+        Some("{}"),
+        "arguments 原始 JSON 字符串原样保留"
+    );
+    let result = w
+        .raw_rows()
+        .find(|r| r.kind() == TrajKind::ToolResult)
+        .unwrap();
+    assert!(result.meta_has_diff(), "meta 存在 → diff 来源");
+    assert!(!result.is_error());
+    let header = w.raw_rows().next().unwrap();
+    assert_eq!(header.reason(), Some("initial"));
+}
+
+#[test]
+fn trajectory_27turn_1144step_ordered_window_and_tool_locatable_ac005_02() {
+    // AC-005-02：27 turn/1144 step 会话事件链完整（窗口内严格升序、无空洞）
+    // 且可定位任意 tool/call（RowId/seq 身份稳定）。
+    let mut w = TrajectoryWindow::new(200);
+    let records = synth_trajectory(27, 1144);
+    let _ = w.apply(TrajIncoming::Snapshot {
+        cursor: None,
+        records,
+        has_more: true,
+        projections: None,
+    });
+    assert_eq!(w.len(), 200, "窗口上限 200（逐出最旧留 seq 锚）");
+    let seqs: Vec<u64> = w.raw_rows().map(|r| r.seq().0).collect();
+    let sorted = {
+        let mut s = seqs.clone();
+        s.sort_unstable();
+        s
+    };
+    assert_eq!(seqs, sorted, "严格升序无乱序");
+    assert!(
+        seqs.windows(2).all(|p| p[1] == p[0] + 1),
+        "无空洞: {seqs:?}"
+    );
+    // 窗口内任一 tool/call 可定位（按 seq + 稳定 RowId）。
+    for row in w.raw_rows().filter(|r| r.kind() == TrajKind::ToolCall) {
+        let by_id = w.row(row.id()).expect("RowId 可定位");
+        assert_eq!(by_id.seq(), row.seq());
+    }
+    assert!(w.tail_seq().is_some() && w.head_seq().is_some());
+}
+
+#[test]
+fn trajectory_page_prepend_no_dup_no_gap_and_has_more_false_ac005_07() {
+    // AC-005-07：向上翻页前插合并无重复无空洞；hasMore=false 到顶；边界行
+    // 不丢（复用 REQ-001 AC-001-03/11 口径）。
+    let mut w = TrajectoryWindow::new(200);
+    w.apply(TrajIncoming::Snapshot {
+        cursor: Some(SessionLogOffset(5)),
+        records: vec![
+            traj_record(4, "step/start", serde_json::json!({"turn": 1, "step": 1})),
+            traj_record(5, "user/message", serde_json::json!({"content": "a"})),
+        ],
+        has_more: true,
+        projections: None,
+    });
+    let eff = w.apply(TrajIncoming::Page {
+        records: vec![
+            traj_record(1, "turn/start", serde_json::json!({"turn": 1})),
+            traj_record(
+                2,
+                "request/header",
+                serde_json::json!({"reason": "initial"}),
+            ),
+            // 与窗口重叠的行：去重不重复插入。
+            traj_record(4, "step/start", serde_json::json!({"turn": 1, "step": 1})),
+        ],
+        has_more: Some(false),
+    });
+    assert_eq!(
+        eff,
+        TrajEffect::HeadPrepend {
+            inserted: 2,
+            anchor_shift: 2
+        }
+    );
+    assert!(!w.head_has_more(), "hasMore=false → 到顶");
+    let seqs: Vec<u64> = w.raw_rows().map(|r| r.seq().0).collect();
+    assert_eq!(seqs, vec![1, 2, 4, 5], "无重复无空洞、边界行不丢");
+    // 全重叠 → Noop。
+    assert_eq!(
+        w.apply(TrajIncoming::Page {
+            records: vec![traj_record(1, "turn/start", serde_json::json!({"turn": 1}))],
+            has_more: None,
+        }),
+        TrajEffect::Noop
+    );
+}
+
+#[test]
+fn trajectory_reconnect_snapshot_reconciles_seq_gap_ac005_08() {
+    // AC-005-08（模型侧）：断网恢复后 snapshot 重建 + 按 seq 对账补齐缺口、
+    // 事件链完整；旧索引清空后旧 seq 可重入。
+    let mut w = TrajectoryWindow::new(200);
+    w.apply(TrajIncoming::Snapshot {
+        cursor: None,
+        records: vec![traj_record(
+            10,
+            "user/message",
+            serde_json::json!({"content": "a"}),
+        )],
+        has_more: true,
+        projections: None,
+    });
+    w.apply(TrajIncoming::FollowEvent(traj_event(
+        11,
+        "assistant/message",
+        serde_json::json!({}),
+    )));
+    // 重连快照：只带回 seq 10（缺口 11 由 follow 尾页补齐）。
+    w.apply(TrajIncoming::Snapshot {
+        cursor: Some(SessionLogOffset(10)),
+        records: vec![traj_record(
+            10,
+            "user/message",
+            serde_json::json!({"content": "a"}),
+        )],
+        has_more: true,
+        projections: None,
+    });
+    // 旧 seq 可重入（索引已清）：补齐缺口后链完整。
+    assert_eq!(
+        w.apply(TrajIncoming::FollowEvent(traj_event(
+            11,
+            "assistant/message",
+            serde_json::json!({}),
+        ))),
+        TrajEffect::TailAppended { appended: 1 }
+    );
+    let seqs: Vec<u64> = w.raw_rows().map(|r| r.seq().0).collect();
+    assert_eq!(seqs, vec![10, 11], "对账补齐后事件链完整");
+}
+
+#[test]
+fn trajectory_seq_request_id_dedup_and_eviction_anchor_ac005_07_08() {
+    let mut w = TrajectoryWindow::new(200);
+    w.apply(TrajIncoming::Snapshot {
+        cursor: None,
+        records: vec![traj_record(
+            1,
+            "user/message",
+            serde_json::json!({"content": "a"}),
+        )],
+        has_more: true,
+        projections: None,
+    });
+    // requestId 幂等：同 rid 不同 seq 重放跳过（D-4/REQ-001 口径）。
+    let mut e = traj_event(2, "assistant/message", serde_json::json!({}));
+    e.request_id = Some("r1".into());
+    assert_eq!(
+        w.apply(TrajIncoming::FollowEvent(e.clone())),
+        TrajEffect::TailAppended { appended: 1 }
+    );
+    let mut replay = e.clone();
+    replay.seq = Some(SessionSeq(3));
+    assert_eq!(w.apply(TrajIncoming::FollowEvent(replay)), TrajEffect::Noop);
+    // seq 去重。
+    assert_eq!(w.apply(TrajIncoming::FollowEvent(e)), TrajEffect::Noop);
+    assert_eq!(w.len(), 2);
+    // 恢复路径：去重拒绝后新事件正常落地（不被旧失败状态污染）。
+    assert_eq!(
+        w.apply(TrajIncoming::FollowEvent(traj_event(
+            4,
+            "turn/end",
+            serde_json::json!({"turn": 1}),
+        ))),
+        TrajEffect::TailAppended { appended: 1 }
+    );
+    // 小窗口逐出留锚：已逐出 seq 的 page 重放 Noop。
+    let mut small = TrajectoryWindow::new(2);
+    for s in 1..=3 {
+        small.apply(TrajIncoming::FollowEvent(traj_event(
+            s,
+            "user/message",
+            serde_json::json!({"content": format!("{s}")}),
+        )));
+    }
+    assert_eq!(small.len(), 2);
+    assert_eq!(
+        small.apply(TrajIncoming::Page {
+            records: vec![traj_record(
+                1,
+                "user/message",
+                serde_json::json!({"content": "1"})
+            )],
+            has_more: None,
+        }),
+        TrajEffect::Noop,
+        "已逐出的 seq 锚点直接丢弃，不重复加载"
+    );
+}
+
+#[test]
+fn trajectory_fold_concurrent_append_keeps_all_rows_ac005_12() {
+    // AC-005-12：turn/assistant 折叠正确且不丢行；折叠中并发 append 的事件
+    // 展开后完整入组、不抖动。
+    let mut w = TrajectoryWindow::new(200);
+    let snapshot = vec![
+        traj_record(1, "turn/start", serde_json::json!({"turn": 1})),
+        traj_record(2, "step/start", serde_json::json!({"turn": 1, "step": 1})),
+        traj_record(
+            3,
+            "assistant/message",
+            serde_json::json!({"turn": 1, "step": 1, "content": "a1"}),
+        ),
+        traj_record(
+            4,
+            "tool/call",
+            serde_json::json!({"turn": 1, "step": 1, "callId": "c1", "name": "bash", "arguments": "{}"}),
+        ),
+        traj_record(
+            5,
+            "tool/result",
+            serde_json::json!({"turn": 1, "step": 1, "callId": "c1", "message": "ok"}),
+        ),
+        traj_record(6, "step/end", serde_json::json!({"turn": 1, "step": 1})),
+        traj_record(7, "turn/end", serde_json::json!({"turn": 1})),
+        traj_record(8, "turn/start", serde_json::json!({"turn": 2})),
+        traj_record(9, "step/start", serde_json::json!({"turn": 2, "step": 2})),
+        traj_record(
+            10,
+            "assistant/message",
+            serde_json::json!({"turn": 2, "step": 2, "content": "a2"}),
+        ),
+        traj_record(11, "turn/end", serde_json::json!({"turn": 2})),
+    ];
+    w.apply(TrajIncoming::Snapshot {
+        cursor: None,
+        records: snapshot,
+        has_more: true,
+        projections: None,
+    });
+    let mut fold = FoldState::default();
+    // z：折叠 assistant 组（turn 1 step 1）→ 组首可见、成员隐藏。
+    let asst_id = w
+        .raw_rows()
+        .find(|r| r.kind() == TrajKind::AssistantMessage && r.turn() == Some(1))
+        .unwrap()
+        .id();
+    assert!(w.toggle_group(&mut fold, asst_id));
+    let view: Vec<TrajKind> = w.view(&fold).into_iter().map(|r| r.kind()).collect();
+    assert_eq!(
+        view,
+        vec![
+            TrajKind::TurnStart,
+            TrajKind::StepStart,
+            TrajKind::AssistantMessage, // 组首
+            TrajKind::StepEnd,
+            TrajKind::TurnEnd,
+            TrajKind::TurnStart,
+            TrajKind::StepStart,
+            TrajKind::AssistantMessage,
+            TrajKind::TurnEnd,
+        ],
+        "折叠 assistant 组：tool/call+tool/result 隐藏、其余不丢"
+    );
+    // 并发 append：同组新 tool/call + tool/result（seq 12/13，无 step/end 边界）。
+    w.apply(TrajIncoming::FollowEvent(traj_event(
+        12,
+        "tool/call",
+        serde_json::json!({"turn": 2, "step": 2, "callId": "c2", "name": "grep", "arguments": "{}"}),
+    )));
+    w.apply(TrajIncoming::FollowEvent(traj_event(
+        13,
+        "tool/result",
+        serde_json::json!({"turn": 2, "step": 2, "callId": "c2", "message": "hit"}),
+    )));
+    // 折叠 turn 2 的 assistant 组再展开（za）→ 新事件完整入组不丢行。
+    let asst2_id = w
+        .raw_rows()
+        .find(|r| r.kind() == TrajKind::AssistantMessage && r.turn() == Some(2))
+        .unwrap()
+        .id();
+    assert!(w.toggle_group(&mut fold, asst2_id));
+    let before: Vec<u64> = w.view(&fold).into_iter().map(|r| r.seq().0).collect();
+    assert_eq!(
+        before.iter().filter(|s| **s == 12 || **s == 13).count(),
+        0,
+        "折叠中 append 的成员行隐藏"
+    );
+    assert!(!w.toggle_group(&mut fold, asst2_id), "za 展开");
+    let after: Vec<u64> = w.view(&fold).into_iter().map(|r| r.seq().0).collect();
+    assert_eq!(
+        after.iter().filter(|s| **s == 12 || **s == 13).count(),
+        2,
+        "展开后新事件完整入组: {after:?}"
+    );
+    // turn 折叠：仅组首可见。
+    let turn_id = w
+        .raw_rows()
+        .find(|r| r.kind() == TrajKind::TurnStart && r.turn() == Some(1))
+        .unwrap()
+        .id();
+    assert!(w.toggle_group(&mut fold, turn_id));
+    let view: Vec<u64> = w.view(&fold).into_iter().map(|r| r.seq().0).collect();
+    let turn1: Vec<u64> = view
+        .iter()
+        .copied()
+        .filter(|s| *s >= 1 && *s <= 7)
+        .collect();
+    assert_eq!(turn1, vec![1], "turn 1 折叠：仅组首 turn/start 可见");
+    assert!(view.contains(&8), "turn 2 不受影响");
+}
+
+#[test]
+fn trajectory_unknown_event_preserved_and_missing_seq_skipped() {
+    let mut w = TrajectoryWindow::new(200);
+    w.apply(TrajIncoming::Snapshot {
+        cursor: None,
+        records: vec![
+            traj_record(9, "future/mystery", serde_json::json!({"k": "v"})),
+            traj_record(10, "user/message", serde_json::json!({"content": "ok"})),
+        ],
+        has_more: true,
+        projections: None,
+    });
+    let unknown = w.raw_rows().next().unwrap();
+    assert_eq!(unknown.kind(), TrajKind::Unknown);
+    assert_eq!(unknown.event_type(), "future/mystery");
+    assert_eq!(
+        unknown
+            .raw()
+            .and_then(|v| v.get("k"))
+            .and_then(|v| v.as_str()),
+        Some("v")
+    );
+    // 无 seq 事件跳过（入日志不崩溃，REQ §6）。
+    let mut e = traj_event(99, "user/message", serde_json::json!({"content": "x"}));
+    e.seq = None;
+    assert_eq!(w.apply(TrajIncoming::FollowEvent(e)), TrajEffect::Noop);
+    assert_eq!(w.len(), 2);
+}
+
+#[test]
+fn trajectory_store_lru_keeps_three_recent_windows() {
+    // REQ-005 §5：多会话轨迹缓存仅最近 3 窗口。
+    let mut store = TrajectoryStore::new(3);
+    store.touch("a", 200);
+    store.touch("b", 200);
+    store.touch("c", 200);
+    store.touch("d", 200);
+    assert!(store.get("a").is_none(), "LRU 逐出最久未用");
+    assert!(store.get("b").is_some());
+    store.touch("b", 200);
+    store.touch("e", 200);
+    assert!(store.get("c").is_none());
+    assert!(store.get("b").is_some());
+}
+
+#[test]
+fn trajectory_row_id_stable_across_prepend_and_toggle() {
+    // RowId 单调不回收：前插/折叠/重算后身份稳定（详情锚点防串、命中跳转
+    // 零抖动，DESIGN-IT-TWICE hybrid 约束）。
+    let mut w = TrajectoryWindow::new(200);
+    w.apply(TrajIncoming::Snapshot {
+        cursor: None,
+        records: vec![traj_record(
+            5,
+            "user/message",
+            serde_json::json!({"content": "a"}),
+        )],
+        has_more: true,
+        projections: None,
+    });
+    let id = w.raw_rows().next().unwrap().id();
+    assert_eq!(id, RowId(1));
+    w.apply(TrajIncoming::Page {
+        records: vec![traj_record(1, "turn/start", serde_json::json!({"turn": 1}))],
+        has_more: Some(false),
+    });
+    assert_eq!(
+        w.row(id).map(|r| r.seq()),
+        Some(SessionSeq(5)),
+        "前插后 RowId 仍指向同一行"
+    );
+    let mut fold = FoldState::default();
+    let turn_id = w
+        .raw_rows()
+        .find(|r| r.kind() == TrajKind::TurnStart)
+        .unwrap()
+        .id();
+    assert_eq!(w.group_of(turn_id), Some(GroupId::Turn(1)));
+    assert_eq!(w.group_of(id), None, "user 行无折叠组");
+    let _ = w.toggle_group(&mut fold, turn_id);
+    assert!(fold.is_collapsed(GroupId::Turn(1)));
+}
