@@ -44,6 +44,10 @@ pub struct Config {
     pub perf: PerfConfig,
     pub keymap: KeymapConfig,
     pub monitor: MonitorConfig,
+    /// Draft persistence (ADR-010): enabled toggle + startup clear.
+    pub drafts: DraftsConfig,
+    /// Export default target path (ADR-010).
+    pub export: ExportConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -57,11 +61,17 @@ pub struct ServerConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct UiConfig {
     pub theme: String,
+    /// 语义角色 → 颜色覆盖（role → hex/名色；非法值回退该角色默认并警告，
+    /// AC-007-21 语义）。内层 flatten：未知角色保留可警告、不 deny 崩溃。
+    #[serde(default)]
+    pub palette: std::collections::BTreeMap<String, String>,
     pub sidebar_width_cells: u16,
     /// 右栏详情列宽（REQ-005 V0.3，Notes/04 §1：45 默认，30–60 可调；
     /// clamp 在 `validate` 执行）。
     pub details_width_cells: u16,
     pub show_turn_rail: bool,
+    /// Timeline 缩略条（REQ-007 AC-007-29；默认关）。
+    pub show_timeline: bool,
     pub tick_ms: u64,
 }
 
@@ -74,9 +84,50 @@ pub struct PerfConfig {
     pub rss_target_mb: u64,
 }
 
+/// `[keymap]` — per-mode command→key-sequence override table (REQ-007
+/// AC-007-21; Step 5). Inner layer is a flatten map: unknown mode/command
+/// names are preserved and warned at build, never fatal.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct KeymapConfig {
+    /// mode → (command → key sequence). `none` unbinds; double-key sequences
+    /// like "g g" supported.
+    #[serde(default)]
+    pub modes: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
+}
+
+/// `[drafts]` — draft persistence switches (ADR-010; D-42 boundary).
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct DraftsConfig {
+    /// 落盘开关：false 退化纯内存注册表（REQ-003 既有语义）。默认开。
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// 启动时清空 drafts.toml（不残留旧会话草稿）。
+    #[serde(default)]
+    pub clear: bool,
+}
+
+impl Default for DraftsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            clear: false,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// `[export]` — export default target path (ADR-010).
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
-pub struct KeymapConfig {}
+pub struct ExportConfig {
+    /// 导出默认落盘目录（空 = 提示用户选择）。
+    pub default_dir: String,
+}
 
 /// `dshtui monitor` 配置段（REQ-009 §3 输入契约；D-29 直连 OTR agent-server）。
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -98,6 +149,8 @@ pub struct Effective {
     pub ui: UiConfig,
     pub perf: PerfConfig,
     pub monitor: MonitorConfig,
+    pub drafts: DraftsConfig,
+    pub export: ExportConfig,
 }
 
 pub const DEFAULT_URL: &str = "http://127.0.0.1:3080";
@@ -133,9 +186,11 @@ impl Default for UiConfig {
     fn default() -> Self {
         Self {
             theme: "dark".to_string(),
+            palette: std::collections::BTreeMap::new(),
             sidebar_width_cells: DEFAULT_SIDEBAR_WIDTH,
             details_width_cells: DEFAULT_DETAILS_WIDTH_CELLS,
             show_turn_rail: false,
+            show_timeline: false,
             tick_ms: DEFAULT_TICK_MS,
         }
     }
@@ -226,6 +281,8 @@ impl Config {
             ui: self.ui.clone(),
             perf: self.perf.clone(),
             monitor,
+            drafts: self.drafts.clone(),
+            export: self.export.clone(),
         })
     }
 
@@ -300,6 +357,181 @@ pub fn default_config_path() -> PathBuf {
             .join("config.toml");
     }
     PathBuf::from(".config").join("dshtui").join("config.toml")
+}
+
+/// Default state path (ADR-010): `$XDG_STATE_HOME/dshtui/drafts.toml` or
+/// `~/.local/state/dshtui/drafts.toml`.
+pub fn default_state_path() -> PathBuf {
+    if let Some(xdg) = env::var_os("XDG_STATE_HOME") {
+        if !xdg.is_empty() {
+            return PathBuf::from(xdg).join("dshtui").join("drafts.toml");
+        }
+    }
+    if let Some(home) = env::var_os("HOME") {
+        return PathBuf::from(home)
+            .join(".local")
+            .join("state")
+            .join("dshtui")
+            .join("drafts.toml");
+    }
+    PathBuf::from(".local")
+        .join("state")
+        .join("dshtui")
+        .join("drafts.toml")
+}
+
+// ---------- ADR-010 atomic write (0600, temp+rename same filesystem) ----------
+
+/// Atomically write `content` to `path` with mode 0600 (ADR-010).
+///
+/// The temp file lives in the SAME directory as the target (same filesystem
+/// rename; never /tmp across calls — `uncategorized/TASK-002-pitfall`). On any
+/// failure the temp file is removed; the destination is never half-written.
+pub fn atomic_write_0600(path: &std::path::Path, content: &str) -> Result<(), ConfigError> {
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => std::path::Path::new("."),
+    };
+    std::fs::create_dir_all(parent).map_err(|source| ConfigError::Io {
+        path: parent.to_path_buf(),
+        source,
+    })?;
+    let tmp = parent.join(format!(
+        ".{}.tmp-{}",
+        path.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "dshtui".into()),
+        std::process::id()
+    ));
+    {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)
+                .map_err(|source| ConfigError::Io {
+                    path: tmp.clone(),
+                    source,
+                })?;
+            use std::io::Write;
+            f.write_all(content.as_bytes())
+                .map_err(|source| ConfigError::Io {
+                    path: tmp.clone(),
+                    source,
+                })?;
+        }
+        #[cfg(not(unix))]
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&tmp).map_err(|source| ConfigError::Io {
+                path: tmp.clone(),
+                source,
+            })?;
+            f.write_all(content.as_bytes())
+                .map_err(|source| ConfigError::Io {
+                    path: tmp.clone(),
+                    source,
+                })?;
+        }
+    }
+    // 目标目录内原子 rename（同文件系统）。
+    std::fs::rename(&tmp, path).map_err(|source| {
+        let _ = std::fs::remove_file(&tmp);
+        ConfigError::Io {
+            path: path.to_path_buf(),
+            source,
+        }
+    })
+}
+
+/// Re-write `config.toml` preserving all sections while updating the
+/// `[ui] theme/palette` values (ADR-010; runtime theme switch persistence,
+/// AC-007-20). `palette_override` entries replace the whole palette map when
+/// Some (theme switch keeps it stable); a None leaves palette untouched.
+///
+/// The rewrite parses the existing file to TOML `Value`, mutates the ui
+/// table, and serializes back — any unknown section survives unchanged.
+pub fn save_theme_config(
+    path: &std::path::Path,
+    theme: &str,
+    palette: &std::collections::BTreeMap<String, String>,
+) -> Result<(), ConfigError> {
+    update_toml_table(path, "ui", |ui| {
+        ui.insert("theme".into(), toml::Value::String(theme.to_string()));
+        let palette_value = toml::Value::Table(
+            palette
+                .iter()
+                .map(|(k, v)| (k.clone(), toml::Value::String(v.clone())))
+                .collect(),
+        );
+        ui.insert("palette".into(), palette_value);
+    })
+}
+
+/// Re-write `config.toml` preserving all sections while replacing the
+/// `[keymap]` modes table (ADR-010; keymap override persistence, AC-007-21).
+pub fn save_keymap_config(
+    path: &std::path::Path,
+    modes: &std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
+) -> Result<(), ConfigError> {
+    update_toml_table(path, "keymap", |keymap| {
+        let modes_value = toml::Value::Table(
+            modes
+                .iter()
+                .map(|(mode, binds)| {
+                    let table = toml::Value::Table(
+                        binds
+                            .iter()
+                            .map(|(cmd, seq)| (cmd.clone(), toml::Value::String(seq.clone())))
+                            .collect(),
+                    );
+                    (mode.clone(), table)
+                })
+                .collect(),
+        );
+        keymap.insert("modes".into(), modes_value);
+    })
+}
+
+/// Shared config re-writer: loads the file (or default when missing), applies
+/// `edit` to one named top-level table, serializes and atomic-writes 0600.
+fn update_toml_table(
+    path: &std::path::Path,
+    table_name: &str,
+    edit: impl FnOnce(&mut toml::map::Map<String, toml::Value>),
+) -> Result<(), ConfigError> {
+    let existing: toml::Value = if path.exists() {
+        let raw = std::fs::read_to_string(path).map_err(|e| ConfigError::Io {
+            path: path.to_path_buf(),
+            source: e,
+        })?;
+        toml::from_str(&raw).map_err(|e| ConfigError::Toml {
+            path: path.to_path_buf(),
+            message: e.to_string(),
+        })?
+    } else {
+        toml::Value::Table(toml::map::Map::new())
+    };
+    let mut table = match existing {
+        toml::Value::Table(t) => t,
+        _ => toml::map::Map::new(),
+    };
+    let mut ui = table
+        .get(table_name)
+        .and_then(|v| v.as_table())
+        .cloned()
+        .unwrap_or_default();
+    edit(&mut ui);
+    table.insert(table_name.to_string(), toml::Value::Table(ui));
+    let out = toml::to_string(&toml::Value::Table(table)).map_err(|e| ConfigError::Toml {
+        path: path.to_path_buf(),
+        message: e.to_string(),
+    })?;
+    atomic_write_0600(path, &out)
 }
 
 /// Parse CLI args. `--token` accepts only an environment variable name; the
@@ -691,6 +923,8 @@ window_messages = 100
             ui: UiConfig::default(),
             perf: PerfConfig::default(),
             monitor: MonitorConfig::default(),
+            drafts: DraftsConfig::default(),
+            export: ExportConfig::default(),
         };
         let s = redact_summary(&eff);
         assert!(!s.contains("super-secret-token"));
@@ -853,5 +1087,148 @@ poll_kb_ms = 15000
         let cfg = Config::load(Some(&path)).unwrap();
         let eff = cfg.resolve(&Cli::default()).unwrap();
         assert_eq!(eff.ui.details_width_cells, 50, "Effective 注入链携带");
+    }
+
+    // ---------- REQ-007 V0.4: palette/drafts/export/keymap + ADR-010 atomic
+    // write ----------
+
+    #[test]
+    fn v04_parses_palette_drafts_export_and_keymap_modes() {
+        let (_dir, path) = tmp_config(
+            r##"
+[ui]
+theme = "light"
+palette = { accent = "red", unknown_role = "green" }
+show_timeline = true
+
+[drafts]
+enabled = false
+clear = true
+
+[export]
+default_dir = "/home/nd/exports"
+
+[keymap.modes.normal]
+move_down = "j"
+quit = "none"
+"##,
+        );
+        let cfg = Config::load(Some(&path)).unwrap();
+        assert_eq!(cfg.ui.theme, "light");
+        assert_eq!(
+            cfg.ui.palette.get("accent").map(String::as_str),
+            Some("red")
+        );
+        assert_eq!(cfg.ui.palette.len(), 2, "未知角色保留不 deny");
+        assert!(cfg.ui.show_timeline);
+        assert!(!cfg.drafts.enabled);
+        assert!(cfg.drafts.clear);
+        assert_eq!(cfg.export.default_dir, "/home/nd/exports");
+        assert_eq!(
+            cfg.keymap
+                .modes
+                .get("normal")
+                .unwrap()
+                .get("quit")
+                .map(String::as_str),
+            Some("none")
+        );
+    }
+
+    #[test]
+    fn v04_defaults_drafts_enabled_export_empty() {
+        let cfg = Config::default();
+        assert!(cfg.drafts.enabled);
+        assert!(!cfg.drafts.clear);
+        assert!(cfg.export.default_dir.is_empty());
+        assert!(cfg.ui.palette.is_empty());
+        assert!(!cfg.ui.show_timeline);
+        let eff = cfg.resolve(&Cli::default()).unwrap();
+        assert!(eff.drafts.enabled);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_0600_creates_parent_and_sets_mode() {
+        let dir = tempdir::TempDir::new().unwrap();
+        let target = dir.path().join("sub").join("drafts.toml");
+        atomic_write_0600(&target, "drafts = {}\n").unwrap();
+        assert!(target.exists());
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "权限 0600");
+        let data = std::fs::read_to_string(&target).unwrap();
+        assert!(data.contains("drafts"));
+        // 无残留 temp 文件。
+        let entries: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
+        assert_eq!(entries.len(), 1, "仅目标文件");
+    }
+
+    #[test]
+    fn save_theme_config_preserves_other_sections() {
+        let (_dir, path) = tmp_config(
+            r##"
+[server]
+url = "http://127.0.0.1:3081"
+
+[ui]
+theme = "dark"
+sidebar_width_cells = 24
+"##,
+        );
+        let palette = {
+            let mut m = std::collections::BTreeMap::new();
+            m.insert("accent".to_string(), "#123456".to_string());
+            m
+        };
+        save_theme_config(&path, "light", &palette).unwrap();
+        let reloaded = Config::load(Some(&path)).unwrap();
+        assert_eq!(
+            reloaded.server.url, "http://127.0.0.1:3081",
+            "其它 section 保留"
+        );
+        assert_eq!(
+            reloaded.ui.sidebar_width_cells, 24,
+            "同 section 其它字段保留"
+        );
+        assert_eq!(reloaded.ui.theme, "light");
+        assert_eq!(
+            reloaded.ui.palette.get("accent").map(String::as_str),
+            Some("#123456")
+        );
+    }
+
+    #[test]
+    fn save_keymap_config_writes_modes_and_keeps_rest() {
+        let (_dir, path) = tmp_config("[server]\nurl = \"http://127.0.0.1:3082\"\n");
+        let modes = {
+            let mut outer = std::collections::BTreeMap::new();
+            let mut inner = std::collections::BTreeMap::new();
+            inner.insert("move_down".to_string(), "k".to_string());
+            outer.insert("normal".to_string(), inner);
+            outer
+        };
+        save_keymap_config(&path, &modes).unwrap();
+        let reloaded = Config::load(Some(&path)).unwrap();
+        assert_eq!(reloaded.server.url, "http://127.0.0.1:3082");
+        assert_eq!(
+            reloaded
+                .keymap
+                .modes
+                .get("normal")
+                .unwrap()
+                .get("move_down")
+                .map(String::as_str),
+            Some("k")
+        );
+    }
+
+    #[test]
+    fn save_theme_to_missing_file_creates_it() {
+        let dir = tempdir::TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        save_theme_config(&path, "dark", &std::collections::BTreeMap::new()).unwrap();
+        let reloaded = Config::load(Some(&path)).unwrap();
+        assert_eq!(reloaded.ui.theme, "dark");
     }
 }

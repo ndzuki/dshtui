@@ -24,3 +24,16 @@ rss_target_mb = 80               # 超限触发 LRU 释放
 addr = "http://127.0.0.1:8799"    # OTR agent-server 地址（默认仅连 loopback）
 poll_agents_ms = 2000             # /agents 轮询间隔
 poll_kb_ms = 30000                # /kb-stats 轮询间隔
+
+# ---------- REQ-007 V0.4（ADR-010 本地持久化边界） ----------
+
+# [ui] 追加字段：
+#   palette = { accent = "#ff0000", ... }   # 语义角色 → 颜色覆盖（可选）
+#   show_timeline = false                   # 消息缩略时间线条（默认关，V0.4）
+
+[drafts]                       # 草稿落盘（ADR-010：仅草稿文本，session 键控）
+enabled = true                 # false 退化为纯内存注册表（REQ-003 语义）
+clear = false                  # 启动时清空已保存草稿
+
+[export]                       # 会话导出（官方 HTTP /api/session.export）
+default_dir = ""               # 导出默认目录（空 = 每次提示选择）
