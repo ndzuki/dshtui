@@ -67,6 +67,22 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         return;
     }
 
+    // 风险 key 二次确认态（AC-007-16：permission.defaultPreset 等）。
+    if let Some(key) = &st.risk_confirm {
+        let confirm = Paragraph::new(vec![
+            Line::from(Span::styled(
+                format!(" 风险 key：{key}（影响权限/安全默认）"),
+                Style::default().fg(warn).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                " Enter 继续编辑 / Esc 或其它键取消",
+                Style::default().fg(accent),
+            )),
+        ]);
+        frame.render_widget(confirm, inner);
+        return;
+    }
+
     if st.rows.is_empty() {
         let msg = if st.loading {
             " 加载中…"
@@ -197,5 +213,24 @@ mod tests {
             .draw(|frame| render(frame, frame.area(), &app))
             .unwrap();
         assert!(rendered_text(&terminal).contains("无白名单可编辑项"));
+    }
+
+    #[test]
+    fn settings_risk_confirm_stage_renders_ac007_16() {
+        let mut app = crate::app::AppState::default();
+        app.mode = crate::app::Mode::Settings;
+        app.settings.open();
+        app.settings.risk_confirm = Some("permission.defaultPreset".into());
+        let backend = TestBackend::new(100, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render(frame, frame.area(), &app))
+            .unwrap();
+        let text = rendered_text(&terminal);
+        assert!(
+            text.contains("permission.defaultPreset"),
+            "风险 key 名, text={text}"
+        );
+        assert!(text.contains("Enter 继续编辑"), "确认提示, text={text}");
     }
 }

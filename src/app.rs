@@ -1855,7 +1855,10 @@ impl AppState {
         let Some(id) = self.subagents.selected_id() else {
             return vec![];
         };
-        let Some(parent) = self.subagents.parent_session_id.clone() else {
+        // 立即父会话：目录根层 = panel parent_session_id；更深层 = 展开的
+        // 直属父 node（`subagents/list` 只列直属——孙代必须以其直属父为
+        // parentSessionId，AC-007-01 嵌套）。
+        let Some(parent) = self.subagents.immediate_parent_of(&id) else {
             return vec![];
         };
         let child = SessionId(id.clone());
@@ -2287,6 +2290,15 @@ impl AppState {
         "permission.defaultPreset",
     ];
 
+    /// 风险 key（属可改集但改动影响权限/安全默认 → 提交前二次确认，
+    /// AC-007-16）。`permission.defaultPreset` 控制后续工具调用的默认审批
+    /// 预设，误改会改变权限行为。
+    pub const SETTINGS_RISK_KEYS: [&'static str; 1] = ["permission.defaultPreset"];
+
+    pub fn is_settings_risk_key(key: &str) -> bool {
+        Self::SETTINGS_RISK_KEYS.contains(&key)
+    }
+
     pub fn open_settings_panel(&mut self) -> Vec<Cmd> {
         self.settings.open();
         self.mode = Mode::Settings;
@@ -2391,6 +2403,13 @@ impl AppState {
             }
         } else {
             match cmd {
+                // 风险确认态（模态，AC-007-16）：Enter 确认进编辑；Esc 或
+                // 其它动作键取消确认。
+                C::PickerDown | C::PickerUp if self.settings.risk_confirm.is_some() => {
+                    self.settings.risk_confirm = None;
+                    self.notice = Some("已取消风险 key 编辑".into());
+                    vec![]
+                }
                 C::PickerDown => {
                     self.settings.move_selection(1);
                     vec![]
@@ -2400,6 +2419,15 @@ impl AppState {
                     vec![]
                 }
                 C::PickerConfirm => {
+                    // 风险确认态：Enter 二次确认 → 进编辑。
+                    if let Some(key) = self.settings.risk_confirm.clone() {
+                        self.settings.risk_confirm = None;
+                        if let Some(row) = self.settings.rows.iter().find(|r| r.key == key) {
+                            self.settings.edit_key = Some(row.key.clone());
+                            self.settings.edit_buffer = row.value_display.clone();
+                        }
+                        return vec![];
+                    }
                     let Some(row) = self.settings.rows.get(self.settings.selected).cloned() else {
                         return vec![];
                     };
@@ -2407,16 +2435,38 @@ impl AppState {
                         self.notice = Some("该 key 只读展示（白名单外/secret 不可编辑）".into());
                         return vec![];
                     }
+                    // AC-007-16：风险 key（如 permission.defaultPreset）先二次
+                    // 确认再进编辑（Enter 确认 / 其它键取消）。
+                    if Self::is_settings_risk_key(&row.key) {
+                        self.settings.risk_confirm = Some(row.key.clone());
+                        self.notice = Some(format!(
+                            "{} 是风险 key（影响权限默认）——Enter 继续编辑 / Esc 取消",
+                            row.key
+                        ));
+                        return vec![];
+                    }
                     self.settings.edit_key = Some(row.key);
                     self.settings.edit_buffer = row.value_display.clone();
                     vec![]
                 }
                 C::ClosePicker | C::Quit => {
+                    if self.settings.risk_confirm.is_some() {
+                        // 取消风险确认。
+                        self.settings.risk_confirm = None;
+                        return vec![];
+                    }
                     self.settings.close();
                     self.mode = Mode::Normal;
                     vec![]
                 }
-                _ => vec![],
+                _ => {
+                    // 风险确认态：除 Enter/Esc 外的动作键 = 取消确认（模态）。
+                    if self.settings.risk_confirm.is_some() {
+                        self.settings.risk_confirm = None;
+                        self.notice = Some("已取消风险 key 编辑".into());
+                    }
+                    vec![]
+                }
             }
         }
     }
@@ -9986,6 +10036,64 @@ mod tests {
     }
 
     #[test]
+    fn subagent_grandchild_open_uses_direct_parent_ac007_01() {
+        // 嵌套子代理（孙代）：目录 p1 → 展开 c1 → 选中 gc1 打开。follow 的
+        // parentSessionId 必须是直属父 c1（`subagents/list` 只列直属），
+        // 不是 panel 根 p1——AC-007-01 嵌套语义。
+        let mut s = AppState {
+            active_session: Some(SessionId("p1".into())),
+            ..Default::default()
+        };
+        s.subagents.open("p1");
+        s.mode = Mode::Subagent;
+        s.subagents.set_catalog(
+            "p1",
+            crate::api::types::SubagentCatalog {
+                entries: vec![crate::api::types::SubagentListEntry::Child {
+                    id: "c1".into(),
+                    activity: "running".into(),
+                    has_children: true,
+                    mode: Some("continuable".into()),
+                    label: None,
+                }],
+                parent_available: true,
+            },
+        );
+        // 展开 c1 → 拉回直属 gc1。
+        let (need, id) = s.subagents.toggle_expand("c1").unwrap();
+        assert!(need && id == "c1");
+        s.subagents.set_catalog(
+            "c1",
+            crate::api::types::SubagentCatalog {
+                entries: vec![crate::api::types::SubagentListEntry::Child {
+                    id: "gc1".into(),
+                    activity: "inactive".into(),
+                    has_children: false,
+                    mode: Some("continuable".into()),
+                    label: None,
+                }],
+                parent_available: true,
+            },
+        );
+        // 选中 gc1（flatten 第 2 行）。
+        s.subagents.selected = 1;
+        let cmds = s.handle_command(crate::input::Command::OpenSelected);
+        assert_eq!(s.mode, Mode::Normal);
+        assert_eq!(s.active_session.as_ref().map(|s| s.0.as_str()), Some("gc1"));
+        assert!(
+            cmds.iter().any(
+                |c| matches!(c, Cmd::OpenFollowSubagent { parent_id, child_id, .. }
+                if parent_id == "c1" && child_id == "gc1")
+            ),
+            "孙代 follow 以直属父 c1 为 parentSessionId, cmds={cmds:?}"
+        );
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Cmd::OpenControl { .. })),
+            "孙代也不订阅 control"
+        );
+    }
+
+    #[test]
     fn subagents_list_failed_shows_code_panel_open_ac007_08() {
         let mut s = AppState {
             active_session: Some(SessionId("p1".into())),
@@ -10430,6 +10538,56 @@ mod tests {
         let _ = s.handle_command(crate::input::Command::PickerConfirm);
         assert!(s.settings.edit_key.is_none(), "secret 行拒绝编辑");
         assert!(s.notice.as_deref().unwrap_or("").contains("只读"));
+    }
+
+    #[test]
+    fn settings_risk_key_requires_second_confirm_ac007_16() {
+        let mut s = AppState::default();
+        s.settings.open();
+        // permission.defaultPreset 是可改白名单但属风险 key。
+        let row = crate::model::SettingsRow {
+            key: "permission.defaultPreset".into(),
+            namespace: "permission".into(),
+            value_display: "ask".into(),
+            original: Some(serde_json::Value::String("ask".into())),
+            user_set: false,
+            secret: false,
+            revision: 3,
+        };
+        s.settings.set_rows(vec![row], true);
+        s.mode = Mode::Settings;
+        // 第一次 Enter → 风险确认态（不进编辑、不发更新）。
+        let cmds = s.handle_command(crate::input::Command::PickerConfirm);
+        assert!(cmds.is_empty(), "确认前不发更新");
+        assert_eq!(
+            s.settings.risk_confirm.as_deref(),
+            Some("permission.defaultPreset"),
+            "进入风险确认态"
+        );
+        assert!(s.settings.edit_key.is_none());
+        // 其它键取消确认。
+        let _ = s.handle_command(crate::input::Command::PickerDown);
+        assert!(s.settings.risk_confirm.is_none(), "其它键取消");
+        // 再次 Enter ×2 → 进编辑。
+        let _ = s.handle_command(crate::input::Command::PickerConfirm);
+        let _ = s.handle_command(crate::input::Command::PickerConfirm);
+        assert!(s.settings.risk_confirm.is_none());
+        assert_eq!(
+            s.settings.edit_key.as_deref(),
+            Some("permission.defaultPreset"),
+            "二次确认后进编辑"
+        );
+        // 编辑提交 → SettingsUpdate（带 CAS revision）。
+        s.settings.edit_buffer = "ask".into();
+        let cmds = s.handle_command(crate::input::Command::PickerConfirm);
+        assert!(
+            cmds.iter().any(|c| matches!(
+                c,
+                Cmd::SettingsUpdate { ns, key, revision, .. }
+                    if ns == "permission" && key == "defaultPreset" && *revision == 3
+            )),
+            "提交更新"
+        );
     }
 
     #[test]

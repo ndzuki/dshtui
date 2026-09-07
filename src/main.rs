@@ -374,6 +374,11 @@ async fn run_connected(eff: Effective, token: String, client: DshClient) -> Resu
     if !eff.keymap.modes.is_empty() {
         let km = dshtui::input::Keymap::build(&eff.keymap);
         app.keymap_override_lines = km.override_lines();
+        // AC-007-21：非法/冲突键位给可读警告（不崩溃、不静默）——与 palette
+        // 警告同通道打 stderr。
+        for w in &km.warnings {
+            eprintln!("警告: keymap {w}");
+        }
     }
     let mut client = Some(client);
     let mut mux: Option<Mux> = None;

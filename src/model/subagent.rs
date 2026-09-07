@@ -206,6 +206,42 @@ impl SubagentViewState {
         out
     }
 
+    /// Immediate parent session id of a node in the tree. Roots are children
+    /// of the panel `parent_session_id`; deeper levels are children of the
+    /// enclosing expanded node (each level was fetched via
+    /// `subagents/list(level_parent)`). Opening a grandchild must address its
+    /// DIRECT parent — not the panel root (AC-007-01 nested children).
+    pub fn immediate_parent_of(&self, id: &str) -> Option<String> {
+        // Roots are children of parent_session_id; deeper levels inherit the
+        // enclosing node id as their parent.
+        fn find(
+            nodes: &[SubagentNode],
+            id: &str,
+            inherited: Option<&str>,
+            root_parent: &str,
+        ) -> Option<String> {
+            for n in nodes {
+                if n.id == id {
+                    // depth 1: parent = root parent; depth ≥2: parent =
+                    // enclosing expanded node (passed via inherited).
+                    return Some(
+                        inherited
+                            .map(str::to_string)
+                            .unwrap_or_else(|| root_parent.to_string()),
+                    );
+                }
+                if let Some(ch) = &n.children {
+                    if let Some(p) = find(ch, id, Some(&n.id), root_parent) {
+                        return Some(p);
+                    }
+                }
+            }
+            None
+        }
+        let root = self.parent_session_id.clone()?;
+        find(&self.roots, id, None, &root)
+    }
+
     /// Update one node's activity (roots or any expanded level) after an
     /// interruptByParent receipt (AC-007-09: running → stopped on success).
     /// Returns true when the node was found and updated.
@@ -432,5 +468,44 @@ mod tests {
         // 叶子 c2 不拉取。
         let (need, _) = v.toggle_expand("c2").unwrap();
         assert!(!need);
+    }
+
+    #[test]
+    fn immediate_parent_of_nested_levels_ac007_01() {
+        use crate::api::types::SubagentListEntry;
+        fn child(id: &str, hc: bool) -> SubagentListEntry {
+            SubagentListEntry::Child {
+                id: id.into(),
+                activity: "inactive".into(),
+                has_children: hc,
+                mode: Some("continuable".into()),
+                label: None,
+            }
+        }
+        // 树：p1 → c1 → gc1（子代理孙代）。
+        let mut v = SubagentViewState::default();
+        v.open("p1");
+        v.set_catalog(
+            "p1",
+            SubagentCatalog {
+                entries: vec![child("c1", true)],
+                parent_available: true,
+            },
+        );
+        v.toggle_expand("c1");
+        v.set_catalog(
+            "c1",
+            SubagentCatalog {
+                entries: vec![child("gc1", false)],
+                parent_available: true,
+            },
+        );
+        // 根层直属 c1 → 立即父 = panel 根 p1。
+        assert_eq!(v.immediate_parent_of("c1").as_deref(), Some("p1"));
+        // 孙代 gc1 → 立即父 = 直属父 c1（非 panel 根！`subagents/list` 只列
+        // 直属，打开孙代必须以 c1 为 parentSessionId——AC-007-01 嵌套）。
+        assert_eq!(v.immediate_parent_of("gc1").as_deref(), Some("c1"));
+        // 未知 id → None。
+        assert_eq!(v.immediate_parent_of("zz"), None);
     }
 }
