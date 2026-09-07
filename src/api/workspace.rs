@@ -14,10 +14,125 @@ use serde_json::Value;
 
 use super::envelope::ClientError;
 use super::mux::{Mux, StreamHandle};
+use super::unary;
 
 pub async fn open_follow(mux: &Mux) -> Result<StreamHandle, ClientError> {
     mux.open_stream("workspace/follow", serde_json::json!({}))
         .await
+}
+
+// ---------- REQ-006 workspace mutation endpoints (V0.3) ----------
+//
+// All workspace mutations nest their business fields under `{"request":{...}}`
+// (official read 0.1.2-rc.1 from dsh-api-workspace-controller
+// typert.remote-client.js). `archiveSession` lives in the **workspace**
+// namespace and takes only `sessionId` (FR-006-02 fact correction).
+
+/// `workspace/create` — adopt an existing directory as a workspace.
+pub async fn create_workspace(
+    http: &reqwest::Client,
+    base: &str,
+    path: &str,
+) -> Result<serde_json::Value, ClientError> {
+    unary(
+        http,
+        base,
+        "workspace/create",
+        serde_json::json!({ "request": { "path": path } }),
+    )
+    .await
+}
+
+/// `workspace/rename` — retitle a workspace.
+pub async fn rename_workspace(
+    http: &reqwest::Client,
+    base: &str,
+    workspace_id: &str,
+    title: &str,
+) -> Result<serde_json::Value, ClientError> {
+    unary(
+        http,
+        base,
+        "workspace/rename",
+        serde_json::json!({ "request": { "workspaceId": workspace_id, "title": title } }),
+    )
+    .await
+}
+
+/// `workspace/delete` — delete a workspace registration.
+pub async fn delete_workspace(
+    http: &reqwest::Client,
+    base: &str,
+    workspace_id: &str,
+) -> Result<serde_json::Value, ClientError> {
+    unary(
+        http,
+        base,
+        "workspace/delete",
+        serde_json::json!({ "request": { "workspaceId": workspace_id } }),
+    )
+    .await
+}
+
+/// `workspace/insertBefore` — DOM-insertBefore-like workspace order mutation.
+pub async fn insert_before(
+    http: &reqwest::Client,
+    base: &str,
+    workspace_id: &str,
+    before_workspace_id: Option<&str>,
+) -> Result<serde_json::Value, ClientError> {
+    let mut req = serde_json::json!({ "workspaceId": workspace_id });
+    if let Some(before) = before_workspace_id {
+        req["beforeWorkspaceId"] = serde_json::json!(before);
+    }
+    unary(
+        http,
+        base,
+        "workspace/insertBefore",
+        serde_json::json!({ "request": req }),
+    )
+    .await
+}
+
+/// `workspace/insertSessionBefore` — move a session within a workspace's
+/// manual order.
+pub async fn insert_session_before(
+    http: &reqwest::Client,
+    base: &str,
+    workspace_id: &str,
+    session_id: &str,
+    before_session_id: Option<&str>,
+) -> Result<serde_json::Value, ClientError> {
+    let mut req = serde_json::json!({
+        "workspaceId": workspace_id,
+        "sessionId": session_id,
+    });
+    if let Some(before) = before_session_id {
+        req["beforeSessionId"] = serde_json::json!(before);
+    }
+    unary(
+        http,
+        base,
+        "workspace/insertSessionBefore",
+        serde_json::json!({ "request": req }),
+    )
+    .await
+}
+
+/// `workspace/archiveSession` — archive a session (workspace namespace; no
+/// workspaceId on the wire, FR-006-02 fact correction).
+pub async fn archive_session(
+    http: &reqwest::Client,
+    base: &str,
+    session_id: &str,
+) -> Result<serde_json::Value, ClientError> {
+    unary(
+        http,
+        base,
+        "workspace/archiveSession",
+        serde_json::json!({ "request": { "sessionId": session_id } }),
+    )
+    .await
 }
 
 /// One workspace row extracted from a follow frame.

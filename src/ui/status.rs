@@ -11,7 +11,7 @@ use crate::model::ProjectionSnapshot;
 use crate::ui::layout::{color_depth, ColorDepth};
 
 /// 快捷键提示行（FR-001-05，README 键位口径；[/] 搜索为 REQ-002 预留但仍展示）。
-const HINT_LINE: &str = "[i]输入 [/]搜索 [f]切换 [gt]轨迹 [?]帮助 [q]退出";
+const HINT_LINE: &str = "[i]输入 [/]搜索 [f]切换 [gt]轨迹 [M]模型 [:]命令 [gv]视图 [?]帮助 [q]退出";
 /// IMAGEVIEW 模式提示行（REQ-004 D-14/05 §10：`o` 系统查看器 `y` 复制路径
 /// `q` 关闭）。
 const IMAGE_HINT_LINE: &str = "[o]系统查看器 [y]复制路径 [q]关闭";
@@ -119,6 +119,24 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
                 ));
             }
         }
+        // REQ-006：模型目录模式指示（FR-006-01）。
+        crate::app::Mode::ModelCatalog => {
+            spans.push(Span::styled(
+                " MODEL ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        // REQ-006：命令面板模式指示（FR-006-03）。
+        crate::app::Mode::CommandPalette => {
+            spans.push(Span::styled(
+                " CMD ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
         _ => {}
     }
     // AC-003-18：不可编程审批降级 → 状态条 `等待审批` 高亮（不弹窗）。
@@ -196,11 +214,19 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
                     .add_modifier(Modifier::BOLD),
             ));
         }
-        if let Some(model) = projections
-            .model_selection()
-            .last_used
-            .or_else(|| projections.model_selection().next)
-        {
+        // AC-006-08（FR-006-01/D-033）：状态条显示模型选择——next 与
+        // lastUsed 不同时显示 `last → next`（next = 下一次 prompt 实际模型，
+        // 与官方 modelSelection 一致，ADR-008）；相同/无 next 时显示当前。
+        let sel = projections.model_selection();
+        let model_display = if sel.next.is_some() && sel.next != sel.last_used {
+            match (sel.last_used, &sel.next) {
+                (Some(last), Some(next)) => Some(format!("{last} → {next}")),
+                (_, next) => next.clone(),
+            }
+        } else {
+            sel.last_used.clone().or(sel.next)
+        };
+        if let Some(model) = model_display {
             spans.push(Span::raw(format!(" {model}")));
         }
         let context = projections.context_pressure();
@@ -471,18 +497,78 @@ mod tests {
     }
 
     #[test]
+    fn status_model_shows_last_then_next_when_changed_ac006_08() {
+        // AC-006-08/D-033：selectModel 后官方 modelSelection.next ≠ lastUsed
+        // → 状态条显示 `last → next`（next=下一次 prompt 实际模型）。
+        let mut app = AppState::default();
+        app.active_session = Some(SessionId("s1".into()));
+        app.conn = ConnState::Ready;
+        app.sessions.touch("s1", 20).apply(Incoming::Snapshot {
+            cursor: None,
+            records: vec![],
+            has_more: false,
+            projections: Some(serde_json::json!({
+                "modelSelection": {
+                    "lastUsed": {"provider": "deepseek_official", "model": "deepseek-chat"},
+                    "next": {"provider": "deepseek_official", "model": "deepseek-reasoner",
+                             "reasoningEffort": "high"}
+                }
+            })),
+        });
+        let backend = TestBackend::new(140, 2);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render(frame, Rect::new(0, 0, 140, 2), &app))
+            .unwrap();
+        let rendered = rendered_text(&terminal);
+        assert!(
+            rendered
+                .contains("deepseek_official/deepseek-chat → deepseek_official/deepseek-reasoner"),
+            "状态条 last → next, rendered={rendered}"
+        );
+        // 相同（无切换）→ 只显示当前一个。
+        let mut app2 = AppState::default();
+        app2.active_session = Some(SessionId("s1".into()));
+        app2.conn = ConnState::Ready;
+        app2.sessions.touch("s1", 20).apply(Incoming::Snapshot {
+            cursor: None,
+            records: vec![],
+            has_more: false,
+            projections: Some(serde_json::json!({
+                "modelSelection": {
+                    "lastUsed": {"provider": "deepseek_official", "model": "deepseek-chat"},
+                    "next": {"provider": "deepseek_official", "model": "deepseek-chat"}
+                }
+            })),
+        });
+        let backend = TestBackend::new(140, 2);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render(frame, Rect::new(0, 0, 140, 2), &app2))
+            .unwrap();
+        let rendered = rendered_text(&terminal);
+        assert!(
+            rendered.contains("deepseek_official/deepseek-chat") && !rendered.contains("→"),
+            "未切换不显示箭头, rendered={rendered}"
+        );
+    }
+
+    #[test]
     fn shortcut_hint_line_shown_when_wide_enough() {
         let mut app = AppState::default();
         app.conn = ConnState::Ready;
-        let backend = TestBackend::new(60, 2);
+        let backend = TestBackend::new(130, 2);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| render(frame, Rect::new(0, 0, 60, 2), &app))
+            .draw(|frame| render(frame, Rect::new(0, 0, 130, 2), &app))
             .unwrap();
         let rendered = rendered_text(&terminal);
         assert!(rendered.contains("[i]输入"), "rendered={rendered}");
         assert!(rendered.contains("[/]搜索"), "rendered={rendered}");
         assert!(rendered.contains("[f]切换"), "rendered={rendered}");
+        assert!(rendered.contains("[M]模型"), "rendered={rendered}");
+        assert!(rendered.contains("[:]命令"), "rendered={rendered}");
+        assert!(rendered.contains("[gv]视图"), "rendered={rendered}");
         assert!(rendered.contains("[?]帮助"), "rendered={rendered}");
         assert!(rendered.contains("[q]退出"), "rendered={rendered}");
     }

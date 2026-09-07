@@ -19,6 +19,8 @@ pub enum InputMode {
     Visual,
     /// 审批弹窗（REQ-003，y/n/q/Esc 决策）。
     Approval,
+    /// 审批列表视图（REQ-006，`L` 打开；j/k 移动、r 重试失败项、A 批量）。
+    ApprovalList,
     /// REQ-004 V0.2：IMAGEVIEW 模式（仅 Kitty 渲染态出现，D-14）。
     ImageView,
 
@@ -28,6 +30,12 @@ pub enum InputMode {
     /// REQ-005：轨迹内过滤输入态（`/` 打开后任意字符进 query；仍在
     /// Trajectory 模式，模态上不离开轨迹 tab）。
     TrajectoryFilter,
+    /// REQ-006：模型目录 overlay（`M` 打开；输入即时本地 nucleo 过滤，
+    /// j/k 移动、Enter 选择、q/Esc 关闭）。effort 子阶段同键位表。
+    ModelCatalog,
+    /// REQ-006：命令面板 overlay（`:` 打开；输入过滤、j/k 移动、Enter 执行、
+    /// Esc/q 关闭）。
+    CommandPalette,
     /// REQ-009 V0.3：MONITOR 模式（`dshtui monitor` 独立键位表）。
     Monitor,
 }
@@ -91,6 +99,15 @@ pub enum Command {
     ApprovalReject,
     ApprovalCancel,
     ApprovalAlways,
+    // ---------- REQ-006 审批队列增强（D-036） ----------
+    /// APPROVAL 单条槽中 `L`：打开审批列表视图。
+    OpenApprovalList,
+    /// ApprovalList 中 `r`：重试光标行失败项。
+    ApprovalRetry,
+    /// ApprovalList 中 `A`：批量 allowed-once（串行泵自动续发）。
+    ApprovalBatchAllow,
+    /// ApprovalList 中 q/Esc：回单条槽不中止。
+    CloseApprovalList,
     /// INSERT `↑`/`↓` 输入历史（REQ-F06）。
     HistoryPrev,
     HistoryNext,
@@ -119,6 +136,17 @@ pub enum Command {
     MonitorCheer,
     /// `l`：定位焦点 agent（跳转 NPC + 状态提示）。
     MonitorLocate,
+    // ---------- REQ-006 模型目录（FR-006-01） ----------
+    /// NORMAL `M`：打开模型目录 overlay（本地 nucleo 过滤 + 热切换）。
+    OpenModelCatalog,
+    // ---------- REQ-006 侧栏视图（FR-006-02，D-034） ----------
+    /// `gv`：循环切换侧栏 groupBy/orderBy（仅本地视图态，无远端写）。
+    CycleSidebarView,
+    // ---------- REQ-006 命令面板（FR-006-03） ----------
+    /// NORMAL `:`：打开命令面板（本地命令 + 斜杠命令）。
+    OpenCommandPalette,
+    /// INSERT 中 `Tab`：呼出命令面板并预填当前 `/` 斜杠命令词（补全）。
+    ComposerTabComplete,
 }
 
 /// Stateful decoder for multi-key Normal-mode commands such as `gg`.
@@ -154,9 +182,12 @@ impl KeyDecoder {
             InputMode::Search => self.search(key),
             InputMode::Visual => self.visual(key),
             InputMode::Approval => self.approval(key),
+            InputMode::ApprovalList => self.approval_list(key),
             InputMode::ImageView => self.image_view(key),
             InputMode::Trajectory => self.trajectory(key),
             InputMode::TrajectoryFilter => self.trajectory_filter(key),
+            InputMode::ModelCatalog => self.model_catalog(key),
+            InputMode::CommandPalette => self.command_palette(key),
             InputMode::Monitor => self.monitor(key),
         }
     }
@@ -167,6 +198,8 @@ impl KeyDecoder {
         match c {
             't' => Some(Command::ToggleTrajectory),
             'T' => Some(Command::GotoChat),
+            // REQ-006：`gv` 循环侧栏视图（groupBy/orderBy，D-034）。
+            'v' => Some(Command::CycleSidebarView),
             _ => None,
         }
     }
@@ -186,6 +219,9 @@ impl KeyDecoder {
             KeyCode::Char(c) if !ctrl => {
                 if self.pending_g {
                     if let Some(cmd) = self.g_prefix_key(c) {
+                        // gt/gT/gv 等双键命令：清前缀（g 后继续按 g 不再误触
+                        // GotoTop；code-review 同源修复）。
+                        self.pending_g = false;
                         return Some(cmd);
                     }
                     self.pending_g = false; // g+其它键：清前缀，按单键解码
@@ -214,6 +250,10 @@ impl KeyDecoder {
                     // REQ-005 Tab 数字键（`1` Chat / `2` Trajectory）。
                     '1' => Some(Command::GotoChat),
                     '2' => Some(Command::ToggleTrajectory),
+                    // REQ-006 模型目录（FR-006-01；`M` 现未占用）。
+                    'M' => Some(Command::OpenModelCatalog),
+                    // REQ-006 命令面板（FR-006-03；Notes/04 §3.1 `:`）。
+                    ':' => Some(Command::OpenCommandPalette),
                     _ => None,
                 }
             }
@@ -260,6 +300,8 @@ impl KeyDecoder {
             KeyCode::Char(c) if !ctrl => {
                 if self.pending_g {
                     if let Some(cmd) = self.g_prefix_key(c) {
+                        // Trajectory 内 gt/gT/gv：清前缀（同 normal 修复）。
+                        self.pending_g = false;
                         return Some(cmd);
                     }
                     self.pending_g = false;
@@ -370,6 +412,9 @@ impl KeyDecoder {
             // REQ-003 AC-003-10：INSERT 中 ↑/↓ 输入历史（全局最近 50 条）。
             KeyCode::Up => Some(Command::HistoryPrev),
             KeyCode::Down => Some(Command::HistoryNext),
+            // REQ-006 FR-006-03：INSERT 中 Tab 呼出命令面板（预填当前
+            // `/` 斜杠命令词，Notes/04 §3.2 命令/路径补全）。
+            KeyCode::Tab => Some(Command::ComposerTabComplete),
             _ => None,
         }
     }
@@ -412,8 +457,9 @@ impl KeyDecoder {
         }
     }
 
-    /// APPROVAL 键位（REQ-003 §3.5）：y 允许 / n 拒绝 / q·Esc 中止（cancelled）；
-    /// a 显示始终允许指引（非 outcome）；Enter 无语义（§3 键位边界）。
+    /// APPROVAL 键位（REQ-003 §3.5 + REQ-006 D-036）：y 允许 / n 拒绝 /
+    /// q·Esc 中止（cancelled）；a 危险项风险确认（否则始终允许指引）；
+    /// L 打开审批列表。Enter 无语义（§3 键位边界）。
     fn approval(&mut self, key: KeyEvent) -> Option<Command> {
         self.pending_g = false;
         match key.code {
@@ -422,6 +468,65 @@ impl KeyDecoder {
             KeyCode::Char('n') if key.modifiers.is_empty() => Some(Command::ApprovalReject),
             KeyCode::Char('q') if key.modifiers.is_empty() => Some(Command::ApprovalCancel),
             KeyCode::Char('a') if key.modifiers.is_empty() => Some(Command::ApprovalAlways),
+            KeyCode::Char('L') if key.modifiers.is_empty() => Some(Command::OpenApprovalList),
+            _ => None,
+        }
+    }
+
+    /// REQ-006 ApprovalList 键位（D-036）：j/k 移动、r 重试失败项、
+    /// A 批量 allowed-once、q/Esc 回单条槽不中止（不发出 cancelled）。
+    fn approval_list(&mut self, key: KeyEvent) -> Option<Command> {
+        self.pending_g = false;
+        match key.code {
+            KeyCode::Esc => Some(Command::CloseApprovalList),
+            KeyCode::Char('q') if key.modifiers.is_empty() => Some(Command::CloseApprovalList),
+            KeyCode::Char('j') if key.modifiers.is_empty() => Some(Command::PickerDown),
+            KeyCode::Char('k') if key.modifiers.is_empty() => Some(Command::PickerUp),
+            KeyCode::Char('r') if key.modifiers.is_empty() => Some(Command::ApprovalRetry),
+            KeyCode::Char('A') if key.modifiers.is_empty() => Some(Command::ApprovalBatchAllow),
+            // 列表视图中 y/n 仍对单条槽（active）决策（批量便捷键之外保留单条）。
+            KeyCode::Char('y') if key.modifiers.is_empty() => Some(Command::ApprovalAllow),
+            KeyCode::Char('n') if key.modifiers.is_empty() => Some(Command::ApprovalReject),
+            KeyCode::Char('a') if key.modifiers.is_empty() => Some(Command::ApprovalAlways),
+            KeyCode::Char('L') if key.modifiers.is_empty() => Some(Command::CloseApprovalList),
+            _ => None,
+        }
+    }
+
+    /// 模型目录 overlay 键位（REQ-006 FR-006-01，D-032/ADR-003）：普通字符
+    /// 输入 query（本地即时过滤）、j/k 移动命中、Enter 选择（effort 子阶段
+    /// 确认 effort）、Esc/q 关闭、Backspace 删字符。effort 子阶段由 reducer
+    /// 依状态分派 Enter/Esc（同键位表，无独立 InputMode）。
+    fn model_catalog(&mut self, key: KeyEvent) -> Option<Command> {
+        self.pending_g = false;
+        match key.code {
+            KeyCode::Esc => Some(Command::ClosePicker),
+            KeyCode::Char('q') if key.modifiers.is_empty() => Some(Command::ClosePicker),
+            KeyCode::Enter if key.modifiers.is_empty() => Some(Command::PickerConfirm),
+            KeyCode::Char('j') if key.modifiers.is_empty() => Some(Command::PickerDown),
+            KeyCode::Char('k') if key.modifiers.is_empty() => Some(Command::PickerUp),
+            KeyCode::Backspace => Some(Command::PickerBackspace),
+            KeyCode::Char(c) if key.modifiers.is_empty() => {
+                Some(Command::PickerInput(c.to_string()))
+            }
+            _ => None,
+        }
+    }
+
+    /// 命令面板 overlay 键位（REQ-006 FR-006-03）：字符输入命令名/斜杠行、
+    /// j/k 移动候选、Enter 执行、Backspace 删、Esc/q 关闭。
+    fn command_palette(&mut self, key: KeyEvent) -> Option<Command> {
+        self.pending_g = false;
+        match key.code {
+            KeyCode::Esc => Some(Command::ClosePicker),
+            KeyCode::Char('q') if key.modifiers.is_empty() => Some(Command::ClosePicker),
+            KeyCode::Enter if key.modifiers.is_empty() => Some(Command::PickerConfirm),
+            KeyCode::Char('j') if key.modifiers.is_empty() => Some(Command::PickerDown),
+            KeyCode::Char('k') if key.modifiers.is_empty() => Some(Command::PickerUp),
+            KeyCode::Backspace => Some(Command::PickerBackspace),
+            KeyCode::Char(c) if key.modifiers.is_empty() => {
+                Some(Command::PickerInput(c.to_string()))
+            }
             _ => None,
         }
     }
@@ -570,6 +675,51 @@ mod tests {
             d.decode(InputMode::Normal, key(KeyCode::Char('o'))),
             Some(Command::OpenSelected)
         );
+        // REQ-006：`M` 打开模型目录（FR-006-01）。
+        assert_eq!(
+            d.decode(InputMode::Normal, key(KeyCode::Char('M'))),
+            Some(Command::OpenModelCatalog)
+        );
+    }
+
+    #[test]
+    fn model_catalog_mode_keys_filter_navigate_and_close_ac006() {
+        let mut d = KeyDecoder::new();
+        // 字符进查询（本地即时过滤）。
+        assert_eq!(
+            d.decode(InputMode::ModelCatalog, key(KeyCode::Char('v'))),
+            Some(Command::PickerInput("v".into()))
+        );
+        assert_eq!(
+            d.decode(InputMode::ModelCatalog, key(KeyCode::Char('4'))),
+            Some(Command::PickerInput("4".into()))
+        );
+        // j/k 移动、Enter 确认、Backspace 删、Esc/q 关闭。
+        assert_eq!(
+            d.decode(InputMode::ModelCatalog, key(KeyCode::Char('j'))),
+            Some(Command::PickerDown)
+        );
+        assert_eq!(
+            d.decode(InputMode::ModelCatalog, key(KeyCode::Char('k'))),
+            Some(Command::PickerUp)
+        );
+        assert_eq!(
+            d.decode(InputMode::ModelCatalog, key(KeyCode::Enter)),
+            Some(Command::PickerConfirm)
+        );
+        assert_eq!(
+            d.decode(InputMode::ModelCatalog, key(KeyCode::Backspace)),
+            Some(Command::PickerBackspace)
+        );
+        assert_eq!(
+            d.decode(InputMode::ModelCatalog, key(KeyCode::Esc)),
+            Some(Command::ClosePicker)
+        );
+        assert_eq!(
+            d.decode(InputMode::ModelCatalog, key(KeyCode::Char('q'))),
+            Some(Command::ClosePicker),
+            "q=关闭（与 Esc 同义）"
+        );
     }
 
     #[test]
@@ -621,6 +771,79 @@ mod tests {
         assert_eq!(
             d.decode(InputMode::Insert, key(KeyCode::Esc)),
             Some(Command::ClosePicker)
+        );
+    }
+
+    #[test]
+    fn approval_list_keys_navigate_retry_batch_and_close_ac006() {
+        let mut d = KeyDecoder::new();
+        // 单条槽：L 打开列表。
+        assert_eq!(
+            d.decode(InputMode::Approval, key(KeyCode::Char('L'))),
+            Some(Command::OpenApprovalList)
+        );
+        // 列表：j/k 移动、r 重试、A 批量、y/n 单条决策、q/Esc/L 回单条槽。
+        assert_eq!(
+            d.decode(InputMode::ApprovalList, key(KeyCode::Char('j'))),
+            Some(Command::PickerDown)
+        );
+        assert_eq!(
+            d.decode(InputMode::ApprovalList, key(KeyCode::Char('k'))),
+            Some(Command::PickerUp)
+        );
+        assert_eq!(
+            d.decode(InputMode::ApprovalList, key(KeyCode::Char('r'))),
+            Some(Command::ApprovalRetry)
+        );
+        assert_eq!(
+            d.decode(InputMode::ApprovalList, key(KeyCode::Char('A'))),
+            Some(Command::ApprovalBatchAllow)
+        );
+        assert_eq!(
+            d.decode(InputMode::ApprovalList, key(KeyCode::Char('q'))),
+            Some(Command::CloseApprovalList)
+        );
+        assert_eq!(
+            d.decode(InputMode::ApprovalList, key(KeyCode::Esc)),
+            Some(Command::CloseApprovalList)
+        );
+        assert_eq!(
+            d.decode(InputMode::ApprovalList, key(KeyCode::Char('y'))),
+            Some(Command::ApprovalAllow)
+        );
+        assert_eq!(
+            d.decode(InputMode::ApprovalList, key(KeyCode::Char('n'))),
+            Some(Command::ApprovalReject)
+        );
+        // 列表中 `q` 不回 Quit（不中止当前项）。
+        assert_ne!(
+            d.decode(InputMode::ApprovalList, key(KeyCode::Char('q'))),
+            Some(Command::Quit)
+        );
+    }
+
+    #[test]
+    fn approval_single_slot_still_decides_with_y_n_q_a_ac003() {
+        let mut d = KeyDecoder::new();
+        assert_eq!(
+            d.decode(InputMode::Approval, key(KeyCode::Char('y'))),
+            Some(Command::ApprovalAllow)
+        );
+        assert_eq!(
+            d.decode(InputMode::Approval, key(KeyCode::Char('n'))),
+            Some(Command::ApprovalReject)
+        );
+        assert_eq!(
+            d.decode(InputMode::Approval, key(KeyCode::Char('q'))),
+            Some(Command::ApprovalCancel)
+        );
+        assert_eq!(
+            d.decode(InputMode::Approval, key(KeyCode::Esc)),
+            Some(Command::ApprovalCancel)
+        );
+        assert_eq!(
+            d.decode(InputMode::Approval, key(KeyCode::Char('a'))),
+            Some(Command::ApprovalAlways)
         );
     }
 

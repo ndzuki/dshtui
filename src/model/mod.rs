@@ -7,6 +7,8 @@
 
 pub mod agent_roster;
 pub mod agent_town;
+pub mod approval;
+pub mod catalog;
 pub mod draft;
 pub mod image;
 pub mod kb_stats;
@@ -24,6 +26,8 @@ pub use agent_roster::{
     esc, fmt_elapsed, short_session, stage_key, stage_meta, AgentKind, AgentRosterEntry,
     AgentStatus, RosterSnapshot, StageMeta, STAGES,
 };
+pub use approval::{ApprovalItem, ApprovalQueue, ApprovalSummary};
+pub use catalog::{CatalogIndex, ModelCatalogItem};
 pub use draft::{DraftRegistry, DraftState, InputHistory};
 pub use image::{
     image_block_of, is_supported_image, AttachmentRef, ImageBlockRef, ImageCacheEntry,
@@ -41,7 +45,9 @@ pub use trajectory::{
     TrajKind, TrajTiming, TrajUsage, TrajectoryDetail, TrajectoryRow, TrajectorySearchIndex,
     TrajectorySearchItem, TrajectorySearchMatch, TrajectoryStore, TrajectoryWindow,
 };
-pub use workspace::{WorkspaceMeta, WorkspaceStore};
+pub use workspace::{
+    sidebar_rows, GroupBy, OrderBy, SidebarRow, WorkspaceMeta, WorkspaceStore, WorkspaceViewState,
+};
 pub use yank::{
     block_plain_text, block_yank_target, selection_text, VisualMode, VisualSelection, YankBackend,
     YankState, YankTarget,

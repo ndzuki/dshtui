@@ -287,6 +287,82 @@ fn waiting_approval_status_only_no_modal_ac003_18() {
 }
 
 #[test]
+fn approval_queue_list_renders_pending_and_failed_ac006_05_14() {
+    use dshtui::model::ApprovalQueue;
+    let mut app = AppState::new(20);
+    app.conn = ConnState::Ready;
+    app.active_session = Some(SessionId("sess-1".into()));
+    app.mode = Mode::Approval;
+    app.approval.visible = true;
+    app.approval.list_open = true;
+    // 队列：e1 失败可重试、e2 待处理。
+    let mut q = ApprovalQueue::new();
+    q.enqueue(
+        ApprovalEvent {
+            client_id: "c-1".into(),
+            event_id: "e1".into(),
+            raw: serde_json::json!({"type": "approval/request", "request": {"toolName": "bash"}}),
+        },
+        false,
+    );
+    q.enqueue(
+        ApprovalEvent {
+            client_id: "c-2".into(),
+            event_id: "e2".into(),
+            raw: serde_json::json!({"type": "approval/request", "request": {"toolName": "bash"}}),
+        },
+        false,
+    );
+    q.promote();
+    q.fail_active(); // e1 failed
+    app.approval.queue = q;
+    let backend = TestBackend::new(110, 24);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::render(frame, &app)).unwrap();
+    let text = rendered_text(&terminal);
+    assert!(text.contains("Approval 队列"), "列表标题, text={text}");
+    assert!(text.contains("FAILED"), "失败项可见, text={text}");
+    assert!(text.contains("pending"), "待处理项可见, text={text}");
+    assert!(text.contains("重试失败项"), "r 提示, text={text}");
+    assert!(text.contains("批量允许"), "A 提示, text={text}");
+}
+
+#[test]
+fn approval_danger_banner_requires_ack_ac006_16() {
+    let mut app = AppState::new(20);
+    app.conn = ConnState::Ready;
+    app.active_session = Some(SessionId("sess-1".into()));
+    app.mode = Mode::Approval;
+    app.approval.visible = true;
+    app.approval.event = Some(ApprovalEvent {
+        client_id: "c-1".into(),
+        event_id: "d1".into(),
+        raw: serde_json::json!({
+            "type": "approval/request",
+            "request": {"toolName": "danger-full-access", "reason": "rm -rf /"}
+        }),
+    });
+    app.approval.queue.enqueue(
+        ApprovalEvent {
+            client_id: "c-1".into(),
+            event_id: "d1".into(),
+            raw: serde_json::json!({
+                "type": "approval/request",
+                "request": {"toolName": "danger-full-access", "reason": "rm -rf /"}
+            }),
+        },
+        true,
+    );
+    app.approval.queue.promote();
+    let backend = TestBackend::new(110, 22);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::render(frame, &app)).unwrap();
+    let text = rendered_text(&terminal);
+    assert!(text.contains("危险操作"), "风险横幅, text={text}");
+    assert!(text.contains("确认风险"), "a=确认, text={text}");
+}
+
+#[test]
 fn copied_toast_and_steer_label_render_in_status_ac003_06_08() {
     let mut app = AppState::new(20);
     app.conn = ConnState::Ready;
@@ -740,4 +816,94 @@ fn trajectory_filter_overlay_renders_matches_ac005_05() {
     let text = rendered_text(&terminal);
     assert!(text.contains("/ db"), "过滤 query 显示, text={text}");
     assert!(text.contains("matches"), "命中计数, text={text}");
+}
+
+#[test]
+fn model_catalog_overlay_renders_rows_and_status_ac006_01() {
+    // AC-006-01（渲染侧）：模型目录 overlay 显示输入行、命中列表与模式徽标。
+    use dshtui::model::catalog::CatalogIndex;
+    let mut app = AppState::new(20);
+    app.conn = ConnState::Ready;
+    app.active_session = Some(SessionId("sess-1".into()));
+    app.mode = Mode::ModelCatalog;
+    app.model_catalog.visible = true;
+    let catalog: dshtui::api::types::ModelCatalog = serde_json::from_value(serde_json::json!({
+        "default": {"provider": "deepseek_official", "model": "deepseek-chat"},
+        "routableProviders": ["deepseek_official"],
+        "groups": [{
+            "id": "deepseek_official",
+            "name": "DeepSeek 官方",
+            "models": [
+                {"id": "deepseek-chat", "name": "DeepSeek Chat",
+                 "reasoning": {"efforts": [{"id": "low", "name": "Low"}], "defaultEffort": "low"}},
+                {"id": "deepseek-v4-pro", "name": "V4 Pro"}
+            ]
+        }],
+        "failures": []
+    }))
+    .unwrap();
+    app.model_catalog.index = {
+        let mut idx = CatalogIndex::new();
+        idx.rebuild(&catalog);
+        idx
+    };
+    app.model_catalog.phase = dshtui::app::CatalogPhase::Ready;
+    app.model_catalog.query = "chat".into();
+    app.model_catalog.current_model = Some("deepseek_official/deepseek-chat".into());
+    let backend = TestBackend::new(140, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::render(frame, &app)).unwrap();
+    let text = rendered_text(&terminal);
+    assert!(text.contains("MODEL"), "状态条 MODEL 徽标, text={text}");
+    assert!(text.contains("Model Catalog"), "面板标题, text={text}");
+    assert!(text.contains("DeepSeek Chat"), "命中行, text={text}");
+    assert!(text.contains("1/2"), "命中/总数计数, text={text}");
+    assert!(text.contains("effort: low"), "effort 元数据, text={text}");
+}
+
+#[test]
+fn sidebar_gv_grouped_vs_flat_renders_ac006_03() {
+    // AC-006-03（渲染侧）：gv 切换 groupBy 后侧栏「视图即时变化」——分组态
+    // 显示 workspace header，flat 态无 header 直接平铺。
+    use dshtui::api::types::{SessionMeta, WorkspaceId};
+    let mut app = AppState::new(20);
+    app.conn = ConnState::Ready;
+    let ws1 = WorkspaceId("ws1".into());
+    app.workspaces
+        .upsert_workspace(ws1.clone(), Some("项目A".into()));
+    let meta = |id: &str, ws: &WorkspaceId| SessionMeta {
+        id: SessionId(id.into()),
+        title: Some(format!("T-{id}")),
+        cwd: None,
+        updated_at_ms: 1,
+        running: false,
+        blank: false,
+        origin: None,
+        parent_id: None,
+        workspace: Some(ws.clone()),
+        last_turn_preview: None,
+    };
+    app.workspaces.upsert_session(meta("s1", &ws1));
+    app.workspaces
+        .attach_session_to_workspace(&ws1, &SessionId("s1".into()));
+
+    // 默认 workspace 分组：header + session（140 列 → 侧栏 32 列完整显示）。
+    let backend = TestBackend::new(140, 10);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::render(frame, &app)).unwrap();
+    let text = rendered_text(&terminal);
+    assert!(text.contains("▾ 项目A"), "分组态 header, text={text}");
+    assert!(text.contains("T-s1"), "分组态 session, text={text}");
+
+    // gv ×2 → flat（先切 order 再切 group，每按只动一轴）。
+    app.handle_command(dshtui::input::Command::CycleSidebarView);
+    app.handle_command(dshtui::input::Command::CycleSidebarView);
+    assert_eq!(app.sidebar_view.group_by, dshtui::model::GroupBy::Flat);
+    let backend = TestBackend::new(140, 10);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::render(frame, &app)).unwrap();
+    let text = rendered_text(&terminal);
+    assert!(!text.contains("▾ 项目A"), "flat 无 header, text={text}");
+    assert!(!text.contains("项目A"), "flat 无 workspace 名, text={text}");
+    assert!(text.contains("T-s1"), "flat 仍显示会话, text={text}");
 }

@@ -3,12 +3,14 @@
 pub mod agent_town;
 pub mod approval;
 pub mod chat;
+pub mod command_palette;
 pub mod composer;
 pub mod detail;
 pub mod image;
 pub mod image_view;
 pub mod layout;
 pub mod markdown;
+pub mod model_catalog;
 pub mod monitor;
 pub mod outline;
 pub mod picker;
@@ -100,6 +102,10 @@ pub fn render(frame: &mut Frame<'_>, app: &AppState) {
     outline::render(frame, areas.center, app);
     search::render(frame, areas.center, app);
     approval::render(frame, areas.center, app);
+    // REQ-006：模型目录 overlay（`M` 打开，在审批之上、帮助之下）。
+    model_catalog::render(frame, areas.center, app);
+    // REQ-006：命令面板 overlay（`:` 打开）。
+    command_palette::render(frame, areas.center, app);
     // FR-001-07：帮助 overlay 最后渲染，位于 picker 之上。
     render_help(frame, frame.area(), app);
 }
@@ -130,6 +136,10 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         ("] / [", "跳下一 / 上一轮"),
         ("↑ / ↓", "输入历史（INSERT）"),
         ("h / l", "折叠 / 展开项目"),
+        // REQ-006 键位（V0.3，D-034/D-035）：模型目录/侧栏视图/命令面板。
+        ("M", "模型目录（搜索 + 热切换）"),
+        ("gv", "侧栏视图 groupBy/orderBy（本地）"),
+        (":", "命令面板（本地命令 + 斜杠 /xxx）"),
         ("?", "帮助"),
         ("q / Ctrl+c", "退出（运行中先 stop；审批中 q=中止）"),
         ("r", "启动失败时重试探测"),

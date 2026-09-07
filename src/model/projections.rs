@@ -59,10 +59,39 @@ pub struct SessionStats {
 }
 
 /// Model selection (modelSelection): lastUsed/next.
+///
+/// Tolerates BOTH the legacy string shape (`{"lastUsed":"deepseek-chat"}`,
+/// Notes/03 §5 alpha.3) and the 0.1.2-rc.1 object shape
+/// (`{"lastUsed":{"provider","model","reasoningEffort?"}}`): each is
+/// normalized to a display string (`provider/model` for objects, raw for
+/// strings). ADR-008 — read-only, never self-computed.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ModelSelection {
     pub last_used: Option<String>,
     pub next: Option<String>,
+}
+
+/// Normalize one `modelSelection.lastUsed|next` value to a display string
+/// (string passthrough / object `provider/model`). Missing/unknown → None.
+fn wire_model_display(value: Option<&Value>) -> Option<String> {
+    let value = value?;
+    match value {
+        Value::String(s) if !s.is_empty() => Some(s.clone()),
+        Value::Object(_) => {
+            let provider = value.get("provider").and_then(Value::as_str).unwrap_or("");
+            let model = value.get("model").and_then(Value::as_str).unwrap_or("");
+            if model.is_empty() && provider.is_empty() {
+                None
+            } else if provider.is_empty() {
+                Some(model.to_string())
+            } else if model.is_empty() {
+                Some(provider.to_string())
+            } else {
+                Some(format!("{provider}/{model}"))
+            }
+        }
+        _ => None,
+    }
 }
 
 impl ProjectionSnapshot {
@@ -144,10 +173,18 @@ impl ProjectionSnapshot {
     }
 
     pub fn model_selection(&self) -> ModelSelection {
+        let raw = self.raw.get("modelSelection");
         ModelSelection {
-            last_used: self.get_str(&["modelSelection", "lastUsed"]),
-            next: self.get_str(&["modelSelection", "next"]),
+            last_used: wire_model_display(raw.and_then(|m| m.get("lastUsed"))),
+            next: wire_model_display(raw.and_then(|m| m.get("next"))),
         }
+    }
+
+    /// Whether `next` differs from `lastUsed` (the status bar shows
+    /// `last → next`; AC-006-08 状态条显示与实际一致）。
+    pub fn model_selection_changed(&self) -> bool {
+        let sel = self.model_selection();
+        sel.next.is_some() && sel.next != sel.last_used
     }
 
     /// contextBreakdown 投影明细（system/tools/message tokens，官方 shape
@@ -224,6 +261,38 @@ mod tests {
         assert_eq!(p.context_pressure().percent(), None);
         assert_eq!(p.token_usage(), TokenUsage::default());
         assert_eq!(p.session_stats(), SessionStats::default());
+        assert_eq!(p.model_selection(), ModelSelection::default());
+        assert!(!p.model_selection_changed());
+    }
+
+    #[test]
+    fn model_selection_tolerates_object_and_string_shapes_ac006_08() {
+        // 0.1.2-rc.1 对象形状。
+        let p = ProjectionSnapshot::new(serde_json::json!({
+            "modelSelection": {
+                "lastUsed": {"provider": "deepseek_official", "model": "deepseek-chat"},
+                "next": {"provider": "deepseek_official", "model": "deepseek-reasoner", "reasoningEffort": "high"}
+            }
+        }));
+        assert_eq!(
+            p.model_selection().last_used.as_deref(),
+            Some("deepseek_official/deepseek-chat")
+        );
+        assert_eq!(
+            p.model_selection().next.as_deref(),
+            Some("deepseek_official/deepseek-reasoner")
+        );
+        assert!(p.model_selection_changed(), "next ≠ lastUsed");
+
+        // legacy 字符串形状。
+        let p = ProjectionSnapshot::new(serde_json::json!({
+            "modelSelection": {"lastUsed": "deepseek-chat", "next": "deepseek-chat"}
+        }));
+        assert_eq!(
+            p.model_selection().last_used.as_deref(),
+            Some("deepseek-chat")
+        );
+        assert!(!p.model_selection_changed());
     }
 
     #[test]

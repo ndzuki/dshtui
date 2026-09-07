@@ -30,9 +30,9 @@ use crate::api::types::{
 use crate::api::{ClientError, ErrorClass};
 use crate::model::{
     block_plain_text, block_yank_target, detail_for, selection_text, ApplyEffect, AttachmentRef,
-    DraftRegistry, DraftState, FoldState, ImageViewState, Incoming, InputHistory, SearchIndex,
-    SearchKindFilter, SessionStore, TrajIncoming, VisualMode, VisualSelection, WorkspaceStore,
-    YankBackend, YankState,
+    DraftRegistry, DraftState, FoldState, ImageViewState, Incoming, InputHistory,
+    ProjectionSnapshot, SearchIndex, SearchKindFilter, SessionStore, TrajIncoming, VisualMode,
+    VisualSelection, WorkspaceStore, YankBackend, YankState,
 };
 
 /// 已编码的 Kitty 帧（ratatui-image `Protocol` 对象；`Box<dyn Protocol>` 无
@@ -63,6 +63,12 @@ pub enum Mode {
     /// Trajectory（REQ-005 V0.3，D-25）：顶部 Tab 独立模式；右栏详情为
     /// Trajectory 内焦点子层（`focus==Details` + `traj.detail_open`）。
     Trajectory,
+    /// 模型目录 overlay（REQ-006 FR-006-01，`M` 打开；ADDR-007 独立模态，
+    /// 不串 SEARCH）。
+    ModelCatalog,
+    /// 命令面板 overlay（REQ-006 FR-006-03，`:` 打开；ADR-007 独立模态，
+    /// 不串 SEARCH）。
+    CommandPalette,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -115,6 +121,15 @@ pub struct PickerState {
     pub selection: usize,
 }
 
+/// Sidebar 行光标（REQ-006 FR-006-02）：Focus::Sidebar 下 j/k 移动、
+/// Enter 打开光标行。与 active_session 高亮分离——光标标记导航行，
+/// session 行的 `●`/`○` 仍标运行/空闲（Prototype PASS：不串语义）。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SidebarState {
+    /// 渲染行下标（`sidebar_rows` 视图态行序，UI 与 reducer 共享 seam）。
+    pub cursor: usize,
+}
+
 /// Modal composer state (REQ-002 §5): visible only in INSERT.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ComposerState {
@@ -159,9 +174,11 @@ impl SearchState {
 }
 
 /// APPROVAL 模态状态（REQ-003 §5 `ApprovalState`；仅内存）。
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ApprovalState {
     pub visible: bool,
+    /// 当前展示项 = 队列 active 的镜像（REQ-006 D-036 additive：事件恒为
+    /// queue active 镜像，队列在途覆盖隐患由入队语义消除）。
     pub event: Option<ApprovalEvent>,
     pub last_outcome: Option<ApprovalOutcome>,
     /// outcome 回复在途：同一弹窗只回复一次（幂等）。
@@ -172,6 +189,448 @@ pub struct ApprovalState {
     pub waiting_hint: bool,
     /// 一次性提示（toast）。
     pub toast: Option<String>,
+    // ---------- REQ-006 审批队列扩展（D-036 additive） ----------
+    /// 串行审批队列（纯模型；pending/active/failed + 有界 granted 去重）。
+    pub queue: crate::model::ApprovalQueue,
+    /// danger-full-access 当前项第二层风险确认（AC-006-16）。
+    pub acked: bool,
+    /// 批量 allowed-once 模式：队列自动续发（≤1 在途，AC-006-15）；danger
+    /// 项停点等 ack 后继续。
+    pub batch_allow: bool,
+    /// 审批列表视图（`L` 打开：j/k 移动、`r` 重试失败项、`A` 批量、q/Esc
+    /// 回单条槽）。
+    pub list_open: bool,
+    /// 列表光标（`ApprovalQueue::list()` 下标）。
+    pub list_cursor: usize,
+    /// 会话 approval/policy 只读展示（ask|never；AC-006-17/D-037，从官方
+    /// 投影宽容解析，TUI 无切换入口）。
+    pub policy_display: Option<&'static str>,
+}
+
+impl Default for ApprovalState {
+    fn default() -> Self {
+        Self {
+            visible: false,
+            event: None,
+            last_outcome: None,
+            reply_inflight: false,
+            prev_mode: Mode::Normal,
+            waiting_hint: false,
+            toast: None,
+            queue: crate::model::ApprovalQueue::new(),
+            acked: false,
+            batch_allow: false,
+            list_open: false,
+            list_cursor: 0,
+            policy_display: None,
+        }
+    }
+}
+
+/// 模型目录 overlay 阶段（REQ-006 FR-006-01；M 打开后异步拉取）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CatalogPhase {
+    /// `session/modelCatalog` 拉取中（加载失败/断网可观察，AC-006-06）。
+    #[default]
+    Loading,
+    /// 目录就绪（含空目录 → 空态提示，AC-006-07 由 query 命中判定）。
+    Ready,
+    /// 加载失败（保留错误提示，可重开/重试）。
+    Error,
+}
+
+/// Model catalog overlay 状态（REQ-006 §5 `ModelCatalogState`；仅内存）。
+///
+/// - `index` 为扁平化后的全量目录（本地 nucleo 过滤，AC-006-01/07 即时性=
+///   本地，官方 modelCatalog 零参数）。
+/// - `current_model`/`next_model` 是官方 projections.modelSelection 的只读
+///   镜像（ADR-008，reducer 在快照/切换时刷新，不自算）。
+/// - effort 子阶段（`effort: Some`）：选中模型自带 reasoning.efforts 子集
+///   时，Enter 先选 effort 再提交（不越界 V0.4）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelCatalogState {
+    pub visible: bool,
+    pub phase: CatalogPhase,
+    /// 扁平目录（含描述/efforts 元数据；查询命中实时过滤）。
+    pub index: crate::model::CatalogIndex,
+    /// 输入行 query（nucleo 本地即时过滤）。
+    pub query: String,
+    /// 过滤后命中列表选中下标（j/k 移动）。
+    pub selection: usize,
+    /// 官方投影 current/next 的展示串（reducer 刷新，ADR-008）。
+    pub current_model: Option<String>,
+    pub next_model: Option<String>,
+    /// 最近一次加载失败提示（AC-006-06）。
+    pub load_error: Option<String>,
+    /// 最近一次 selectModel 失败 `error.code`（AC-006-09 状态条提示）。
+    pub last_error_code: Option<String>,
+    /// selectModel 在途（provider/model）：防重入（同一弹窗只提交一次）。
+    pub selecting: Option<(String, String)>,
+    /// effort 子阶段（选中模型带 reasoning.efforts 时进入）。
+    pub effort: Option<EffortPick>,
+}
+
+impl Default for ModelCatalogState {
+    fn default() -> Self {
+        Self {
+            visible: false,
+            phase: CatalogPhase::Loading,
+            index: crate::model::CatalogIndex::new(),
+            query: String::new(),
+            selection: 0,
+            current_model: None,
+            next_model: None,
+            load_error: None,
+            last_error_code: None,
+            selecting: None,
+            effort: None,
+        }
+    }
+}
+
+impl ModelCatalogState {
+    /// 重置为「打开即拉取」初态（清查询/选中/错误，保留目录在重开时刷新）。
+    pub fn reset_for_open(&mut self) {
+        self.visible = true;
+        self.phase = CatalogPhase::Loading;
+        self.query.clear();
+        self.selection = 0;
+        self.load_error = None;
+        self.last_error_code = None;
+        self.selecting = None;
+        self.effort = None;
+    }
+}
+
+/// effort 子阶段：选中模型的 reasoning effort 候选（id 列表）+ 光标。
+#[derive(Debug, Clone, PartialEq)]
+pub struct EffortPick {
+    pub provider_id: String,
+    pub model_id: String,
+    pub model_name: String,
+    /// 候选 effort id（wire `efforts[].id`；off/low/high/max…）。
+    pub efforts: Vec<String>,
+    pub default: Option<String>,
+    pub cursor: usize,
+}
+
+/// 命令面板候选的动作类型（REQ-006 FR-006-03 / D-035 + FR-006-02 操作半）。
+/// workspace/session 操作项进入 palette 输入/确认子阶段（Step 6）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaletteAction {
+    /// ≡ `M` 打开模型目录。
+    ModelCatalog,
+    /// ≡ `gv` 循环侧栏视图（本地态）。
+    CycleSidebarView,
+    /// ≡ `h` 折叠全部 workspace。
+    CollapseAll,
+    /// ≡ `l` 展开全部 workspace。
+    ExpandAll,
+    /// 新建会话（`session/create`，空 workspace；成功刷新列表）。
+    NewSession,
+    /// `help` 打开帮助。
+    Help,
+    /// 会话操作（目标 = active_session）。
+    ForkSession,
+    RenameSession,
+    ArchiveSession,
+    /// workspace 操作（目标 = sidebar 光标行 workspace；无则提示）。
+    NewWorkspace,
+    RenameWorkspace,
+    DeleteWorkspace,
+    /// 移动会话到目标 workspace（输入 workspace id / 空 = 未分组）。
+    MoveSession,
+}
+
+/// 会话/workspace 写操作（REQ-006 FR-006-02 操作半；wire 端点 Step 1 已封装）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum WorkspaceOperation {
+    /// `session/fork`（atSeq=None：当前头部 fork）。
+    ForkSession { session_id: SessionId },
+    /// `session/rename`。
+    RenameSession {
+        session_id: SessionId,
+        title: String,
+    },
+    /// `workspace/archiveSession`（归档=删除当前会话，web 按钮语义）。
+    ArchiveSession { session_id: SessionId },
+    /// `workspace/create`（path）。
+    NewWorkspace { path: String },
+    /// `workspace/rename`。
+    RenameWorkspace {
+        workspace_id: crate::api::types::WorkspaceId,
+        title: String,
+    },
+    /// `workspace/delete`（危险）。
+    DeleteWorkspace {
+        workspace_id: crate::api::types::WorkspaceId,
+    },
+    /// `workspace/insert_session_before`（移动当前会话到目标 workspace 末尾；
+    /// 目标 workspace 必填——wire 无「移出分组」端点）。
+    MoveSession {
+        session_id: SessionId,
+        target_workspace: crate::api::types::WorkspaceId,
+    },
+}
+
+impl WorkspaceOperation {
+    /// 操作名（通知/错误文案与单飞去重键）。
+    pub fn label(&self) -> &'static str {
+        match self {
+            WorkspaceOperation::ForkSession { .. } => "fork session",
+            WorkspaceOperation::RenameSession { .. } => "rename session",
+            WorkspaceOperation::ArchiveSession { .. } => "archive session",
+            WorkspaceOperation::NewWorkspace { .. } => "new workspace",
+            WorkspaceOperation::RenameWorkspace { .. } => "rename workspace",
+            WorkspaceOperation::DeleteWorkspace { .. } => "delete workspace",
+            WorkspaceOperation::MoveSession { .. } => "move session",
+        }
+    }
+
+    /// 是否为破坏性操作（archive/delete 需二次确认）。
+    pub fn dangerous(&self) -> bool {
+        matches!(
+            self,
+            WorkspaceOperation::ArchiveSession { .. } | WorkspaceOperation::DeleteWorkspace { .. }
+        )
+    }
+}
+
+/// palette 操作子阶段（Step 6）：参数输入 / 破坏性二次确认。
+#[derive(Debug, Clone, PartialEq)]
+pub enum PaletteStage {
+    /// 文本参数输入（重命名标题/新建 workspace path/移动目标）。
+    Input {
+        prompt: &'static str,
+        kind: OpArgKind,
+    },
+    /// 破坏性确认（`y` 执行 / 其它键取消）。
+    ConfirmDanger {
+        label: String,
+        op: WorkspaceOperation,
+    },
+}
+
+/// 参数输入类型（决定提交后的操作构建）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpArgKind {
+    RenameSession,
+    NewWorkspace,
+    RenameWorkspace,
+    MoveSession,
+}
+
+/// 写操作回执（`workspace/*`/`session/*` 成功后的 apply 载荷）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum OpOutcome {
+    /// 无需特别处理的成功（rename/archive/delete/move）。
+    Ack,
+    /// fork 返回新会话 id（成功后打开）。
+    ForkCreated { session_id: String },
+    /// workspace/create 返回 id（刷新 workspace follow 对账）。
+    WorkspaceCreated { workspace_id: String },
+}
+
+/// 命令面板候选条目（本地动作 / 远端斜杠命令 / V0.4 占位）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum CommandPaletteItem {
+    /// TUI 可执行动作（进入对应流程/发写命令）。
+    Local {
+        label: &'static str,
+        desc: &'static str,
+        action: PaletteAction,
+    },
+    /// 远端斜杠命令（`commands/list` 动态注册；执行经 commands/execute）。
+    Remote { name: String, desc: String },
+    /// V0.4 才有的项（settings/theme/keymap/export…），选中仅显示提示。
+    V04 {
+        label: &'static str,
+        desc: &'static str,
+    },
+}
+
+/// 命令面板 overlay 状态（REQ-006 §5 `CommandPaletteState`；仅内存）。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CommandPaletteState {
+    pub visible: bool,
+    /// 输入行（命令名前缀 / 完整斜杠行）。
+    pub query: String,
+    /// 过滤后候选选中下标。
+    pub selection: usize,
+    /// 最近一次 `commands/execute` 失败 `error.code`（AC-006-13，D-035）。
+    pub last_error_code: Option<String>,
+    /// 最近一次执行反馈（成功/失败文本；面板内显示）。
+    pub last_result: Option<String>,
+    /// 远端命令表（`commands/list` 拉取一次缓存；打开会话后可用）。
+    pub remote_commands: Vec<crate::api::types::CommandDescriptor>,
+    /// 远端命令表是否已拉取（fetch-once）。
+    pub remote_fetched: bool,
+    /// `commands/execute` 单飞（同一行只提交一次，AC-006-12/15 同源）。
+    pub executing: bool,
+    /// Step 6 操作子阶段（参数输入 / 破坏性确认；None=命令列表）。
+    pub stage: Option<PaletteStage>,
+    /// workspace/session 写操作在途（request_id + label；requestId 幂等，
+    /// AC-006-12——重复/迟到响应不重复 apply）。
+    pub op_inflight: Option<(String, &'static str)>,
+}
+
+impl CommandPaletteState {
+    /// 打开即重置为初态（保留远端缓存供重开复用；query/结果/stage 清空）。
+    pub fn reset_for_open(&mut self) {
+        self.visible = true;
+        self.query.clear();
+        self.selection = 0;
+        self.last_error_code = None;
+        self.last_result = None;
+        self.executing = false;
+        self.stage = None;
+        self.op_inflight = None;
+    }
+
+    /// 进入参数输入子阶段（清空 query 作为输入缓冲）。
+    pub fn begin_input(&mut self, kind: OpArgKind, prompt: &'static str) {
+        self.stage = Some(PaletteStage::Input { prompt, kind });
+        self.query.clear();
+        self.selection = 0;
+        self.last_result = None;
+        self.last_error_code = None;
+    }
+
+    /// 进入破坏性二次确认。
+    pub fn begin_confirm(&mut self, op: WorkspaceOperation) {
+        let label = op.label().to_string();
+        self.stage = Some(PaletteStage::ConfirmDanger { label, op });
+        self.last_result = None;
+        self.last_error_code = None;
+    }
+
+    /// 内置本地命令 + V0.4 占位（D-035 映射清单；workspace/session 操作项由
+    /// sidebar 上下文与 Step 6 执行链路承载，此处列纯本地入口）。
+    fn local_candidates() -> Vec<CommandPaletteItem> {
+        vec![
+            CommandPaletteItem::Local {
+                label: "model catalog",
+                desc: "模型目录与热切换（M）",
+                action: PaletteAction::ModelCatalog,
+            },
+            CommandPaletteItem::Local {
+                label: "new session",
+                desc: "新建会话（官方 web New session）",
+                action: PaletteAction::NewSession,
+            },
+            CommandPaletteItem::Local {
+                label: "sidebar view",
+                desc: "循环侧栏视图 groupBy/orderBy（gv）",
+                action: PaletteAction::CycleSidebarView,
+            },
+            CommandPaletteItem::Local {
+                label: "collapse all",
+                desc: "折叠全部 workspace（h）",
+                action: PaletteAction::CollapseAll,
+            },
+            CommandPaletteItem::Local {
+                label: "expand all",
+                desc: "展开全部 workspace（l）",
+                action: PaletteAction::ExpandAll,
+            },
+            CommandPaletteItem::Local {
+                label: "help",
+                desc: "键位帮助（?）",
+                action: PaletteAction::Help,
+            },
+            // ---------- REQ-006 workspace/session 操作（FR-006-02 操作半） ----------
+            CommandPaletteItem::Local {
+                label: "fork session",
+                desc: "复制当前会话为分支（成功后打开）",
+                action: PaletteAction::ForkSession,
+            },
+            CommandPaletteItem::Local {
+                label: "rename session",
+                desc: "重命名当前会话",
+                action: PaletteAction::RenameSession,
+            },
+            CommandPaletteItem::Local {
+                label: "archive session",
+                desc: "归档当前会话（危险，二次确认）",
+                action: PaletteAction::ArchiveSession,
+            },
+            CommandPaletteItem::Local {
+                label: "move session",
+                desc: "移动当前会话到目标 workspace",
+                action: PaletteAction::MoveSession,
+            },
+            CommandPaletteItem::Local {
+                label: "new workspace",
+                desc: "新建 workspace（输入路径）",
+                action: PaletteAction::NewWorkspace,
+            },
+            CommandPaletteItem::Local {
+                label: "rename workspace",
+                desc: "重命名光标所在 workspace",
+                action: PaletteAction::RenameWorkspace,
+            },
+            CommandPaletteItem::Local {
+                label: "delete workspace",
+                desc: "删除光标所在 workspace（危险，二次确认）",
+                action: PaletteAction::DeleteWorkspace,
+            },
+            CommandPaletteItem::V04 {
+                label: "settings",
+                desc: "设置面板（V0.4）",
+            },
+            CommandPaletteItem::V04 {
+                label: "theme",
+                desc: "主题切换（V0.4）",
+            },
+            CommandPaletteItem::V04 {
+                label: "keymap",
+                desc: "键位编辑（V0.4）",
+            },
+            CommandPaletteItem::V04 {
+                label: "export",
+                desc: "导出/存档（V0.4）",
+            },
+        ]
+    }
+
+    /// 全量候选（本地 + 远端斜杠）。远端需已拉取；否则仅本地。
+    pub fn all_candidates(&self) -> Vec<CommandPaletteItem> {
+        let mut out = Self::local_candidates();
+        if self.remote_fetched {
+            for c in &self.remote_commands {
+                out.push(CommandPaletteItem::Remote {
+                    name: c.name.clone(),
+                    desc: c.description.clone(),
+                });
+            }
+        }
+        out
+    }
+
+    /// 过滤后的可见候选（UI 与 reducer 共享 seam：命令名/标签前缀匹配；
+    /// 忽略前导 `:`/`/`，便于直接输入斜杠命令名）。
+    pub fn filtered(&self) -> Vec<CommandPaletteItem> {
+        let q = self
+            .query
+            .trim()
+            .trim_start_matches(':')
+            .trim_start_matches('/')
+            .to_lowercase();
+        self.all_candidates()
+            .into_iter()
+            .filter(|item| match item {
+                CommandPaletteItem::Local { label, .. } => {
+                    q.is_empty() || label.to_lowercase().contains(&q)
+                }
+                CommandPaletteItem::Remote { name, .. } => {
+                    q.is_empty() || name.to_lowercase().contains(&q)
+                }
+                CommandPaletteItem::V04 { label, .. } => {
+                    q.is_empty() || label.to_lowercase().contains(&q)
+                }
+            })
+            .collect()
+    }
 }
 
 /// turnOutline 大纲列表（`O`；D-19 独立键，与 `o` 打开不冲突）。
@@ -420,6 +879,68 @@ pub enum AppEvent {
         retryable: bool,
         for_viewer: bool,
     },
+    // ---------- REQ-006 V0.3 模型目录（FR-006-01） ----------
+    /// `session/modelCatalog` 加载成功（generation 关联在途目录；stale 忽略）。
+    ModelCatalogLoaded {
+        generation: u64,
+        catalog: crate::api::types::ModelCatalog,
+    },
+    /// `session/modelCatalog` 加载失败（目录区/状态条可观察，AC-006-06；
+    /// 权限错误不自动重试，网络走既有重连）。
+    ModelCatalogLoadFailed {
+        generation: u64,
+        error: ClientError,
+    },
+    /// `session/selectModel` 成功（服务端已确认 next；热切换生效，
+    /// AC-006-08）。
+    ModelSelected {
+        selected: crate::api::types::WireModelSelection,
+    },
+    /// `session/selectModel` 失败（显示 error.code、当前模型不变、
+    /// 权限错误不自动重试，AC-006-09）。
+    ModelSelectFailed {
+        error: ClientError,
+    },
+    // ---------- REQ-006 命令面板（FR-006-03） ----------
+    /// `commands/list` 成功（agentId=当前会话 id，官方 wire `agentId:
+    /// SessionId` 实读 0.1.2-rc.1）。
+    RemoteCommandsLoaded {
+        commands: Vec<crate::api::types::CommandDescriptor>,
+    },
+    /// `commands/list` 失败（面板内提示，不崩）。
+    RemoteCommandsFailed {
+        error: ClientError,
+    },
+    /// `commands/execute` 成功（result 文本；undefined 容忍为空成功）。
+    CommandExecuted {
+        text: Option<String>,
+    },
+    /// `commands/execute` 失败（显示 error.code，面板保持可继续输入，
+    /// AC-006-13）。
+    CommandExecuteFailed {
+        error: ClientError,
+    },
+    // ---------- REQ-006 workspace/session 操作（FR-006-02 操作半） ----------
+    /// `session/create` 成功（新建会话；刷新会话列表，web 立即可见一致，
+    /// AC-006-02/04）。
+    SessionCreated {
+        session_id: String,
+    },
+    SessionCreateFailed {
+        error: ClientError,
+    },
+    // ---------- REQ-006 workspace/session 操作回执（FR-006-02 操作半） ----------
+    /// 写操作成功（requestId 校验：与在途不一致 = 重复/迟到响应，不 apply）。
+    WorkspaceOpDone {
+        request_id: String,
+        outcome: OpOutcome,
+    },
+    /// 写操作失败（requestId 匹配才置错；本地不漂移，AC-006-10）。
+    WorkspaceOpFailed {
+        request_id: String,
+        op_name: String,
+        error: ClientError,
+    },
 }
 
 /// Orchestration commands emitted by the reducer (executed by the run loop).
@@ -508,6 +1029,34 @@ pub enum Cmd {
     CopyImageText {
         text: String,
     },
+    // ---------- REQ-006 V0.3 模型目录（FR-006-01） ----------
+    /// `session/modelCatalog` 拉取（打开 overlay 时一次；单飞 generation）。
+    FetchModelCatalog {
+        generation: u64,
+    },
+    /// `session/selectModel` 热切换（当前活动会话；reasoning effort 可选）。
+    /// 幂等：reducer 以 `selecting` 单飞守卫，同一弹窗只提交一次（AC-006-15
+    /// 同源；selectModel 请求无独立 requestId wire 字段，本地单飞足够）。
+    SelectModel {
+        provider: String,
+        model: String,
+        reasoning_effort: Option<String>,
+    },
+    // ---------- REQ-006 命令面板（FR-006-03） ----------
+    /// `commands/list` 拉取（打开命令面板且有活动会话时一次；agentId=会话）。
+    FetchRemoteCommands,
+    /// `commands/execute` 执行斜杠行（agentId=会话 id；images 空）。
+    ExecuteCommand {
+        line: String,
+    },
+    /// `session/create` 新建会话（Step 5 `new session` 命令）。
+    CreateSession,
+    /// workspace/session 写操作（FR-006-02 操作半；requestId 幂等——
+    /// 重复/迟到响应不重复 apply，AC-006-12）。
+    WorkspaceOp {
+        request_id: String,
+        op: WorkspaceOperation,
+    },
 }
 
 #[derive(Debug)]
@@ -542,6 +1091,10 @@ pub struct AppState {
     pub yank: YankState,
     /// 审批模态。
     pub approval: ApprovalState,
+    /// 模型目录 overlay（REQ-006 FR-006-01，`M` 打开）。
+    pub model_catalog: ModelCatalogState,
+    /// 命令面板 overlay（REQ-006 FR-006-03，`:` 打开）。
+    pub command_palette: CommandPaletteState,
     /// turnOutline 大纲列表（`O`）。
     pub outline: OutlineState,
     /// 焦点块游标（窗口块下标；搜索跳转/视觉选择/上下文 yank 的锚）。
@@ -567,14 +1120,20 @@ pub struct AppState {
     /// clamp 30–60 由 layout 侧执行，Notes/04 §1）。
     pub details_width_cells: u16,
     page_guard: PageGuard,
+    /// 模型目录 fetch 单飞 generation（REQ-006 FR-006-01）：打开时自增，
+    /// stale 响应（overlay 已关/已重开）直接丢弃（模式 15 in-flight 去重）。
+    catalog_generation: u64,
     want_backfill: bool,
     /// `loadThrough(seq)` 在途目标：每页合并后 reducer 判断是否已覆盖，
     /// 未覆盖且仍有更多历史则继续发下一页（AC-003-09 按 seq 落位）。
     load_through_target: Option<SessionSeq>,
     load_through_pages: usize,
     running_sessions: HashSet<SessionId>,
-    /// Workspaces collapsed via `h` (FR-001-03); `l` expands all.
-    pub collapsed_workspaces: HashSet<crate::api::types::WorkspaceId>,
+    /// 侧栏本地视图态（REQ-006 D-034：group_by/order_by/折叠；gv 仅本地态，
+    /// 无远端写）。折叠语义迁自 `collapsed_workspaces`（h 折叠 / l 展开）。
+    pub sidebar_view: crate::model::WorkspaceViewState,
+    /// 侧栏行光标（Focus::Sidebar 下 j/k 移动、Enter 打开）。
+    pub sidebar: SidebarState,
     list_cursor: Option<String>,
     list_loaded: bool,
     // ---------- REQ-004 V0.2 图片 ----------
@@ -625,6 +1184,8 @@ impl Default for AppState {
             search_index: SearchIndex::new(),
             yank: YankState::default(),
             approval: ApprovalState::default(),
+            model_catalog: ModelCatalogState::default(),
+            command_palette: CommandPaletteState::default(),
             outline: OutlineState::default(),
             cursor_block: 0,
             stop: StopState::default(),
@@ -639,11 +1200,13 @@ impl Default for AppState {
             window_cap: 200,
             details_width_cells: crate::ui::layout::DEFAULT_DETAILS_WIDTH,
             page_guard: PageGuard::default(),
+            catalog_generation: 0,
             want_backfill: false,
             load_through_target: None,
             load_through_pages: 0,
             running_sessions: HashSet::new(),
-            collapsed_workspaces: HashSet::new(),
+            sidebar_view: crate::model::WorkspaceViewState::default(),
+            sidebar: SidebarState::default(),
             list_cursor: None,
             list_loaded: false,
             kitty_capable: false,
@@ -796,6 +1359,11 @@ impl AppState {
                     if let Some(p) = projections.as_ref() {
                         self.approval.waiting_hint = projections_await_approval(p);
                     }
+                }
+                // AC-006-17：approval/policy ask|never 只读展示（宽容解析，
+                // 无 TUI 切换入口 D-037）。逐快照刷新：最新投影为准。
+                if let Some(p) = projections.as_ref() {
+                    self.approval.policy_display = crate::api::approval::policy_hint(p);
                 }
                 if running {
                     self.running_sessions.insert(session_id.clone());
@@ -1090,45 +1658,94 @@ impl AppState {
                 vec![]
             }
             AppEvent::ApprovalRequest { event } => {
-                // 同一事件重复投递（重连/重放）只保留一次（模式 15 去重）。
-                if self
-                    .approval
-                    .event
-                    .as_ref()
-                    .is_some_and(|cur| cur.event_id == event.event_id)
-                {
-                    tracing::debug!(event_id = %event.event_id, "重复审批事件忽略");
+                // 队列去重（pending/active/failed/granted 命中 → false 忽略；
+                // 模式 15 重放防护，AC-006-15/18）。danger 标记为宽容读取
+                // （api 层 needs_ack；wire `[未验证]`）。
+                // AC-006-17：帧自身携带 policy（ask|never）→ 只读展示。
+                if let Some(policy) = crate::api::approval::policy_hint(&event.raw) {
+                    self.approval.policy_display = Some(policy);
+                }
+                let danger = crate::api::approval::needs_ack(&event.raw);
+                if !self.approval.queue.enqueue(event, danger) {
+                    tracing::debug!("重复审批事件忽略（队列去重）");
                     return vec![];
                 }
-                if self.mode != Mode::Approval {
-                    self.approval.prev_mode = self.mode;
+                // 无活动项（首次到达 / 上一项已清）→ promote 进单条槽显示。
+                if self.approval.event.is_none() {
+                    self.approval_promote_display();
                 }
-                self.mode = Mode::Approval;
-                self.approval.event = Some(event);
-                self.approval.visible = true;
-                self.approval.reply_inflight = false;
-                self.approval.waiting_hint = false;
                 vec![]
             }
             AppEvent::ApprovalReplied { outcome } => {
                 self.approval.reply_inflight = false;
                 self.approval.last_outcome = Some(outcome);
                 self.approval.toast = Some(format!("审批已回复: {}", outcome.as_str()));
-                self.approval.event = None;
-                self.approval.visible = false;
-                self.mode = self.approval.prev_mode;
-                vec![]
+                let granted = outcome == ApprovalOutcome::AllowedOnce;
+                // settle 后队列自动 promote 下一 pending（≤1 在途）。
+                self.approval.queue.settle(granted);
+                // 批量模式：非 danger 停点 → 自动续发下一项（AC-006-15
+                // 串行泵；逐条 unary，无服务端批量端点）。
+                let batch_cmds = self.approval_pump_if_batch();
+                if self.approval.queue.has_active() {
+                    // 展示下一项（danger 停点等 ack 时禁用批量）。
+                    self.approval_sync_from_queue();
+                    if self.approval.queue.head_requires_ack() {
+                        self.approval.batch_allow = false;
+                        self.approval.toast = Some(
+                            "危险操作需先确认风险：按 a 确认后再允许（仍仅授权本次）".to_string(),
+                        );
+                    }
+                } else if self.approval.queue.summary().failed > 0 {
+                    // pending/active 已清但仍有失败项：留在 Approval 并打开
+                    // 列表视图（`r` 重试失败项入口，AC-006-14）。
+                    self.approval.event = None;
+                    self.approval.batch_allow = false;
+                    self.approval.list_open = true;
+                    self.approval.list_cursor = 0;
+                    self.approval.waiting_hint = false;
+                    self.approval.toast =
+                        Some("部分审批失败（已保留）：列表 [r] 重试失败项 / [q] 退出".to_string());
+                } else {
+                    // 队列全空 → 关闭弹窗恢复先前模式（AC-003 单条行为不变）。
+                    // 单条路径最常见的 toast 此刻弹窗已关不可见：转状态条
+                    // notice（Step 7 ① approval.toast 死数据修复），并清残留
+                    // 防下次打开带出陈旧文案。
+                    let closing_toast = self.approval.toast.take();
+                    self.approval.event = None;
+                    self.approval.visible = false;
+                    self.approval.waiting_hint = false;
+                    self.approval.batch_allow = false;
+                    self.approval.list_open = false;
+                    if let Some(text) = closing_toast {
+                        self.notice = Some(text);
+                    }
+                    self.mode = self.approval.prev_mode;
+                }
+                batch_cmds
             }
             AppEvent::ApprovalReplyFailed { outcome, error } => {
-                // fail closed：不授权；弹窗收缩为状态条 `等待审批` + 指引官方
-                // web（AC-003-17/18），运行状态不丢。
+                // fail closed：不授权；本条保留为失败项可单独重试（AC-006-14
+                // 部分失败语义），其余队列项自动续发继续处理。
                 self.approval.reply_inflight = false;
+                self.approval.queue.fail_active();
+                if self.approval.queue.has_active() {
+                    self.approval_sync_from_queue();
+                    let batch_cmds = self.approval_pump_if_batch();
+                    self.last_error = Some(format!(
+                        "审批回复失败（{}，不授权）: {error}；失败项可 [L] 列表重试",
+                        outcome.as_str()
+                    ));
+                    return batch_cmds;
+                }
+                // 无剩余项：收缩为状态条 `等待审批` + 指引官方 web
+                // （AC-003-17/18），失败项保留可 [L] 列表重试。
                 self.approval.event = None;
                 self.approval.visible = false;
                 self.approval.waiting_hint = true;
+                self.approval.batch_allow = false;
                 self.mode = self.approval.prev_mode;
                 self.last_error = Some(format!(
-                    "审批回复失败（{}，不授权）: {error}；请在官方 web 完成审批",
+                    "审批回复失败（{}，不授权）: {error}；请在官方 web 完成审批（失败项可 [L] 列表重试）",
                     outcome.as_str()
                 ));
                 vec![]
@@ -1147,6 +1764,8 @@ impl AppState {
                     if self.approval.event.is_none() {
                         self.approval.waiting_hint = projections_await_approval(&projections);
                     }
+                    // AC-006-17：approval/policy ask|never 只读展示。
+                    self.approval.policy_display = crate::api::approval::policy_hint(&projections);
                     if running {
                         self.running_sessions.insert(session_id.clone());
                     } else {
@@ -1251,6 +1870,201 @@ impl AppState {
                 retryable,
                 for_viewer,
             ),
+            // ---------- REQ-006：模型目录（FR-006-01） ----------
+            AppEvent::ModelCatalogLoaded {
+                generation,
+                catalog,
+            } => {
+                // stale（overlay 已关/已重开后迟到）直接丢弃（模式 15）。
+                if generation != self.catalog_generation || !self.model_catalog.visible {
+                    tracing::debug!(generation, "modelCatalog stale 响应丢弃");
+                    return vec![];
+                }
+                self.model_catalog.index.rebuild(&catalog);
+                self.model_catalog.phase = CatalogPhase::Ready;
+                self.model_catalog.load_error = None;
+                self.model_catalog.selection = 0;
+                self.model_catalog.query.clear();
+                // ADR-008：current/next 只读官方 modelSelection 投影镜像。
+                self.model_catalog.current_model = self
+                    .active_window()
+                    .map(|w| ProjectionSnapshot::new(w.projections().clone()))
+                    .and_then(|p| p.model_selection().last_used);
+                self.model_catalog.next_model = self
+                    .active_window()
+                    .map(|w| ProjectionSnapshot::new(w.projections().clone()))
+                    .and_then(|p| p.model_selection().next);
+                vec![]
+            }
+            AppEvent::ModelCatalogLoadFailed { generation, error } => {
+                if generation != self.catalog_generation || !self.model_catalog.visible {
+                    tracing::debug!(generation, "modelCatalog stale 失败丢弃");
+                    return vec![];
+                }
+                self.model_catalog.phase = CatalogPhase::Error;
+                let code = error.code();
+                // code() 各变体均非空（envelope.rs）；统一含 code 展示。
+                self.model_catalog.load_error =
+                    Some(format!("模型目录加载失败: {error}（error.code={code}）"));
+                // 权限错误不自动重试（只记录，不置 last_error 干扰重连提示）；
+                // 网络断开走既有重连（既有 open follow 流驱动）。
+                if error.class() == ErrorClass::PermissionDenied {
+                    tracing::error!(error = %error, "模型目录权限不足");
+                } else {
+                    tracing::warn!(error = %error, "模型目录加载失败");
+                }
+                vec![]
+            }
+            AppEvent::ModelSelected { selected } => {
+                self.model_catalog.selecting = None;
+                self.model_catalog.phase = CatalogPhase::Ready;
+                self.model_catalog.effort = None;
+                self.model_catalog.next_model = Some(selected.display());
+                self.model_catalog.visible = false;
+                self.mode = Mode::Normal;
+                self.notice = Some(format!(
+                    "模型已切换: {}（下一次 prompt 生效）",
+                    selected.display()
+                ));
+                vec![]
+            }
+            AppEvent::ModelSelectFailed { error } => {
+                // 当前使用模型不变（不本地改）；显示 error.code，权限错误不
+                // 自动重试（AC-006-09）。目录保持打开可继续选/退出。
+                self.model_catalog.selecting = None;
+                self.model_catalog.phase = CatalogPhase::Ready;
+                let code = error.code();
+                self.model_catalog.last_error_code = Some(code.clone());
+                self.model_catalog.load_error = Some(format!("模型切换失败: {error}"));
+                if error.class() == ErrorClass::PermissionDenied {
+                    tracing::error!(error = %error, "selectModel 权限不足");
+                } else {
+                    tracing::warn!(error = %error, "selectModel 失败");
+                }
+                vec![]
+            }
+            // ---------- REQ-006 命令面板（FR-006-03） ----------
+            AppEvent::RemoteCommandsLoaded { commands } => {
+                // 缓存命令表（fetch-once；重开命令面板复用）。
+                self.command_palette.remote_commands = commands;
+                self.command_palette.remote_fetched = true;
+                self.command_palette.selection = 0;
+                vec![]
+            }
+            AppEvent::RemoteCommandsFailed { error } => {
+                self.command_palette.last_error_code = Some(error.code());
+                self.command_palette.last_result = Some(format!("斜杠命令加载失败: {error}"));
+                tracing::warn!(error = %error, "commands/list 失败");
+                vec![]
+            }
+            AppEvent::CommandExecuted { text } => {
+                // execute 单飞结束；面板显示结果文本，保持打开可继续输入
+                // （AC-006-13 不崩溃）。
+                self.command_palette.executing = false;
+                self.command_palette.last_result = Some(match text {
+                    Some(t) if !t.trim().is_empty() => t,
+                    _ => "命令已执行".to_string(),
+                });
+                vec![]
+            }
+            AppEvent::CommandExecuteFailed { error } => {
+                // AC-006-13：显示 error.code、面板不崩溃可继续输入、权限错误
+                // 不自动重试。
+                self.command_palette.executing = false;
+                let code = error.code();
+                self.command_palette.last_error_code = Some(code);
+                self.command_palette.last_result = Some(format!("命令执行失败: {error}"));
+                if error.class() == ErrorClass::PermissionDenied {
+                    tracing::error!(error = %error, "commands/execute 权限不足");
+                } else {
+                    tracing::warn!(error = %error, "commands/execute 失败");
+                }
+                vec![]
+            }
+            // ---------- REQ-006 workspace/session 操作（FR-006-02 操作半） ----------
+            AppEvent::SessionCreated { session_id } => {
+                // 新建成功：notice + 重拉会话列表（web 一致，AC-006-02/04）。
+                self.notice = Some(format!("已新建会话 {session_id}"));
+                self.list_loaded = false;
+                vec![Cmd::LoadSessionList { cursor: None }]
+            }
+            AppEvent::SessionCreateFailed { error } => {
+                let code = error.code();
+                self.command_palette.last_error_code = Some(code);
+                self.command_palette.last_result = Some(format!("新建会话失败: {error}"));
+                if error.class() == ErrorClass::PermissionDenied {
+                    tracing::error!(error = %error, "session/create 权限不足");
+                } else {
+                    tracing::warn!(error = %error, "session/create 失败");
+                }
+                vec![]
+            }
+            // ---------- REQ-006 workspace/session 操作回执（FR-006-02） ----------
+            AppEvent::WorkspaceOpDone {
+                request_id,
+                outcome,
+            } => {
+                // requestId 幂等（AC-006-12）：与在途不匹配 = 重复/迟到响应，
+                // 不重复 apply。
+                let Some((inflight_id, label)) = self.command_palette.op_inflight.clone() else {
+                    return vec![];
+                };
+                if inflight_id != request_id {
+                    tracing::debug!(request_id, "workspace op 重复/迟到响应忽略（幂等）");
+                    return vec![];
+                }
+                self.command_palette.op_inflight = None;
+                match outcome {
+                    OpOutcome::ForkCreated { session_id } => {
+                        // fork 成功：打开新会话（web 列表经重拉一致）。
+                        let sid = SessionId(session_id.clone());
+                        self.notice = Some(format!("已创建分支会话 {session_id}"));
+                        self.list_loaded = false;
+                        let mut cmds = vec![Cmd::LoadSessionList { cursor: None }];
+                        cmds.extend(self.open_session(sid));
+                        cmds
+                    }
+                    OpOutcome::WorkspaceCreated { workspace_id } => {
+                        self.notice = Some(format!("已新建 workspace {workspace_id}"));
+                        // workspace/follow 增量对账；重拉会话列表确保一致。
+                        self.list_loaded = false;
+                        vec![Cmd::LoadSessionList { cursor: None }]
+                    }
+                    OpOutcome::Ack => {
+                        self.notice = Some(format!("操作成功: {label}（web 端同步中）"));
+                        // 本地列表不经手改（不漂移）；重拉会话列表与 web 对账
+                        // （AC-006-02 操作后 web 立即可见一致）。
+                        self.list_loaded = false;
+                        vec![Cmd::LoadSessionList { cursor: None }]
+                    }
+                }
+            }
+            AppEvent::WorkspaceOpFailed {
+                request_id,
+                op_name,
+                error,
+            } => {
+                // 仅当与在途匹配才落错（迟到失败不覆盖新状态）。
+                if self
+                    .command_palette
+                    .op_inflight
+                    .as_ref()
+                    .is_some_and(|(rid, _)| *rid == request_id)
+                {
+                    self.command_palette.op_inflight = None;
+                    let code = error.code();
+                    self.command_palette.last_error_code = Some(code);
+                    self.command_palette.last_result = Some(format!("{op_name} 失败: {error}"));
+                    // AC-006-10：本地列表不漂移（未收到成功前不改本地）；
+                    // 权限错误不自动重试。
+                    if error.class() == ErrorClass::PermissionDenied {
+                        tracing::error!(error = %error, "{op_name} 权限不足");
+                    } else {
+                        tracing::warn!(error = %error, "{op_name} 失败");
+                    }
+                }
+                vec![]
+            }
         }
     }
 
@@ -1868,6 +2682,19 @@ impl AppState {
                         _ => {}
                     }
                     vec![]
+                } else if self.mode == Mode::Normal
+                    && self.focus == Focus::Sidebar
+                    && matches!(cmd, C::MoveDown | C::MoveUp)
+                {
+                    // REQ-006（D-034/Step 4 Prototype PASS）：Focus::Sidebar 下
+                    // j/k 移动侧栏行光标（不触发 Chat 滚动）；Chat 滚动需在
+                    // Center/Details 焦点（Ctrl+w 循环）。半页/G/gg 仍是滚动。
+                    if cmd == C::MoveDown {
+                        self.sidebar_cursor_move(true);
+                    } else {
+                        self.sidebar_cursor_move(false);
+                    }
+                    vec![]
                 } else {
                     self.scroll(cmd)
                 }
@@ -1902,6 +2729,10 @@ impl AppState {
                     self.mode = Mode::Normal;
                     vec![]
                 }
+                Mode::Approval if self.approval.list_open => {
+                    // Esc 在审批列表 = 回单条槽不中止（REQ-006 D-036）。
+                    self.approval_close_list()
+                }
                 Mode::Approval => {
                     // Esc 在审批弹窗 = cancelled 决策（不退出程序）。
                     self.approval_decide(ApprovalOutcome::Cancelled)
@@ -1918,9 +2749,39 @@ impl AppState {
                 // REQ-005：Trajectory Esc（详情/过滤关闭）已由分流处理；
                 // 此处保持穷尽性。
                 Mode::Trajectory => vec![],
+                // REQ-006：模型目录 q/Esc 关闭（effort 子阶段先退一级回主列表，
+                // 再按一次才关闭整个目录）。
+                Mode::ModelCatalog => {
+                    if self.model_catalog.effort.is_some() {
+                        self.model_catalog.effort = None;
+                        self.model_catalog.selection = 0;
+                    } else {
+                        self.close_model_catalog();
+                    }
+                    vec![]
+                }
+                // REQ-006：命令面板 q/Esc——输入/确认子阶段先取消回列表，
+                // 无子阶段才关闭面板。
+                Mode::CommandPalette => {
+                    if self.command_palette.stage.is_some() {
+                        self.command_palette.stage = None;
+                        self.command_palette.query.clear();
+                        self.command_palette.selection = 0;
+                    } else {
+                        self.close_command_palette();
+                    }
+                    vec![]
+                }
             },
             C::PickerDown => {
-                if self.mode == Mode::Search {
+                if self.approval.list_open && self.mode == Mode::Approval {
+                    // REQ-006 审批列表：j/k 移动光标。
+                    let total = self.approval.queue.len();
+                    if total > 0 {
+                        self.approval.list_cursor = (self.approval.list_cursor + 1).min(total - 1);
+                    }
+                    vec![]
+                } else if self.mode == Mode::Search {
                     if !self.search.results_locked {
                         // 编辑段：j 是输入字符。
                         return self.search_input("j");
@@ -1930,28 +2791,52 @@ impl AppState {
                         self.search.history_selection =
                             (self.search.history_selection + 1).min(total - 1);
                     }
+                    vec![]
+                } else if self.mode == Mode::ModelCatalog {
+                    self.model_catalog_cursor_move(true);
+                    vec![]
+                } else if self.mode == Mode::CommandPalette {
+                    self.command_palette_cursor_move(true);
+                    vec![]
                 } else {
                     self.picker.selection += 1;
+                    vec![]
                 }
-                vec![]
             }
             C::PickerUp => {
-                if self.mode == Mode::Search {
+                if self.approval.list_open && self.mode == Mode::Approval {
+                    // REQ-006 审批列表：j/k 移动光标。
+                    self.approval.list_cursor = self.approval.list_cursor.saturating_sub(1);
+                    vec![]
+                } else if self.mode == Mode::Search {
                     if !self.search.results_locked {
                         // 编辑段：k 是输入字符。
                         return self.search_input("k");
                     }
                     self.search.history_selection = self.search.history_selection.saturating_sub(1);
+                    vec![]
+                } else if self.mode == Mode::ModelCatalog {
+                    self.model_catalog_cursor_move(false);
+                    vec![]
+                } else if self.mode == Mode::CommandPalette {
+                    self.command_palette_cursor_move(false);
+                    vec![]
                 } else {
                     self.picker.selection = self.picker.selection.saturating_sub(1);
+                    vec![]
                 }
-                vec![]
             }
             C::PickerInput(text) => {
                 if self.mode == Mode::Insert {
                     self.composer_input(&text)
                 } else if self.mode == Mode::Search {
                     self.search_input(&text)
+                } else if self.mode == Mode::ModelCatalog {
+                    self.model_catalog_input(&text);
+                    vec![]
+                } else if self.mode == Mode::CommandPalette {
+                    self.command_palette_input(&text);
+                    vec![]
                 } else {
                     self.picker.query.push_str(&text);
                     self.picker.selection = 0;
@@ -1963,6 +2848,12 @@ impl AppState {
                     self.composer_backspace()
                 } else if self.mode == Mode::Search {
                     self.search_input_backspace()
+                } else if self.mode == Mode::ModelCatalog {
+                    self.model_catalog_backspace();
+                    vec![]
+                } else if self.mode == Mode::CommandPalette {
+                    self.command_palette_backspace();
+                    vec![]
                 } else {
                     self.picker.query.pop();
                     vec![]
@@ -2048,14 +2939,19 @@ impl AppState {
                     self.open_focused_image()
                 } else {
                     match self.focus {
-                        Focus::Sidebar => self.open_session_from_selection(),
+                        // REQ-006：Sidebar `o` 打开光标行（session→open；
+                        // workspace header→折叠/展开）。
+                        Focus::Sidebar => self.open_sidebar_cursor_row(),
                         _ => self.open_external_at_cursor(),
                     }
                 }
             }
             C::OpenFocused => {
-                // NORMAL Enter：仅中心区图片焦点打开图片（D-14）。
-                if self.focus == Focus::Center && self.focused_image_block().is_some() {
+                // NORMAL Enter：Center 图片打开；REQ-006 Sidebar Enter 打开
+                // 光标行（session/workspace）。
+                if self.focus == Focus::Sidebar {
+                    self.open_sidebar_cursor_row()
+                } else if self.focus == Focus::Center && self.focused_image_block().is_some() {
                     self.open_focused_image()
                 } else {
                     vec![]
@@ -2111,13 +3007,15 @@ impl AppState {
             }
             C::StopRunning => self.request_stop(),
             C::CollapseProject => {
-                for workspace in &self.workspaces.workspaces {
-                    self.collapsed_workspaces.insert(workspace.id.clone());
-                }
+                // h：折叠所有 workspace（本地视图态，D-034）。
+                self.sidebar_view.collapse_all(&self.workspaces);
+                self.clamp_sidebar_cursor();
                 vec![]
             }
             C::ExpandProject => {
-                self.collapsed_workspaces.clear();
+                // l：展开全部 workspace。
+                self.sidebar_view.expand_all();
+                self.clamp_sidebar_cursor();
                 vec![]
             }
             C::PickerConfirm => match self.mode {
@@ -2131,6 +3029,11 @@ impl AppState {
                     }
                 }
                 Mode::Search => self.search_confirm(),
+                // REQ-006：模型目录 Enter——主列表：选中模型（带 efforts →
+                // 进 effort 子阶段）；effort 子阶段：确认 effort 提交热切换。
+                Mode::ModelCatalog => self.model_catalog_confirm(),
+                // REQ-006：命令面板 Enter——执行选中候选。
+                Mode::CommandPalette => self.command_palette_confirm(),
                 // APPROVAL 仅 y/n/q/Esc/a（§3 键位边界；Enter 无语义，no-op）。
                 Mode::Normal if self.outline.open => self.outline_confirm(),
                 _ => vec![],
@@ -2139,14 +3042,30 @@ impl AppState {
             C::ApprovalReject => self.approval_decide(ApprovalOutcome::Rejected),
             C::ApprovalCancel => self.approval_decide(ApprovalOutcome::Cancelled),
             C::ApprovalAlways => {
-                // `a` 非 outcome 词表：TUI 不代远端切换 approval/policy=never
-                // （REQ-I04 V0.4），只显示指引（D-18）。
-                self.approval.toast = Some(
-                    "始终允许需在官方 web 策略设置中切换（approval/policy=never，V0.4）"
-                        .to_string(),
-                );
-                vec![]
+                if self.approval.queue.head_requires_ack() {
+                    // danger-full-access 项：`a` = 风险确认（第二层确认，
+                    // AC-006-16；确认后仍仅 allowed-once，不提升策略 D-037）。
+                    if self.approval.queue.ack_active() {
+                        self.approval.acked = true;
+                        self.approval.toast =
+                            Some("风险已确认；仍仅授权本次（allowed-once）".to_string());
+                    }
+                    vec![]
+                } else {
+                    // `a` 非 outcome 词表：TUI 不代远端切换 approval/policy
+                    // =never（REQ-I04 V0.4），只显示指引（D-18）。
+                    self.approval.toast = Some(
+                        "始终允许需在官方 web 策略设置中切换（approval/policy=never，V0.4）"
+                            .to_string(),
+                    );
+                    vec![]
+                }
             }
+            // REQ-006 审批列表/批量/重试（D-036）。
+            C::OpenApprovalList => self.approval_open_list(),
+            C::ApprovalRetry => self.approval_retry_list_item(),
+            C::ApprovalBatchAllow => self.approval_batch_allow(),
+            C::CloseApprovalList => self.approval_close_list(),
             C::OpenSession(sid) => self.open_session(sid),
             C::OpenHelp => {
                 self.help_open = true;
@@ -2166,7 +3085,10 @@ impl AppState {
             }
             C::ToggleWorkspace => vec![],
             C::Quit => {
-                if self.mode == Mode::Approval {
+                if self.mode == Mode::Approval && self.approval.list_open {
+                    // APPROVAL 列表中 `q` = 回单条槽不中止（REQ-006 D-036）。
+                    self.approval_close_list()
+                } else if self.mode == Mode::Approval {
                     // APPROVAL 中 `q` = 中止当前审批（cancelled），不退出
                     // （REQ-003 §3 `q` 键位边界）。
                     self.approval_decide(ApprovalOutcome::Cancelled)
@@ -2177,6 +3099,48 @@ impl AppState {
             C::RetryProbe => {
                 self.conn = ConnState::Connecting;
                 self.startup_guidance = None;
+                vec![]
+            }
+            // REQ-006：模型目录 `M` 打开（仅 NORMAL；打开即拉取目录）。
+            C::OpenModelCatalog => {
+                if self.mode == Mode::Normal {
+                    self.open_model_catalog()
+                } else {
+                    vec![]
+                }
+            }
+            // REQ-006：命令面板 `:` 打开（仅 NORMAL）。
+            C::OpenCommandPalette => {
+                if self.mode == Mode::Normal {
+                    self.open_command_palette()
+                } else {
+                    vec![]
+                }
+            }
+            // REQ-006：INSERT Tab 呼出命令面板（预填当前 `/` 斜杠命令词，
+            // FR-006-03 基础补全；Esc 回 composer 保留草稿）。
+            C::ComposerTabComplete => {
+                if self.mode != Mode::Insert || !self.composer.visible {
+                    return vec![];
+                }
+                let prefix = self.draft_slash_command_prefix();
+                if prefix.is_empty() {
+                    self.notice = Some("Tab 补全：先输入 / 开头的斜杠命令名".to_string());
+                    return vec![];
+                }
+                self.open_command_palette_with_query(prefix)
+            }
+            // REQ-006：`gv` 循环侧栏视图（本地态，AC-006-03/11 无写）。
+            C::CycleSidebarView => {
+                if self.mode == Mode::Normal {
+                    self.sidebar_view.cycle();
+                    self.clamp_sidebar_cursor();
+                    self.notice = Some(format!(
+                        "视图: group={} order={}",
+                        self.sidebar_view.group_by.as_str(),
+                        self.sidebar_view.order_by.as_str()
+                    ));
+                }
                 vec![]
             }
 
@@ -2612,6 +3576,550 @@ impl AppState {
         self.search.results_locked = false;
     }
 
+    // ---------- REQ-006 Sidebar 行光标与视图态（FR-006-02，D-034） ----------
+
+    /// 侧栏可见行数（视图态行序，`sidebar_rows` 纯函数；UI 与 reducer 共享）。
+    fn sidebar_row_len(&self) -> usize {
+        crate::model::sidebar_rows(&self.sidebar_view, &self.workspaces).len()
+    }
+
+    fn clamp_sidebar_cursor(&mut self) {
+        let len = self.sidebar_row_len();
+        if len == 0 {
+            self.sidebar.cursor = 0;
+        } else if self.sidebar.cursor >= len {
+            self.sidebar.cursor = len - 1;
+        }
+    }
+
+    /// j/k（Focus::Sidebar）：移动行光标（不触发 Chat 滚动）。
+    fn sidebar_cursor_move(&mut self, down: bool) {
+        let len = self.sidebar_row_len();
+        if len == 0 {
+            return;
+        }
+        if down {
+            self.sidebar.cursor = (self.sidebar.cursor + 1).min(len - 1);
+        } else {
+            self.sidebar.cursor = self.sidebar.cursor.saturating_sub(1);
+        }
+    }
+
+    /// 光标行目标（session / workspace header）。
+    fn sidebar_cursor_row(&self) -> Option<crate::model::SidebarRow> {
+        crate::model::sidebar_rows(&self.sidebar_view, &self.workspaces)
+            .into_iter()
+            .nth(self.sidebar.cursor)
+    }
+
+    /// Enter/`o`（Focus::Sidebar）：打开光标行——session → open follow；
+    /// workspace header → 折叠/展开（本地视图态）。
+    fn open_sidebar_cursor_row(&mut self) -> Vec<Cmd> {
+        use crate::model::SidebarRow as Row;
+        match self.sidebar_cursor_row() {
+            Some(Row::Session(id)) => self.open_session(id),
+            Some(Row::WorkspaceHeader { id, .. }) => {
+                self.sidebar_view.toggle(&id);
+                self.clamp_sidebar_cursor();
+                vec![]
+            }
+            None => vec![],
+        }
+    }
+
+    // ---------- REQ-006 模型目录（FR-006-01） ----------
+
+    /// `M` 打开模型目录 overlay：重置为加载态并拉取 `session/modelCatalog`
+    /// （单飞 generation；仅 NORMAL 语义，调用方已检查）。
+    fn open_model_catalog(&mut self) -> Vec<Cmd> {
+        self.mode = Mode::ModelCatalog;
+        self.model_catalog.reset_for_open();
+        // 读一次当前官方 modelSelection 投影（ADR-008；会话级镜像）。
+        let projections = self
+            .active_window()
+            .map(|w| ProjectionSnapshot::new(w.projections().clone()));
+        if let Some(p) = projections.as_ref() {
+            let sel = p.model_selection();
+            self.model_catalog.current_model = sel.last_used;
+            self.model_catalog.next_model = sel.next;
+        }
+        self.catalog_generation = self.catalog_generation.wrapping_add(1);
+        vec![Cmd::FetchModelCatalog {
+            generation: self.catalog_generation,
+        }]
+    }
+
+    /// q/Esc 关闭模型目录（effort 子阶段已先退一级；此处直接关闭）。
+    fn close_model_catalog(&mut self) {
+        self.model_catalog.visible = false;
+        self.model_catalog.effort = None;
+        self.model_catalog.selecting = None;
+        // 作废在途目录拉取（迟到响应丢弃）。
+        self.catalog_generation = self.catalog_generation.wrapping_add(1);
+        self.mode = Mode::Normal;
+    }
+
+    /// 主列表过滤命中（UI 与 reducer 共用同一 seam：`CatalogIndex::query`）。
+    fn model_catalog_hits(&self) -> Vec<&crate::model::ModelCatalogItem> {
+        self.model_catalog.index.query(&self.model_catalog.query)
+    }
+
+    /// j/k 移动光标：effort 子阶段移 effort 候选；主列表移命中行。
+    fn model_catalog_cursor_move(&mut self, down: bool) {
+        if let Some(pick) = self.model_catalog.effort.as_mut() {
+            if down {
+                if !pick.efforts.is_empty() {
+                    pick.cursor = (pick.cursor + 1).min(pick.efforts.len() - 1);
+                }
+            } else {
+                pick.cursor = pick.cursor.saturating_sub(1);
+            }
+            return;
+        }
+        let total = self.model_catalog_hits().len();
+        if total == 0 {
+            return;
+        }
+        if down {
+            self.model_catalog.selection = (self.model_catalog.selection + 1).min(total - 1);
+        } else {
+            self.model_catalog.selection = self.model_catalog.selection.saturating_sub(1);
+        }
+    }
+
+    /// 字符输入进 query（effort 子阶段输入忽略，避免误改查询词）。
+    fn model_catalog_input(&mut self, text: &str) {
+        if self.model_catalog.effort.is_some() {
+            return;
+        }
+        self.model_catalog.query.push_str(text);
+        self.model_catalog.selection = 0;
+    }
+
+    fn model_catalog_backspace(&mut self) {
+        if self.model_catalog.effort.is_some() {
+            return;
+        }
+        self.model_catalog.query.pop();
+        self.model_catalog.selection = 0;
+    }
+
+    /// Enter：主列表 → 选中模型（自带 efforts → 进 effort 子阶段，否则直接
+    /// 热切换）；effort 子阶段 → 确认 effort 提交。Error 态 Enter = 重试加载。
+    /// selectModel 单飞：`selecting` 在途时忽略（同一弹窗只提交一次，
+    /// AC-006-15 同源守卫）。
+    fn model_catalog_confirm(&mut self) -> Vec<Cmd> {
+        if self.model_catalog.selecting.is_some() {
+            return vec![];
+        }
+        match self.model_catalog.phase {
+            CatalogPhase::Error => {
+                // 重试加载（恢复后重试成功，AC-006-06）。
+                self.model_catalog.phase = CatalogPhase::Loading;
+                self.model_catalog.load_error = None;
+                self.model_catalog.last_error_code = None;
+                self.catalog_generation = self.catalog_generation.wrapping_add(1);
+                return vec![Cmd::FetchModelCatalog {
+                    generation: self.catalog_generation,
+                }];
+            }
+            CatalogPhase::Loading => return vec![],
+            CatalogPhase::Ready => {}
+        }
+        // effort 子阶段确认。
+        if let Some(pick) = self.model_catalog.effort.clone() {
+            let effort = pick
+                .efforts
+                .get(pick.cursor)
+                .cloned()
+                .or(pick.default.clone());
+            self.model_catalog.effort = None;
+            self.model_catalog.selection = 0;
+            return self.model_catalog_submit(pick.provider_id, pick.model_id, effort);
+        }
+        // 主列表：选中行（与 UI 同 query 同序）。
+        let Some(item) = self
+            .model_catalog_hits()
+            .into_iter()
+            .nth(self.model_catalog.selection)
+            .cloned()
+        else {
+            return vec![];
+        };
+        if !item.reasoning_efforts.is_empty() {
+            // 模型自带 reasoning efforts → 先选 effort（不越界 V0.4）。
+            let default_idx = item
+                .default_effort
+                .as_ref()
+                .and_then(|d| item.reasoning_efforts.iter().position(|e| e == d))
+                .unwrap_or(0);
+            self.model_catalog.effort = Some(EffortPick {
+                provider_id: item.provider_id,
+                model_id: item.model_id,
+                model_name: item.model_name,
+                efforts: item.reasoning_efforts,
+                default: item.default_effort,
+                cursor: default_idx,
+            });
+            return vec![];
+        }
+        self.model_catalog_submit(item.provider_id, item.model_id, None)
+    }
+
+    /// 发起 `session/selectModel`（无活动会话 → 目录区提示，不发命令）。
+    fn model_catalog_submit(
+        &mut self,
+        provider: String,
+        model: String,
+        reasoning_effort: Option<String>,
+    ) -> Vec<Cmd> {
+        if self.active_session.is_none() {
+            self.model_catalog.load_error =
+                Some("无打开的会话：先用 f/o 打开会话再切换模型".into());
+            return vec![];
+        }
+        self.model_catalog.selecting = Some((provider.clone(), model.clone()));
+        self.model_catalog.load_error = None;
+        self.model_catalog.last_error_code = None;
+        vec![Cmd::SelectModel {
+            provider,
+            model,
+            reasoning_effort,
+        }]
+    }
+
+    // ---------- REQ-006 命令面板（FR-006-03，`:`） ----------
+
+    /// `:` 打开命令面板：重置输入态；有活动会话则拉取远端斜杠命令表
+    /// （fetch-once：已拉取重开复用不重拉）。
+    fn open_command_palette(&mut self) -> Vec<Cmd> {
+        self.open_command_palette_with_query(String::new())
+    }
+
+    /// 打开命令面板并预填 query（composer Tab 补全 / `:` 均走此；前缀以
+    /// `/` 开头时命中远端斜杠命令候选）。
+    fn open_command_palette_with_query(&mut self, query: String) -> Vec<Cmd> {
+        self.mode = Mode::CommandPalette;
+        self.command_palette.reset_for_open();
+        self.command_palette.query = query;
+        let mut cmds = Vec::new();
+        if !self.command_palette.remote_fetched && self.active_session.is_some() {
+            cmds.push(Cmd::FetchRemoteCommands);
+        }
+        cmds
+    }
+
+    /// q/Esc 关闭命令面板：从 composer Tab 进入时回 INSERT（草稿保留，
+    /// 下次 Enter 仍是发送 prompt）；否则回 NORMAL。
+    fn close_command_palette(&mut self) {
+        self.command_palette.visible = false;
+        self.command_palette.executing = false;
+        self.command_palette.stage = None;
+        if self.composer.visible {
+            self.mode = Mode::Insert;
+        } else {
+            self.mode = Mode::Normal;
+        }
+    }
+
+    /// j/k 移动候选光标。
+    fn command_palette_cursor_move(&mut self, down: bool) {
+        let total = self.command_palette.filtered().len();
+        if total == 0 {
+            return;
+        }
+        if down {
+            self.command_palette.selection = (self.command_palette.selection + 1).min(total - 1);
+        } else {
+            self.command_palette.selection = self.command_palette.selection.saturating_sub(1);
+        }
+    }
+
+    /// 字符输入（输入过滤；重新选中首项）。
+    fn command_palette_input(&mut self, text: &str) {
+        self.command_palette.query.push_str(text);
+        self.command_palette.selection = 0;
+        self.command_palette.last_result = None;
+        self.command_palette.last_error_code = None;
+    }
+
+    fn command_palette_backspace(&mut self) {
+        self.command_palette.query.pop();
+        self.command_palette.selection = 0;
+        self.command_palette.last_result = None;
+        self.command_palette.last_error_code = None;
+    }
+
+    /// Enter：执行选中候选（本地动作 → reducer 直执行；远端 → Cmd 单飞；
+    /// V0.4 → 面板提示不执行）。
+    fn command_palette_confirm(&mut self) -> Vec<Cmd> {
+        // 操作子阶段优先：参数输入提交 / 破坏性确认执行。
+        if let Some(stage) = self.command_palette.stage.clone() {
+            return match stage {
+                PaletteStage::Input { kind, .. } => self.palette_stage_input_commit(kind),
+                PaletteStage::ConfirmDanger { op, .. } => self.palette_send_op(op),
+            };
+        }
+        let Some(item) = self
+            .command_palette
+            .filtered()
+            .into_iter()
+            .nth(self.command_palette.selection)
+        else {
+            return vec![];
+        };
+        match item {
+            CommandPaletteItem::Local { action, .. } => match action {
+                // workspace/session 操作：留在面板（输入/确认子阶段或直接发）。
+                PaletteAction::ForkSession
+                | PaletteAction::RenameSession
+                | PaletteAction::ArchiveSession
+                | PaletteAction::MoveSession
+                | PaletteAction::NewWorkspace
+                | PaletteAction::RenameWorkspace
+                | PaletteAction::DeleteWorkspace => self.palette_begin_operation(action),
+                action => {
+                    self.command_palette.visible = false;
+                    // 从 composer Tab 进入时 Local 动作后回 INSERT（草稿保留）。
+                    self.mode = if self.composer.visible {
+                        Mode::Insert
+                    } else {
+                        Mode::Normal
+                    };
+                    match action {
+                        PaletteAction::ModelCatalog => self.open_model_catalog(),
+                        PaletteAction::CycleSidebarView => {
+                            self.sidebar_view.cycle();
+                            self.clamp_sidebar_cursor();
+                            self.notice = Some(format!(
+                                "视图: group={} order={}",
+                                self.sidebar_view.group_by.as_str(),
+                                self.sidebar_view.order_by.as_str()
+                            ));
+                            vec![]
+                        }
+                        PaletteAction::CollapseAll => {
+                            self.sidebar_view.collapse_all(&self.workspaces);
+                            self.clamp_sidebar_cursor();
+                            vec![]
+                        }
+                        PaletteAction::ExpandAll => {
+                            self.sidebar_view.expand_all();
+                            self.clamp_sidebar_cursor();
+                            vec![]
+                        }
+                        PaletteAction::NewSession => {
+                            // 关闭面板（保持 NORMAL）再发 create；结果事件返回。
+                            vec![Cmd::CreateSession]
+                        }
+                        PaletteAction::Help => {
+                            self.help_open = true;
+                            vec![]
+                        }
+                        PaletteAction::ForkSession
+                        | PaletteAction::RenameSession
+                        | PaletteAction::ArchiveSession
+                        | PaletteAction::MoveSession
+                        | PaletteAction::NewWorkspace
+                        | PaletteAction::RenameWorkspace
+                        | PaletteAction::DeleteWorkspace => unreachable!("上方已处理"),
+                    }
+                }
+            },
+            CommandPaletteItem::Remote { name, .. } => {
+                // 单飞：同一命令行只提交一次（AC-006-12/13）。
+                if self.command_palette.executing {
+                    return vec![];
+                }
+                // 执行完整斜杠行（query 中可能带参数，如 `/plan off`）。
+                let line = if self.command_palette.query.trim_start().starts_with('/') {
+                    self.command_palette.query.trim().to_string()
+                } else {
+                    format!("/{name}")
+                };
+                self.command_palette.executing = true;
+                self.command_palette.last_result = None;
+                self.command_palette.last_error_code = None;
+                vec![Cmd::ExecuteCommand { line }]
+            }
+            CommandPaletteItem::V04 { label, .. } => {
+                // 非目标项：显示禁用提示（REQ-007 V0.4），面板保持可输入。
+                self.command_palette.last_result =
+                    Some(format!("{label} 在 V0.4 提供（当前版本不可用）"));
+                vec![]
+            }
+        }
+    }
+
+    /// 操作项开始：目标校验 → 无参操作直接发（返回其 Cmd）/ 需参数进入输入
+    /// 子阶段（返回空）/ 危险操作先确认。
+    fn palette_begin_operation(&mut self, action: PaletteAction) -> Vec<Cmd> {
+        // 校验目标是否存在（会话操作 → active_session；workspace 操作 →
+        // sidebar 光标 workspace）。
+        match action {
+            PaletteAction::ForkSession
+            | PaletteAction::RenameSession
+            | PaletteAction::ArchiveSession
+            | PaletteAction::MoveSession => {
+                if self.active_session.is_none() {
+                    self.command_palette.last_result = Some("无活动会话：先用 f/o 打开会话".into());
+                    return vec![];
+                }
+            }
+            PaletteAction::NewWorkspace => {}
+            PaletteAction::RenameWorkspace | PaletteAction::DeleteWorkspace => {
+                if self.palette_workspace_target().is_none() {
+                    self.command_palette.last_result =
+                        Some("请先将侧栏光标移到 workspace 或其会话".into());
+                    return vec![];
+                }
+            }
+            _ => unreachable!(),
+        }
+        match action {
+            PaletteAction::ForkSession => {
+                // 无参直接发（fork 当前活动会话）。
+                let op = WorkspaceOperation::ForkSession {
+                    session_id: self.active_session.clone().unwrap(),
+                };
+                self.palette_execute_op(op)
+            }
+            PaletteAction::ArchiveSession => {
+                let op = WorkspaceOperation::ArchiveSession {
+                    session_id: self.active_session.clone().unwrap(),
+                };
+                // dangerous → 进入确认（返回空）。
+                self.palette_execute_op(op)
+            }
+            PaletteAction::DeleteWorkspace => {
+                let wid = self.palette_workspace_target().unwrap();
+                let op = WorkspaceOperation::DeleteWorkspace { workspace_id: wid };
+                // dangerous → 进入确认（返回空）。
+                self.palette_execute_op(op)
+            }
+            PaletteAction::RenameSession => {
+                self.command_palette
+                    .begin_input(OpArgKind::RenameSession, "会话新标题");
+                vec![]
+            }
+            PaletteAction::MoveSession => {
+                self.command_palette
+                    .begin_input(OpArgKind::MoveSession, "目标 workspace id");
+                vec![]
+            }
+            PaletteAction::NewWorkspace => {
+                self.command_palette
+                    .begin_input(OpArgKind::NewWorkspace, "workspace 路径");
+                vec![]
+            }
+            PaletteAction::RenameWorkspace => {
+                self.command_palette
+                    .begin_input(OpArgKind::RenameWorkspace, "workspace 新标题");
+                vec![]
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    /// 参数输入子阶段 Enter：按类型构建操作并执行（危险操作先进确认）。
+    fn palette_stage_input_commit(&mut self, kind: OpArgKind) -> Vec<Cmd> {
+        let text = self.command_palette.query.trim().to_string();
+        let op = match kind {
+            OpArgKind::RenameSession => {
+                let Some(session_id) = self.active_session.clone() else {
+                    self.command_palette.last_result = Some("无活动会话：先用 f/o 打开会话".into());
+                    return vec![];
+                };
+                if text.is_empty() {
+                    self.command_palette.last_result = Some("标题不能为空".into());
+                    return vec![];
+                }
+                Some(WorkspaceOperation::RenameSession {
+                    session_id,
+                    title: text,
+                })
+            }
+            OpArgKind::NewWorkspace => {
+                if text.is_empty() {
+                    self.command_palette.last_result = Some("路径不能为空".into());
+                    return vec![];
+                }
+                Some(WorkspaceOperation::NewWorkspace { path: text })
+            }
+            OpArgKind::RenameWorkspace => {
+                if text.is_empty() {
+                    self.command_palette.last_result = Some("标题不能为空".into());
+                    return vec![];
+                }
+                let Some(workspace_id) = self.palette_workspace_target() else {
+                    self.command_palette.last_result =
+                        Some("请先将侧栏光标移到 workspace 或其会话".into());
+                    return vec![];
+                };
+                Some(WorkspaceOperation::RenameWorkspace {
+                    workspace_id,
+                    title: text,
+                })
+            }
+            OpArgKind::MoveSession => {
+                let Some(session_id) = self.active_session.clone() else {
+                    self.command_palette.last_result = Some("无活动会话：先用 f/o 打开会话".into());
+                    return vec![];
+                };
+                // wire 无「移出分组」端点：目标 workspace 必填（可空提示已改）。
+                if text.is_empty() {
+                    self.command_palette.last_result = Some("目标 workspace id 不能为空".into());
+                    return vec![];
+                }
+                Some(WorkspaceOperation::MoveSession {
+                    session_id,
+                    target_workspace: crate::api::types::WorkspaceId(text),
+                })
+            }
+        };
+        let Some(op) = op else {
+            return vec![];
+        };
+        self.palette_execute_op(op)
+    }
+
+    /// 目标 workspace = sidebar 光标行（header 或会话所属）。
+    fn palette_workspace_target(&self) -> Option<crate::api::types::WorkspaceId> {
+        use crate::model::SidebarRow as Row;
+        match self.sidebar_cursor_row()? {
+            Row::WorkspaceHeader { id, .. } => Some(id),
+            Row::Session(id) => self
+                .workspaces
+                .sessions
+                .get(&id)
+                .and_then(|m| m.workspace.clone()),
+        }
+    }
+
+    /// 执行写操作：危险 → 二次确认阶段；否则直接发（requestId 单飞）。
+    fn palette_execute_op(&mut self, op: WorkspaceOperation) -> Vec<Cmd> {
+        if self.command_palette.op_inflight.is_some() {
+            self.command_palette.last_result = Some("有操作在途，请等待完成后再试".into());
+            return vec![];
+        }
+        if op.dangerous() {
+            self.command_palette.begin_confirm(op);
+            return vec![];
+        }
+        self.palette_send_op(op)
+    }
+
+    /// 真正发送写操作 Cmd（requestId 幂等单飞，AC-006-12）。
+    fn palette_send_op(&mut self, op: WorkspaceOperation) -> Vec<Cmd> {
+        let request_id = crate::api::types::mint_request_id();
+        let label = op.label();
+        self.command_palette.op_inflight = Some((request_id.clone(), label));
+        self.command_palette.stage = None;
+        self.command_palette.last_result = None;
+        self.command_palette.last_error_code = None;
+        vec![Cmd::WorkspaceOp { request_id, op }]
+    }
+
     fn search_input(&mut self, text: &str) -> Vec<Cmd> {
         self.search.query.push_str(text);
         // 输入变更 → 回到编辑段（n/N/y/j/k 恢复为字符输入）。
@@ -2799,16 +4307,129 @@ impl AppState {
         vec![]
     }
 
-    /// 审批决策（y/n/q 共用；同一弹窗只回复一次 — 幂等，AC-003-17）。
+    /// 审批决策（y/n/q 共用；同一弹窗只回复一次 — 幂等，AC-003-17/AC-006-15）。
+    /// danger 未确认时 AllowedOnce 被拦截（AC-006-16 第二层确认停点）。
     fn approval_decide(&mut self, outcome: ApprovalOutcome) -> Vec<Cmd> {
         if self.mode != Mode::Approval || self.approval.reply_inflight {
+            return vec![];
+        }
+        if outcome == ApprovalOutcome::AllowedOnce && self.approval.queue.head_requires_ack() {
+            self.approval.toast =
+                Some("危险操作需先确认风险（按 a）后再允许，仍仅授权本次".to_string());
+            return vec![];
+        }
+        let Some(event) = self.approval.queue.active_event() else {
+            return vec![];
+        };
+        self.approval.reply_inflight = true;
+        vec![Cmd::ReplyApproval { event, outcome }]
+    }
+
+    /// Promote 队列首项到单条展示槽（镜像 `ApprovalState.event`），进入
+    /// Approval 模态。prev_mode 仅在非 Approval→Approval 首提时快照一次
+    /// （批量自动推进不重快照）。
+    fn approval_promote_display(&mut self) {
+        let Some(event) = self.approval.queue.promote() else {
+            return;
+        };
+        if self.mode != Mode::Approval {
+            self.approval.prev_mode = self.mode;
+        }
+        self.approval.event = Some(event);
+        self.approval.acked = self.approval.queue.head_acked();
+        self.approval.visible = true;
+        self.approval.reply_inflight = false;
+        self.approval.waiting_hint = false;
+        self.approval.list_open = false;
+        self.mode = Mode::Approval;
+    }
+
+    /// 把 queue active 状态镜像回 `ApprovalState`（event/acked/list）。
+    fn approval_sync_from_queue(&mut self) {
+        self.approval.event = self.approval.queue.active_event();
+        self.approval.acked = self.approval.queue.head_acked();
+    }
+
+    /// 批量续发：batch_allow 且无 danger 停点且无在途 → 对当前 active 发起
+    /// allowed-once（逐条 unary 串行泵；AC-006-15）。danger 停点自动关闭
+    /// batch（等 ack，AC-006-16）。
+    fn approval_pump_if_batch(&mut self) -> Vec<Cmd> {
+        if !self.approval.batch_allow || self.approval.reply_inflight {
+            return vec![];
+        }
+        if self.approval.queue.head_requires_ack() {
+            self.approval.batch_allow = false;
+            self.approval.toast =
+                Some("危险操作需先确认风险（按 a）后继续批量；仅授权本次".to_string());
             return vec![];
         }
         let Some(event) = self.approval.event.clone() else {
             return vec![];
         };
         self.approval.reply_inflight = true;
-        vec![Cmd::ReplyApproval { event, outcome }]
+        vec![Cmd::ReplyApproval {
+            event,
+            outcome: ApprovalOutcome::AllowedOnce,
+        }]
+    }
+
+    /// `L`：打开审批列表视图（pending/failed 全量；光标行用于 r 重试）。
+    fn approval_open_list(&mut self) -> Vec<Cmd> {
+        if self.mode != Mode::Approval {
+            return vec![];
+        }
+        self.approval.list_open = true;
+        self.approval.list_cursor = 0;
+        vec![]
+    }
+
+    /// q/Esc（列表视图）：有单条槽 → 回单条槽不中止（不发出 cancelled）；
+    /// 无单条槽（队列只剩失败项）→ 退出 Approval 回先前模式。
+    fn approval_close_list(&mut self) -> Vec<Cmd> {
+        self.approval.list_open = false;
+        self.approval.list_cursor = 0;
+        if self.approval.event.is_none() && !self.approval.queue.has_active() {
+            // 无单条槽可回：退出（失败项保留在内存，供下次审批/L 重试）。
+            self.approval.visible = false;
+            self.approval.batch_allow = false;
+            self.mode = self.approval.prev_mode;
+        }
+        vec![]
+    }
+
+    /// `r`（列表视图）：重试光标行失败项（回单条槽；若槽空则 promote）。
+    fn approval_retry_list_item(&mut self) -> Vec<Cmd> {
+        let event_id = {
+            let items = self.approval.queue.list();
+            items
+                .get(self.approval.list_cursor)
+                .map(|item| item.event.event_id.clone())
+        };
+        let Some(event_id) = event_id else {
+            return vec![];
+        };
+        if !self.approval.queue.is_failed(&event_id) {
+            return vec![];
+        }
+        self.approval.queue.retry_failed(&event_id);
+        self.approval.list_open = false;
+        self.approval.list_cursor = 0;
+        self.approval_sync_from_queue();
+        if self.approval.event.is_none() {
+            self.approval_promote_display();
+        }
+        vec![]
+    }
+
+    /// `A`（列表视图）：批量 allowed-once（串行泵自动续发；danger 停点）。
+    fn approval_batch_allow(&mut self) -> Vec<Cmd> {
+        if self.mode != Mode::Approval {
+            return vec![];
+        }
+        self.approval.batch_allow = true;
+        self.approval.list_open = false;
+        // 先对当前 active 发一条（若存在）；后续由 ApprovalReplied 续发。
+        self.approval_pump_if_batch()
     }
 
     fn outline_confirm(&mut self) -> Vec<Cmd> {
@@ -2884,6 +4505,27 @@ impl AppState {
             }
         }
         vec![]
+    }
+
+    /// 提取 composer 当前行光标处「/ 开头的斜杠命令词」（Tab 补全预填前缀；
+    /// 非 / 开头 → 空）。
+    fn draft_slash_command_prefix(&self) -> String {
+        let Some(draft) = self.draft.as_ref() else {
+            return String::new();
+        };
+        // 光标前到行首的文本（多行时取当前行，光标未在行首/行中则取
+        // 光标前最近一个空白边界；基础版：仅当行首是 / 且光标后无空格）。
+        let before_cursor: String = draft.text.chars().take(draft.cursor).collect();
+        let current_line = before_cursor.rsplit('\n').next().unwrap_or("");
+        let line = current_line.trim_start();
+        if !line.starts_with('/') {
+            return String::new();
+        }
+        // 光标前不含空白 → 是可补全词（含 / 本身）。
+        if current_line.contains(' ') {
+            return String::new();
+        }
+        current_line.trim().to_string()
     }
 
     fn composer_history_next(&mut self) -> Vec<Cmd> {
@@ -3000,13 +4642,6 @@ impl AppState {
             },
             Cmd::OpenControl { session_id: sid },
         ]
-    }
-
-    fn open_session_from_selection(&mut self) -> Vec<Cmd> {
-        match self.picker_selected_session() {
-            Some(sid) => self.open_session(sid),
-            None => vec![],
-        }
     }
 
     fn picker_selected_session(&self) -> Option<SessionId> {
@@ -4425,6 +6060,232 @@ mod tests {
         ));
     }
 
+    // ================= REQ-006 审批队列（D-036） =================
+
+    fn approval_ev_raw(_id: &str, danger: bool) -> serde_json::Value {
+        let request = if danger {
+            serde_json::json!({"toolName": "danger-full-access", "callId": "c9", "reason": "rm -rf /"})
+        } else {
+            serde_json::json!({"toolName": "bash", "reason": "ls"})
+        };
+        serde_json::json!({ "type": "approval/request", "request": request })
+    }
+
+    fn approval_ev(id: &str, danger: bool) -> ApprovalEvent {
+        ApprovalEvent {
+            client_id: format!("c-{id}"),
+            event_id: id.to_string(),
+            raw: approval_ev_raw(id, danger),
+        }
+    }
+
+    #[test]
+    fn approval_serial_queue_y_y_q_each_once_ac006_15() {
+        let mut s = AppState::default();
+        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle(snapshot("s1", false));
+        // 三条审批到达：首条 promote 显示，其余入队（不覆盖在途）。
+        s.handle(AppEvent::ApprovalRequest {
+            event: approval_ev("e1", false),
+        });
+        s.handle(AppEvent::ApprovalRequest {
+            event: approval_ev("e2", false),
+        });
+        s.handle(AppEvent::ApprovalRequest {
+            event: approval_ev("e3", false),
+        });
+        assert_eq!(s.mode, Mode::Approval);
+        assert_eq!(s.approval.queue.summary().pending, 2, "两条排队");
+        // y → e1 allowed-once。
+        let cmds = s.handle_command(C::ApprovalAllow);
+        assert!(
+            matches!(&cmds[0], Cmd::ReplyApproval { outcome: ApprovalOutcome::AllowedOnce, event } if event.event_id == "e1")
+        );
+        // e1 回复成功 → 自动续发显示 e2（≤1 在途）。
+        s.handle(AppEvent::ApprovalReplied {
+            outcome: ApprovalOutcome::AllowedOnce,
+        });
+        assert_eq!(
+            s.approval.event.as_ref().unwrap().event_id,
+            "e2",
+            "自动 promote 下一项"
+        );
+        assert_eq!(s.mode, Mode::Approval, "仍在审批模态");
+        // y → e2。
+        let cmds = s.handle_command(C::ApprovalAllow);
+        assert!(matches!(&cmds[0], Cmd::ReplyApproval { event, .. } if event.event_id == "e2"));
+        s.handle(AppEvent::ApprovalReplied {
+            outcome: ApprovalOutcome::AllowedOnce,
+        });
+        // q → e3 cancelled。
+        assert_eq!(
+            s.approval.event.as_ref().unwrap().event_id,
+            "e3",
+            "第三条自动展示"
+        );
+        let cmds = s.handle_command(C::Quit);
+        assert!(
+            matches!(&cmds[0], Cmd::ReplyApproval { outcome: ApprovalOutcome::Cancelled, event } if event.event_id == "e3")
+        );
+        s.handle(AppEvent::ApprovalReplied {
+            outcome: ApprovalOutcome::Cancelled,
+        });
+        // 队列清空 → 回先前模式。
+        assert_eq!(s.mode, Mode::Normal);
+        assert!(!s.approval.visible);
+        assert_eq!(s.approval.queue.summary().pending, 0);
+    }
+
+    #[test]
+    fn approval_partial_failure_keeps_item_retryable_others_continue_ac006_14() {
+        let mut s = AppState::default();
+        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle(snapshot("s1", false));
+        s.handle(AppEvent::ApprovalRequest {
+            event: approval_ev("e1", false),
+        });
+        s.handle(AppEvent::ApprovalRequest {
+            event: approval_ev("e2", false),
+        });
+        s.handle_command(C::ApprovalAllow); // e1 reply in-flight
+                                            // e1 回复失败：fail-closed，e1 保留失败项；e2 自动展示可继续。
+        s.handle(AppEvent::ApprovalReplyFailed {
+            outcome: ApprovalOutcome::AllowedOnce,
+            error: ClientError::Transport("eof".into()),
+        });
+        assert_eq!(
+            s.approval.event.as_ref().unwrap().event_id,
+            "e2",
+            "失败后其余可继续"
+        );
+        assert!(s.approval.queue.is_failed("e1"), "失败项保留");
+        assert!(!s.approval.waiting_hint, "仍有项处理，不收缩等待审批");
+        // e2 成功。
+        s.handle_command(C::ApprovalAllow);
+        s.handle(AppEvent::ApprovalReplied {
+            outcome: ApprovalOutcome::AllowedOnce,
+        });
+        assert_eq!(s.approval.queue.summary().failed, 1, "e1 仍失败");
+        assert!(!s.approval.queue.is_empty(), "失败项仍在队列");
+        // 打开列表 → r 重试 e1（回单条槽）。
+        s.handle_command(C::OpenApprovalList);
+        assert!(s.approval.list_open);
+        s.handle_command(C::PickerUp); // 光标到顶部（无意义边界测试）
+        s.handle_command(C::PickerDown);
+        s.handle_command(C::PickerDown); // 光标在 e1(failed) 上（active 空）
+        s.handle_command(C::ApprovalRetry);
+        assert!(!s.approval.list_open, "重试后回单条槽");
+        assert_eq!(s.approval.event.as_ref().unwrap().event_id, "e1");
+        assert!(!s.approval.queue.is_failed("e1"));
+    }
+
+    #[test]
+    fn approval_danger_ack_then_allow_still_allowed_once_ac006_16() {
+        let mut s = AppState::default();
+        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle(snapshot("s1", false));
+        s.handle(AppEvent::ApprovalRequest {
+            event: approval_ev("d1", true),
+        });
+        // 未 ack 时 y 被拦截（不发 ReplyApproval）。
+        assert!(s.handle_command(C::ApprovalAllow).is_empty());
+        assert!(!s.approval.reply_inflight);
+        // `a` = 风险确认。
+        assert!(s.handle_command(C::ApprovalAlways).is_empty());
+        assert!(s.approval.acked);
+        // ack 后 y → allowed-once（仍不提升策略）。
+        let cmds = s.handle_command(C::ApprovalAllow);
+        assert!(
+            matches!(&cmds[0], Cmd::ReplyApproval { outcome: ApprovalOutcome::AllowedOnce, event } if event.event_id == "d1")
+        );
+        s.handle(AppEvent::ApprovalReplied {
+            outcome: ApprovalOutcome::AllowedOnce,
+        });
+        assert_eq!(s.mode, Mode::Normal);
+        // 已授权事件重放 → 不入队不再授权。
+        s.handle(AppEvent::ApprovalRequest {
+            event: approval_ev("d1", true),
+        });
+        assert_eq!(s.mode, Mode::Normal, "重放已授权事件被拒");
+    }
+
+    #[test]
+    fn approval_policy_display_read_only_from_projection_ac006_17() {
+        let mut s = AppState::default();
+        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        // projections 带 approval/policy=ask → 只读展示（不弹窗、无切换）。
+        s.handle(AppEvent::FollowSnapshot {
+            session_id: SessionId("s1".into()),
+            cursor: Some(SessionLogOffset(0)),
+            records: vec![],
+            has_more: false,
+            projections: Some(serde_json::json!({
+                "running": false,
+                "approvalPolicy": "ask"
+            })),
+        });
+        assert_eq!(s.approval.policy_display, Some("ask"));
+        // 帧自身携带 policy（approval/request 到达路径）。
+        s.handle(AppEvent::ApprovalRequest {
+            event: ApprovalEvent {
+                client_id: "c".into(),
+                event_id: "e".into(),
+                raw: serde_json::json!({
+                    "type": "approval/request",
+                    "request": {"toolName": "bash", "reason": "x"},
+                    "approval/policy": "never"
+                }),
+            },
+        });
+        assert_eq!(s.approval.policy_display, Some("never"));
+        // 未知/缺失 → None；never 无切换入口（handle_command 无对应命令）。
+        s.handle(AppEvent::FollowSnapshot {
+            session_id: SessionId("s1".into()),
+            cursor: Some(SessionLogOffset(0)),
+            records: vec![],
+            has_more: false,
+            projections: Some(serde_json::json!({"running": false})),
+        });
+        assert_eq!(s.approval.policy_display, None);
+    }
+
+    #[test]
+    fn approval_batch_allow_serial_pump_stops_at_danger_ac006_15_16() {
+        let mut s = AppState::default();
+        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle(snapshot("s1", false));
+        s.handle(AppEvent::ApprovalRequest {
+            event: approval_ev("e1", false),
+        });
+        s.handle(AppEvent::ApprovalRequest {
+            event: approval_ev("d1", true),
+        });
+        s.handle(AppEvent::ApprovalRequest {
+            event: approval_ev("e2", false),
+        });
+        // A 批量：对 e1 发 allowed-once，danger 前串行续发。
+        let cmds = s.handle_command(C::ApprovalBatchAllow);
+        assert!(matches!(&cmds[0], Cmd::ReplyApproval { event, .. } if event.event_id == "e1"));
+        assert!(s.approval.batch_allow);
+        // e1 成功 → 自动续发 d1？不：danger 停点等 ack，batch 自动关闭。
+        s.handle(AppEvent::ApprovalReplied {
+            outcome: ApprovalOutcome::AllowedOnce,
+        });
+        assert_eq!(s.approval.event.as_ref().unwrap().event_id, "d1");
+        assert!(!s.approval.batch_allow, "danger 停点关闭批量");
+        assert!(s.approval.queue.head_requires_ack());
+        // ack + y → d1 allowed-once（不提升）。
+        s.handle_command(C::ApprovalAlways);
+        let cmds = s.handle_command(C::ApprovalAllow);
+        assert!(matches!(&cmds[0], Cmd::ReplyApproval { event, .. } if event.event_id == "d1"));
+        s.handle(AppEvent::ApprovalReplied {
+            outcome: ApprovalOutcome::AllowedOnce,
+        });
+        // batch 已停 → e2 不自动续发（等待用户决策）。
+        assert_eq!(s.approval.event.as_ref().unwrap().event_id, "e2");
+        assert_eq!(s.handle_command(C::ApprovalAllow).len(), 1);
+    }
+
     #[test]
     fn search_permission_error_does_not_retry_window_search_unaffected_ac003_13() {
         let mut s = AppState::default();
@@ -4558,5 +6419,673 @@ mod tests {
             panic!("预期复制, 得到 {cmds:?}")
         };
         assert_eq!(text, "{\"k\": \"v\"}\n", "SEARCH y 复制整块代码");
+    }
+
+    // ---------- REQ-006 模型目录 reducer 测试（FR-006-01） ----------
+
+    fn wire_catalog() -> crate::api::types::ModelCatalog {
+        serde_json::from_value(serde_json::json!({
+            "default": {"provider": "deepseek_official", "model": "deepseek-chat"},
+            "routableProviders": ["deepseek_official"],
+            "groups": [{
+                "id": "deepseek_official",
+                "name": "DeepSeek 官方",
+                "models": [
+                    {"id": "deepseek-chat", "name": "DeepSeek Chat",
+                     "reasoning": {"efforts": [{"id": "low", "name": "Low"},
+                                               {"id": "high", "name": "High"}],
+                                   "defaultEffort": "low"}},
+                    {"id": "deepseek-v4-pro", "name": "V4 Pro",
+                     "description": "旗舰推理"}
+                ]
+            }],
+            "failures": []
+        }))
+        .unwrap()
+    }
+
+    fn open_catalog_loaded(s: &mut AppState) -> u64 {
+        let cmds = s.handle_command(C::OpenModelCatalog);
+        let Cmd::FetchModelCatalog { generation } = cmds[0] else {
+            panic!("打开目录应发 fetch, 得到 {cmds:?}")
+        };
+        s.handle(AppEvent::ModelCatalogLoaded {
+            generation,
+            catalog: wire_catalog(),
+        });
+        generation
+    }
+
+    #[test]
+    fn catalog_m_opens_overlay_and_fetches_once_ac006_01() {
+        let mut s = AppState::default();
+        let cmds = s.handle_command(C::OpenModelCatalog);
+        assert_eq!(s.mode, Mode::ModelCatalog);
+        assert!(s.model_catalog.visible);
+        assert_eq!(s.model_catalog.phase, CatalogPhase::Loading);
+        assert_eq!(cmds.len(), 1);
+        let Cmd::FetchModelCatalog { generation } = &cmds[0] else {
+            panic!("预期拉取目录, 得到 {cmds:?}")
+        };
+        assert_eq!(*generation, 1, "首次打开 generation=1");
+        // 非 NORMAL 打开被忽略。
+        s.mode = Mode::Search;
+        assert!(s.handle_command(C::OpenModelCatalog).is_empty());
+    }
+
+    #[test]
+    fn catalog_loaded_indexes_ready_and_local_fuzzy_query_ac006_01_07() {
+        let mut s = AppState::default();
+        open_catalog_loaded(&mut s);
+        assert_eq!(s.model_catalog.phase, CatalogPhase::Ready);
+        assert_eq!(s.model_catalog.index.len(), 2);
+        // 本地 nucleo 即时过滤（AC-006-01 即时性=本地）。
+        s.handle_command(C::PickerInput("v4".into()));
+        assert_eq!(s.model_catalog.index.query("v4").len(), 1);
+        // 无匹配 → 空态（不误报错误）。
+        s.handle_command(C::PickerInput("zzz".into()));
+        let hits = s.model_catalog.index.query("zzz");
+        assert!(hits.is_empty());
+        assert!(s.model_catalog.load_error.is_none(), "空态不误报错误");
+        // 退格恢复。
+        for _ in 0..5 {
+            s.handle_command(C::PickerBackspace);
+        }
+        assert_eq!(s.model_catalog.index.query("").len(), 2);
+    }
+
+    #[test]
+    fn catalog_load_failure_shows_error_code_without_auto_retry_ac006_06() {
+        let mut s = AppState::default();
+        s.handle_command(C::OpenModelCatalog);
+        // 权限拒绝：显示 error.code、不自动重试（无 Reconnect/重发 Cmd）。
+        let cmds = s.handle(AppEvent::ModelCatalogLoadFailed {
+            generation: 1,
+            error: ClientError::Remote {
+                code: "PERMISSION_DENIED".into(),
+                message: "no permission".into(),
+                class: ErrorClass::PermissionDenied,
+            },
+        });
+        assert!(cmds.is_empty(), "权限错误不自动重试, cmds={cmds:?}");
+        assert_eq!(s.model_catalog.phase, CatalogPhase::Error);
+        let err = s.model_catalog.load_error.as_deref().unwrap();
+        assert!(err.contains("PERMISSION_DENIED"), "err={err}");
+        // 恢复路径：Error 态 Enter = 重试加载 → 成功（恢复后重试成功）。
+        let cmds = s.handle_command(C::PickerConfirm);
+        let Cmd::FetchModelCatalog { generation } = cmds[0] else {
+            panic!("Error 态 Enter 应重试, 得到 {cmds:?}")
+        };
+        assert_eq!(s.model_catalog.phase, CatalogPhase::Loading);
+        s.handle(AppEvent::ModelCatalogLoaded {
+            generation,
+            catalog: wire_catalog(),
+        });
+        assert_eq!(s.model_catalog.phase, CatalogPhase::Ready);
+        assert!(s.model_catalog.load_error.is_none(), "重试成功后清除错误");
+    }
+
+    #[test]
+    fn catalog_select_no_effort_success_updates_next_and_closes_ac006_08() {
+        let mut s = AppState::default();
+        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        open_catalog_loaded(&mut s);
+        // 选中无 efforts 的 v4-pro（本地过滤 + Enter）。
+        s.handle_command(C::PickerInput("v4".into()));
+        s.handle_command(C::PickerConfirm);
+        // selecting 单飞在途。
+        assert_eq!(
+            s.model_catalog.selecting,
+            Some(("deepseek_official".into(), "deepseek-v4-pro".into()))
+        );
+        // 服务端确认成功。
+        let cmds = s.handle(AppEvent::ModelSelected {
+            selected: crate::api::types::WireModelSelection {
+                provider: "deepseek_official".into(),
+                model: "deepseek-v4-pro".into(),
+                reasoning_effort: None,
+            },
+        });
+        assert!(cmds.is_empty());
+        assert_eq!(s.mode, Mode::Normal, "切换成功后关闭目录回 NORMAL");
+        assert!(!s.model_catalog.visible);
+        assert!(s.model_catalog.selecting.is_none(), "在途清除");
+        assert_eq!(
+            s.model_catalog.next_model.as_deref(),
+            Some("deepseek_official/deepseek-v4-pro"),
+            "next 镜像更新"
+        );
+        let notice = s.notice.as_deref().unwrap();
+        assert!(
+            notice.contains("deepseek_official/deepseek-v4-pro"),
+            "notice={notice}"
+        );
+        assert!(notice.contains("下一次 prompt 生效"), "notice={notice}");
+    }
+
+    #[test]
+    fn catalog_select_failure_keeps_current_and_shows_code_ac006_09() {
+        let mut s = AppState::default();
+        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        open_catalog_loaded(&mut s);
+        s.handle_command(C::PickerInput("v4".into()));
+        s.handle_command(C::PickerConfirm);
+        // 权限拒绝失败：当前模型不变（无 current 变化）、error.code 显示、
+        // 无自动重试命令。
+        let cmds = s.handle(AppEvent::ModelSelectFailed {
+            error: ClientError::Remote {
+                code: "PERMISSION_DENIED".into(),
+                message: "no".into(),
+                class: ErrorClass::PermissionDenied,
+            },
+        });
+        assert!(cmds.is_empty(), "权限错误不自动重试, cmds={cmds:?}");
+        assert_eq!(
+            s.model_catalog.last_error_code.as_deref(),
+            Some("PERMISSION_DENIED")
+        );
+        assert!(s.model_catalog.selecting.is_none(), "在途清除");
+        assert_eq!(s.mode, Mode::ModelCatalog, "目录保持打开可继续");
+        assert!(s.model_catalog.current_model.is_none(), "当前模型不变");
+    }
+
+    #[test]
+    fn catalog_select_without_active_session_hints_not_crash() {
+        let mut s = AppState::default();
+        open_catalog_loaded(&mut s);
+        // 过滤到无 efforts 的 v4-pro 再 Enter → 直接 submit 路径（无活动会话
+        // 时提示而非崩溃）。
+        s.handle_command(C::PickerInput("v4".into()));
+        let cmds = s.handle_command(C::PickerConfirm);
+        assert!(cmds.is_empty(), "无活动会话不发 selectModel, cmds={cmds:?}");
+        assert!(s
+            .model_catalog
+            .load_error
+            .as_deref()
+            .unwrap()
+            .contains("无打开的会话"));
+    }
+
+    #[test]
+    fn catalog_effort_subflow_uses_model_declared_efforts() {
+        let mut s = AppState::default();
+        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        open_catalog_loaded(&mut s);
+        // 选中带 efforts 的 deepseek-chat（默认 cursor 落在 defaultEffort=low）。
+        s.handle_command(C::PickerInput("chat".into()));
+        s.handle_command(C::PickerConfirm);
+        let pick = s
+            .model_catalog
+            .effort
+            .as_ref()
+            .expect("应进入 effort 子阶段");
+        assert_eq!(pick.efforts, vec!["low", "high"]);
+        assert_eq!(pick.cursor, 0, "default 光标落在 low");
+        // effort 阶段输入被忽略（字符不是查询词）。
+        s.handle_command(C::PickerInput("x".into()));
+        assert_eq!(s.model_catalog.effort.as_ref().unwrap().cursor, 0);
+        // j 移动 → high。
+        s.handle_command(C::PickerDown);
+        assert_eq!(s.model_catalog.effort.as_ref().unwrap().cursor, 1);
+        // Esc 从 effort 返回主列表（目录仍开）；再 Enter 重新进入 effort。
+        s.handle_command(C::ClosePicker);
+        assert!(s.model_catalog.effort.is_none(), "Esc 退回主列表");
+        assert!(s.model_catalog.visible, "目录仍开");
+        s.handle_command(C::PickerConfirm);
+        assert!(s.model_catalog.effort.is_some(), "主列表 Enter 重进 effort");
+        s.handle_command(C::PickerDown);
+        s.handle_command(C::PickerDown);
+        assert_eq!(
+            s.model_catalog.effort.as_ref().unwrap().cursor,
+            1,
+            "光标钳制在末尾"
+        );
+        // Enter 提交带 effort（确认后 effort 清空）。
+        let cmds = s.handle_command(C::PickerConfirm);
+        let Cmd::SelectModel {
+            provider,
+            model,
+            reasoning_effort,
+        } = &cmds[0]
+        else {
+            panic!("预期 SelectModel, 得到 {cmds:?}")
+        };
+        assert_eq!(provider, "deepseek_official");
+        assert_eq!(model, "deepseek-chat");
+        assert_eq!(reasoning_effort.as_deref(), Some("high"));
+        assert!(s.model_catalog.effort.is_none(), "确认后 effort 子阶段结束");
+    }
+
+    #[test]
+    fn catalog_stale_response_after_reopen_is_dropped() {
+        // 生命周期/单飞（模式 15）：关闭后重开 → 旧 generation 的迟到响应
+        // 不得污染新目录状态。
+        let mut s = AppState::default();
+        // 第一次打开（gen=1）。
+        let cmds = s.handle_command(C::OpenModelCatalog);
+        let Cmd::FetchModelCatalog { generation: g1 } = cmds[0] else {
+            panic!()
+        };
+        // 关闭（作废 gen=1）→ 重开（gen=2）。
+        s.handle_command(C::ClosePicker);
+        let cmds = s.handle_command(C::OpenModelCatalog);
+        let Cmd::FetchModelCatalog { generation: g2 } = cmds[0] else {
+            panic!()
+        };
+        assert_ne!(g1, g2);
+        // gen=1 迟到成功 → 丢弃（不进入 Ready，仍是 Loading 等 gen=2）。
+        let cmds = s.handle(AppEvent::ModelCatalogLoaded {
+            generation: g1,
+            catalog: wire_catalog(),
+        });
+        assert!(cmds.is_empty());
+        assert_eq!(s.model_catalog.phase, CatalogPhase::Loading, "旧响应不落位");
+        // gen=2 正常到达 → Ready。
+        s.handle(AppEvent::ModelCatalogLoaded {
+            generation: g2,
+            catalog: wire_catalog(),
+        });
+        assert_eq!(s.model_catalog.phase, CatalogPhase::Ready);
+        assert_eq!(s.model_catalog.index.len(), 2);
+    }
+
+    // ---------- REQ-006 命令面板 reducer 测试（FR-006-03） ----------
+
+    #[test]
+    fn palette_colon_opens_with_remote_fetch_when_session_active() {
+        let mut s = AppState::default();
+        let cmds = s.handle_command(C::OpenCommandPalette);
+        assert_eq!(s.mode, Mode::CommandPalette);
+        assert!(s.command_palette.visible);
+        // 无活动会话：不拉远端（返回空命令列表）。
+        assert!(cmds.is_empty());
+        // 打开会话后再开：发 FetchRemoteCommands。
+        s.handle_command(C::ClosePicker);
+        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        let cmds = s.handle_command(C::OpenCommandPalette);
+        assert!(matches!(cmds[0], Cmd::FetchRemoteCommands), "cmds={cmds:?}");
+        // 远端命令到达 → 缓存并显示为候选。
+        s.handle(AppEvent::RemoteCommandsLoaded {
+            commands: vec![crate::api::types::CommandDescriptor {
+                name: "plan".into(),
+                description: "Plan mode".into(),
+                input: None,
+            }],
+        });
+        assert!(s.command_palette.remote_fetched);
+        let filtered = s.command_palette.filtered();
+        assert!(filtered.iter().any(|i| matches!(
+            i,
+            CommandPaletteItem::Remote { name, .. } if name == "plan"
+        )));
+    }
+
+    #[test]
+    fn palette_confirm_remote_execute_and_failure_stays_open_ac006_13() {
+        let mut s = AppState::default();
+        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle_command(C::OpenCommandPalette);
+        s.handle(AppEvent::RemoteCommandsLoaded {
+            commands: vec![crate::api::types::CommandDescriptor {
+                name: "plan".into(),
+                description: "Plan mode".into(),
+                input: None,
+            }],
+        });
+        // 选中 plan（filtered 里第一个 remote 是 plan? 直接设 query）。
+        s.handle_command(C::PickerInput("/plan".into()));
+        let idx = s
+            .command_palette
+            .filtered()
+            .iter()
+            .position(|i| matches!(i, CommandPaletteItem::Remote { name, .. } if name == "plan"))
+            .unwrap();
+        s.command_palette.selection = idx;
+        let cmds = s.handle_command(C::PickerConfirm);
+        assert!(matches!(&cmds[0], Cmd::ExecuteCommand { line } if line == "/plan"));
+        assert!(s.command_palette.executing, "单飞在途");
+        // 重复 Enter 单飞拒绝（不重复提交，AC-006-12/15 同源）。
+        assert!(s.handle_command(C::PickerConfirm).is_empty());
+        // 执行失败：error.code 显示、面板保持打开可继续输入（AC-006-13）。
+        let cmds = s.handle(AppEvent::CommandExecuteFailed {
+            error: ClientError::Remote {
+                code: "PERMISSION_DENIED".into(),
+                message: "denied".into(),
+                class: ErrorClass::PermissionDenied,
+            },
+        });
+        assert!(cmds.is_empty(), "权限错误不自动重试");
+        assert_eq!(
+            s.command_palette.last_error_code.as_deref(),
+            Some("PERMISSION_DENIED")
+        );
+        assert!(!s.command_palette.executing, "在途清除");
+        assert_eq!(s.mode, Mode::CommandPalette, "面板保持打开");
+        // 恢复路径：清除错误后执行成功。
+        s.command_palette.last_result = None;
+        s.handle_command(C::PickerInput("x".into())); // 触发错误清空
+        assert!(s.command_palette.last_error_code.is_none());
+    }
+
+    #[test]
+    fn palette_v04_and_local_actions() {
+        let mut s = AppState::default();
+        s.handle_command(C::OpenCommandPalette);
+        // V0.4 占位：Enter 不执行，仅提示，面板保持。
+        let idx = s
+            .command_palette
+            .filtered()
+            .iter()
+            .position(|i| {
+                matches!(
+                    i,
+                    CommandPaletteItem::V04 {
+                        label: "settings",
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        s.command_palette.selection = idx;
+        assert!(s.handle_command(C::PickerConfirm).is_empty());
+        assert_eq!(s.mode, Mode::CommandPalette);
+        assert!(s
+            .command_palette
+            .last_result
+            .as_deref()
+            .unwrap()
+            .contains("V0.4"));
+        // 本地 model catalog 动作：关闭面板并打开模型目录。
+        s.command_palette.query = "model".into();
+        let idx = s
+            .command_palette
+            .filtered()
+            .iter()
+            .position(|i| {
+                matches!(
+                    i,
+                    CommandPaletteItem::Local {
+                        label: "model catalog",
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        s.command_palette.selection = idx;
+        let cmds = s.handle_command(C::PickerConfirm);
+        assert!(matches!(cmds[0], Cmd::FetchModelCatalog { .. }));
+        assert_eq!(s.mode, Mode::ModelCatalog, "model catalog 打开");
+        // new session 动作：发 CreateSession。
+        s.handle_command(C::ClosePicker);
+        s.handle_command(C::OpenCommandPalette);
+        s.command_palette.query = "new session".into();
+        s.command_palette.selection = 0;
+        let cmds = s.handle_command(C::PickerConfirm);
+        assert!(matches!(cmds[0], Cmd::CreateSession), "cmds={cmds:?}");
+        assert_eq!(s.mode, Mode::Normal);
+        // SessionCreated → 刷新列表 + notice。
+        let cmds = s.handle(AppEvent::SessionCreated {
+            session_id: "s-new".into(),
+        });
+        assert!(cmds
+            .iter()
+            .any(|c| matches!(c, Cmd::LoadSessionList { .. })));
+        assert!(s.notice.as_deref().unwrap().contains("s-new"));
+    }
+
+    // ---------- REQ-006 workspace/session 操作（FR-006-02 操作半） ----------
+
+    fn select_palette_item(s: &mut AppState, query: &str) -> usize {
+        s.handle_command(C::OpenCommandPalette);
+        s.handle_command(C::PickerInput(query.into()));
+        let idx = s
+            .command_palette
+            .filtered()
+            .iter()
+            .position(|i| matches!(i, CommandPaletteItem::Local { label, .. } if *label == query))
+            .expect("候选存在");
+        s.command_palette.selection = idx;
+        idx
+    }
+
+    #[test]
+    fn op_fork_requires_active_session_and_dispatches() {
+        let mut s = AppState::default();
+        // 无活动会话 → 提示不发。
+        select_palette_item(&mut s, "fork session");
+        assert!(s.handle_command(C::PickerConfirm).is_empty());
+        assert!(s
+            .command_palette
+            .last_result
+            .as_deref()
+            .unwrap()
+            .contains("无活动会话"));
+        // 有活动会话 → fork 直接发（无参数）。
+        s.handle_command(C::ClosePicker);
+        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        select_palette_item(&mut s, "fork session");
+        let cmds = s.handle_command(C::PickerConfirm);
+        let Cmd::WorkspaceOp { request_id, op } = &cmds[0] else {
+            panic!("预期 WorkspaceOp, cmds={cmds:?}")
+        };
+        assert_eq!(
+            op,
+            &WorkspaceOperation::ForkSession {
+                session_id: SessionId("s1".into())
+            }
+        );
+        assert!(!request_id.is_empty());
+        assert_eq!(
+            s.command_palette.op_inflight.as_ref().unwrap().0,
+            *request_id,
+            "requestId 单飞在途"
+        );
+    }
+
+    #[test]
+    fn op_rename_session_input_stage_then_dispatch() {
+        let mut s = AppState::default();
+        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        select_palette_item(&mut s, "rename session");
+        assert!(s.handle_command(C::PickerConfirm).is_empty());
+        // 进入输入子阶段。
+        assert!(matches!(
+            s.command_palette.stage,
+            Some(PaletteStage::Input {
+                kind: OpArgKind::RenameSession,
+                ..
+            })
+        ));
+        // 空标题拒绝。
+        assert!(s.handle_command(C::PickerConfirm).is_empty());
+        assert!(s
+            .command_palette
+            .last_result
+            .as_deref()
+            .unwrap()
+            .contains("不能为空"));
+        // 输入标题 → Enter 提交。
+        s.handle_command(C::PickerInput("新标题".into()));
+        let cmds = s.handle_command(C::PickerConfirm);
+        let Cmd::WorkspaceOp { op, .. } = &cmds[0] else {
+            panic!("cmds={cmds:?}")
+        };
+        assert_eq!(
+            op,
+            &WorkspaceOperation::RenameSession {
+                session_id: SessionId("s1".into()),
+                title: "新标题".into()
+            }
+        );
+    }
+
+    #[test]
+    fn op_archive_danger_requires_confirm_then_sends_ac006_02() {
+        let mut s = AppState::default();
+        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        select_palette_item(&mut s, "archive session");
+        assert!(s.handle_command(C::PickerConfirm).is_empty());
+        // 进入 ConfirmDanger（未发送）。
+        assert!(matches!(
+            s.command_palette.stage,
+            Some(PaletteStage::ConfirmDanger { .. })
+        ));
+        assert!(s.command_palette.op_inflight.is_none(), "确认前不发送");
+        // Esc 取消（不执行、面板回列表）。
+        s.handle_command(C::ClosePicker);
+        assert!(s.command_palette.stage.is_none());
+        assert!(s.command_palette.visible);
+        // 再次进入并 Enter 确认 → 发送。
+        select_palette_item(&mut s, "archive session");
+        assert!(s.handle_command(C::PickerConfirm).is_empty());
+        let cmds = s.handle_command(C::PickerConfirm);
+        let Cmd::WorkspaceOp { op, .. } = &cmds[0] else {
+            panic!("确认后应发送, cmds={cmds:?}")
+        };
+        assert!(
+            matches!(op, WorkspaceOperation::ArchiveSession { session_id } if session_id.0 == "s1")
+        );
+    }
+
+    #[test]
+    fn op_success_ack_refreshes_and_failure_keeps_local_no_drift_ac006_10() {
+        let mut s = AppState::default();
+        s.command_palette.op_inflight = Some((String::from("req-1"), "rename session"));
+        let cmds = s.handle(AppEvent::WorkspaceOpDone {
+            request_id: "req-1".into(),
+            outcome: OpOutcome::Ack,
+        });
+        assert!(cmds
+            .iter()
+            .any(|c| matches!(c, Cmd::LoadSessionList { .. })));
+        assert!(s.command_palette.op_inflight.is_none());
+        // 失败：error.code 显示、不自动重试、本地不漂移。
+        s.command_palette.op_inflight = Some((String::from("req-2"), "archive session"));
+        let cmds = s.handle(AppEvent::WorkspaceOpFailed {
+            request_id: "req-2".into(),
+            op_name: "archive session".into(),
+            error: ClientError::Remote {
+                code: "PERMISSION_DENIED".into(),
+                message: "denied".into(),
+                class: ErrorClass::PermissionDenied,
+            },
+        });
+        assert!(cmds.is_empty(), "失败不发刷新/重试, cmds={cmds:?}");
+        assert_eq!(
+            s.command_palette.last_error_code.as_deref(),
+            Some("PERMISSION_DENIED")
+        );
+        assert!(s
+            .command_palette
+            .last_result
+            .as_deref()
+            .unwrap()
+            .contains("archive session 失败"));
+        assert!(
+            s.command_palette.op_inflight.is_none(),
+            "在途清除（可重试）"
+        );
+    }
+
+    #[test]
+    fn op_duplicate_or_late_response_is_idempotent_ac006_12() {
+        let mut s = AppState::default();
+        s.command_palette.op_inflight = Some((String::from("req-1"), "rename session"));
+        // 第一次成功 apply（清在途）。
+        let first = s.handle(AppEvent::WorkspaceOpDone {
+            request_id: "req-1".into(),
+            outcome: OpOutcome::Ack,
+        });
+        assert_eq!(first.len(), 1, "第一次刷新列表");
+        assert!(
+            s.notice.as_deref().unwrap().contains("操作成功"),
+            "第一次 apply 设 notice"
+        );
+        let notice_before = s.notice.clone();
+        // 重复响应（同 request_id 迟到重放）→ 在途已清 → 不 apply。
+        let dup = s.handle(AppEvent::WorkspaceOpDone {
+            request_id: "req-1".into(),
+            outcome: OpOutcome::ForkCreated {
+                session_id: "s-new".into(),
+            },
+        });
+        assert!(dup.is_empty(), "重复响应不重复 apply（不重开 fork）");
+        assert_eq!(s.notice, notice_before, "迟到响应不覆盖 notice");
+        assert!(
+            !matches!(
+                s.active_session.as_ref(),
+                Some(x) if x.0 == "s-new"
+            ),
+            "迟到 fork 不打开新会话"
+        );
+    }
+
+    #[test]
+    fn op_fork_success_opens_new_session() {
+        let mut s = AppState::default();
+        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.command_palette.op_inflight = Some((String::from("req-9"), "fork session"));
+        let cmds = s.handle(AppEvent::WorkspaceOpDone {
+            request_id: "req-9".into(),
+            outcome: OpOutcome::ForkCreated {
+                session_id: "s-fork".into(),
+            },
+        });
+        assert!(cmds.iter().any(|c| {
+            matches!(c, Cmd::OpenFollow { session_id, .. } if session_id.0 == "s-fork")
+        }));
+        assert_eq!(
+            s.active_session.as_ref().map(|x| x.0.as_str()),
+            Some("s-fork"),
+            "fork 成功打开新会话"
+        );
+    }
+
+    #[test]
+    fn reconnect_approval_replay_dedup_and_op_retry_recovers_ac006_18() {
+        // AC-006-18：断线重连对账——重放审批/操作不产生重复副作用。
+        let mut s = AppState::default();
+        // 审批 granted 后事件重放（断线期间 pending，恢复后同事件重到）→
+        // 队列 granted 去重集拒绝（AC-006-15/18：不重复授权）。
+        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        let ev = ApprovalEvent {
+            client_id: "c-1".into(),
+            event_id: "e-1".into(),
+            raw: serde_json::json!({"type": "approval/request", "reason": "deploy"}),
+        };
+        s.handle(AppEvent::ApprovalRequest { event: ev.clone() });
+        assert_eq!(s.approval.event.as_ref().unwrap().event_id, "e-1");
+        // 决策已发（ApprovalReplied settle granted）。
+        s.handle(AppEvent::ApprovalReplied {
+            outcome: ApprovalOutcome::AllowedOnce,
+        });
+        assert!(s.approval.queue.summary().pending == 0);
+        // 断线重连后同事件重放 → 忽略（granted 去重），不再次授权。
+        let cmds = s.handle(AppEvent::ApprovalRequest { event: ev });
+        assert!(cmds.is_empty(), "重放审批被去重, cmds={cmds:?}");
+        assert!(s.approval.event.is_none(), "granted 事件不再进入展示槽");
+
+        // workspace 写操作断线失败（Transport）→ 本地不漂移、在途清除；
+        // 恢复后重试成功（失败后修正输入重跑不污染）。
+        s.command_palette.op_inflight = Some((String::from("req-r1"), "rename session"));
+        let cmds = s.handle(AppEvent::WorkspaceOpFailed {
+            request_id: "req-r1".into(),
+            op_name: "rename session".into(),
+            error: ClientError::Transport("连接断开".into()),
+        });
+        assert!(cmds.is_empty());
+        assert!(
+            s.command_palette.op_inflight.is_none(),
+            "失败清在途允许重试"
+        );
+        // 恢复路径：重试成功（requestId 新 id apply）。
+        s.command_palette.op_inflight = Some((String::from("req-r2"), "rename session"));
+        let cmds = s.handle(AppEvent::WorkspaceOpDone {
+            request_id: "req-r2".into(),
+            outcome: OpOutcome::Ack,
+        });
+        assert!(cmds
+            .iter()
+            .any(|c| matches!(c, Cmd::LoadSessionList { .. })));
     }
 }

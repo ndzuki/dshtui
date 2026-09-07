@@ -12,7 +12,10 @@ use serde_json::Value;
 
 use super::envelope::ClientError;
 use super::mux::{Mux, StreamHandle};
-use super::types::{PageResult, PromptRequest, SessionAddress, SessionSeq};
+use super::types::{
+    ModelCatalog, PageResult, PromptRequest, SessionAddress, SessionCreateValue, SessionForkValue,
+    SessionId, SessionRenameValue, SessionSeq,
+};
 use super::unary;
 
 /// `{accepted:true}` receipt shared by `session/prompt` / `session/cancel`
@@ -204,6 +207,124 @@ pub async fn open_control(
 ) -> Result<StreamHandle, ClientError> {
     let args = serde_json::json!({ "address": address });
     mux.open_stream("session/control", args).await
+}
+
+// ---------- REQ-006 session mutation / model endpoints (V0.3) ----------
+//
+// All single-`request`-parameter endpoints nest their business fields under
+// `{"request":{...}}` inside the envelope args (official read 0.1.2-rc.1 from
+// dsh-api-session-controller typert.remote-client.js). Protocol knowledge
+// stays in this api layer; app/ui never hand-builds these args.
+
+/// `session/modelCatalog` (zero-arg unary, official read 0.1.2-rc.1).
+pub async fn model_catalog(
+    http: &reqwest::Client,
+    base: &str,
+) -> Result<ModelCatalog, ClientError> {
+    let value = unary(http, base, "session/modelCatalog", serde_json::json!({})).await?;
+    serde_json::from_value(value)
+        .map_err(|e| ClientError::Protocol(format!("session/modelCatalog 响应形状异常: {e}")))
+}
+
+/// `session/selectModel` — select the next model used by the next prompt.
+/// Response `{selected:{provider,model,reasoningEffort?}}`.
+pub async fn select_model(
+    http: &reqwest::Client,
+    base: &str,
+    session_id: &SessionId,
+    provider: &str,
+    model: &str,
+    reasoning_effort: Option<&str>,
+) -> Result<super::types::WireModelSelection, ClientError> {
+    let mut req = serde_json::json!({
+        "sessionId": session_id.0,
+        "provider": provider,
+        "model": model,
+    });
+    if let Some(effort) = reasoning_effort {
+        req["reasoningEffort"] = serde_json::json!(effort);
+    }
+    let value = unary(
+        http,
+        base,
+        "session/selectModel",
+        serde_json::json!({ "request": req }),
+    )
+    .await?;
+    let selected = value
+        .get("selected")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    serde_json::from_value(selected)
+        .map_err(|e| ClientError::Protocol(format!("session/selectModel 响应形状异常: {e}")))
+}
+
+/// `session/fork` — fork a session (optionally at a seq); returns the new
+/// session id.
+pub async fn fork(
+    http: &reqwest::Client,
+    base: &str,
+    session_id: &SessionId,
+    at_seq: Option<u64>,
+) -> Result<SessionForkValue, ClientError> {
+    let mut req = serde_json::json!({ "sessionId": session_id.0 });
+    if let Some(seq) = at_seq {
+        req["atSeq"] = serde_json::json!(seq);
+    }
+    let value = unary(
+        http,
+        base,
+        "session/fork",
+        serde_json::json!({ "request": req }),
+    )
+    .await?;
+    serde_json::from_value(value)
+        .map_err(|e| ClientError::Protocol(format!("session/fork 响应形状异常: {e}")))
+}
+
+/// `session/rename` — rename a session; returns the normalized title and the
+/// committing event seq.
+pub async fn rename(
+    http: &reqwest::Client,
+    base: &str,
+    session_id: &SessionId,
+    title: &str,
+) -> Result<SessionRenameValue, ClientError> {
+    let value = unary(
+        http,
+        base,
+        "session/rename",
+        serde_json::json!({ "request": { "sessionId": session_id.0, "title": title } }),
+    )
+    .await?;
+    serde_json::from_value(value)
+        .map_err(|e| ClientError::Protocol(format!("session/rename 响应形状异常: {e}")))
+}
+
+/// `session/create` — create a new session (optionally in a workspace /
+/// cwd); returns the new session id.
+pub async fn create(
+    http: &reqwest::Client,
+    base: &str,
+    workspace_id: Option<&str>,
+    cwd: Option<&str>,
+) -> Result<SessionCreateValue, ClientError> {
+    let mut req = serde_json::json!({});
+    if let Some(ws) = workspace_id {
+        req["workspaceId"] = serde_json::json!(ws);
+    }
+    if let Some(c) = cwd {
+        req["cwd"] = serde_json::json!(c);
+    }
+    let value = unary(
+        http,
+        base,
+        "session/create",
+        serde_json::json!({ "request": req }),
+    )
+    .await?;
+    serde_json::from_value(value)
+        .map_err(|e| ClientError::Protocol(format!("session/create 响应形状异常: {e}")))
 }
 
 /// Parse one `session/control` stream value. The baseline carries
