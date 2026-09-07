@@ -1383,3 +1383,74 @@ fn trajectory_search_index_updates_on_stream_append_ac005_05() {
     let hits = app.traj_search_index.query("done");
     assert_eq!(hits.len(), 2, "新到事件立即进命中: {hits:?}");
 }
+
+#[test]
+fn trajectory_filter_decoder_special_keys_ac005_05_13() {
+    // 真实 KeyDecoder 路径（code-review S1 修复证据）：特殊键必须不被
+    // 兜底 `Char(c)` 遮蔽——q/Esc 退出过滤、j/k 命中选中移动、Backspace
+    // 删除、Enter 跳转；普通字符进查询词。此前实现首个臂吞掉 q/j/k。
+    let mut decoder = KeyDecoder::new();
+    let dec = |d: &mut KeyDecoder, code| d.decode(InputMode::TrajectoryFilter, key(code));
+
+    assert_eq!(
+        dec(&mut decoder, KeyCode::Char('x')),
+        Some(Command::PickerInput("x".into()))
+    );
+    assert_eq!(
+        dec(&mut decoder, KeyCode::Char('j')),
+        Some(Command::MoveDown),
+        "j 命中选中下移（不被当查询字符）"
+    );
+    assert_eq!(
+        dec(&mut decoder, KeyCode::Char('k')),
+        Some(Command::MoveUp),
+        "k 命中选中上移"
+    );
+    assert_eq!(
+        dec(&mut decoder, KeyCode::Char('q')),
+        Some(Command::ClosePicker),
+        "q 退出过滤（不退出程序，AC-005-11 模态）"
+    );
+    assert_eq!(dec(&mut decoder, KeyCode::Esc), Some(Command::ClosePicker));
+    assert_eq!(
+        dec(&mut decoder, KeyCode::Backspace),
+        Some(Command::PickerBackspace)
+    );
+    assert_eq!(
+        dec(&mut decoder, KeyCode::Enter),
+        Some(Command::PickerConfirm)
+    );
+}
+
+#[test]
+fn trajectory_pending_g_cleared_on_non_prefix_keys_ac005_01() {
+    // code-review S8 修复证据：Enter 开详情后按 t 不得触发 gt 切回 Chat。
+    let mut decoder = KeyDecoder::new();
+    assert_eq!(
+        decoder.decode(InputMode::Trajectory, key(KeyCode::Char('g'))),
+        None,
+        "g 前缀置位"
+    );
+    // g 后按 Enter（非前缀键）→ 打开详情并清前缀。
+    assert_eq!(
+        decoder.decode(InputMode::Trajectory, key(KeyCode::Enter)),
+        Some(Command::OpenDetail)
+    );
+    // 随后按 t 必须不是 ToggleTrajectory（pending_g 已清）。
+    assert_eq!(
+        decoder.decode(InputMode::Trajectory, key(KeyCode::Char('t'))),
+        None,
+        "详情打开后 t 不再触发 gt"
+    );
+    // Esc 路径同样清前缀。
+    decoder.decode(InputMode::Trajectory, key(KeyCode::Char('g')));
+    assert_eq!(
+        decoder.decode(InputMode::Trajectory, key(KeyCode::Esc)),
+        Some(Command::ClosePicker)
+    );
+    assert_eq!(
+        decoder.decode(InputMode::Trajectory, key(KeyCode::Char('t'))),
+        None,
+        "Esc 后 t 不再触发 gt"
+    );
+}

@@ -265,28 +265,46 @@ impl KeyDecoder {
                     _ => None,
                 }
             }
-            KeyCode::Char('c') if ctrl => Some(Command::Quit),
-            KeyCode::Char('w') if ctrl => Some(Command::CycleFocus),
-            KeyCode::Enter if !ctrl => Some(Command::OpenDetail),
-            KeyCode::Esc => Some(Command::ClosePicker),
-            _ => None,
+            KeyCode::Char('c') if ctrl => {
+                // S8 修复：非 g 前缀键路径清 pending_g（详情打开后按 t 不再
+                // 误触 gt 切回 Chat；与 normal 模式 Enter/Esc 清理同构）。
+                self.pending_g = false;
+                Some(Command::Quit)
+            }
+            KeyCode::Char('w') if ctrl => {
+                self.pending_g = false;
+                Some(Command::CycleFocus)
+            }
+            KeyCode::Enter if !ctrl => {
+                self.pending_g = false;
+                Some(Command::OpenDetail)
+            }
+            KeyCode::Esc => {
+                self.pending_g = false;
+                Some(Command::ClosePicker)
+            }
+            _ => {
+                self.pending_g = false;
+                None
+            }
         }
     }
 
     /// 轨迹内过滤输入态键位：普通字符进 query，Backspace 删除，Enter 跳转，
-    /// Esc/q 退出（Step 4，AC-005-13 输入即时过滤）。
+    /// Esc/q 退出，j/k 命中选中移动（Step 4，AC-005-05/13）。
+    /// 注意匹配臂顺序：特殊键必须排在兜底 `Char(c)` 之前，否则被当查询
+    /// 字符吞掉（code-review S1 修复，与 picker 模式同构）。
     fn trajectory_filter(&mut self, key: KeyEvent) -> Option<Command> {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
-            KeyCode::Char(c) if key.modifiers.is_empty() => {
-                Some(Command::PickerInput(c.to_string()))
-            }
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                Some(Command::Quit)
-            }
-            KeyCode::Enter => Some(Command::PickerConfirm),
+            KeyCode::Char('c') if ctrl => Some(Command::Quit),
+            KeyCode::Enter if !ctrl => Some(Command::PickerConfirm),
             KeyCode::Esc => Some(Command::ClosePicker),
-            KeyCode::Char('q') if key.modifiers.is_empty() => Some(Command::ClosePicker),
+            KeyCode::Char('q') if !ctrl => Some(Command::ClosePicker),
+            KeyCode::Char('j') if !ctrl => Some(Command::MoveDown),
+            KeyCode::Char('k') if !ctrl => Some(Command::MoveUp),
             KeyCode::Backspace => Some(Command::PickerBackspace),
+            KeyCode::Char(c) if !ctrl => Some(Command::PickerInput(c.to_string())),
             _ => None,
         }
     }
