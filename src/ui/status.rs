@@ -211,6 +211,21 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         if let Some(model) = model_display {
             spans.push(Span::raw(format!(" {model}")));
         }
+        // REQ-007 AC-007-11：goal 状态 chip（官方 goal 投影，ADR-008；缺字段
+        // → 不显示，TUI 不自算）。
+        if let Some(goal) = projections.goal() {
+            let phase = match goal.phase {
+                Some(crate::api::types::GoalPhase::Active) => "◉active",
+                Some(crate::api::types::GoalPhase::Paused) => "◉paused",
+                Some(crate::api::types::GoalPhase::Blocked) => "◉blocked",
+                Some(crate::api::types::GoalPhase::Complete) => "✓done",
+                None => "◉goal",
+            };
+            spans.push(Span::styled(
+                format!(" {phase}"),
+                Style::default().fg(Color::Cyan),
+            ));
+        }
         let context = projections.context_pressure();
         if let (Some(used), Some(total)) = (context.pressure_tokens, context.projected_tokens) {
             spans.push(Span::raw(format!(" ctx {used}/{total}")));

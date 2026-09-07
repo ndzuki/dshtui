@@ -42,6 +42,8 @@ pub enum InputMode {
     Mention,
     /// REQ-007 V0.4：subagent 目录面板（`:subagents`；AC-007-07~10）。
     Subagent,
+    /// REQ-007 V0.4：goal 面板（`:goal`；AC-007-11/12/14）。
+    Goal,
 }
 
 /// Domain commands emitted by the input layer.
@@ -154,6 +156,13 @@ pub enum Command {
     // ---------- REQ-007 V0.4 subagent（AC-007-07~10） ----------
     /// subagent 目录面板 `x`：请求中断所选子代理（二次确认后执行）。
     SubagentInterrupt,
+    // ---------- REQ-007 V0.4 goal（AC-007-11/12/14） ----------
+    GoalCreate,
+    GoalEdit,
+    GoalPause,
+    GoalResume,
+    GoalComplete,
+    GoalClear,
 }
 
 /// Stateful decoder for multi-key Normal-mode commands such as `gg`.
@@ -233,6 +242,7 @@ impl KeyDecoder {
             InputMode::Monitor => self.monitor(key),
             InputMode::Mention => self.mention(key),
             InputMode::Subagent => self.subagent(key),
+            InputMode::Goal => self.goal(key),
         }
     }
 
@@ -632,6 +642,29 @@ impl KeyDecoder {
         }
     }
 
+    /// REQ-007 goal 面板键位（AC-007-11/12/14）：无输入子阶段时
+    /// c=create / e=edit objective / p=pause / r=resume / x=complete /
+    /// d=clear(二次确认) / Esc·q 关闭；create/edit 输入子阶段字符进 buffer。
+    fn goal(&mut self, key: KeyEvent) -> Option<Command> {
+        self.pending_g = false;
+        match key.code {
+            KeyCode::Esc => Some(Command::ClosePicker),
+            KeyCode::Char('q') if key.modifiers.is_empty() => Some(Command::ClosePicker),
+            KeyCode::Char('c') if key.modifiers.is_empty() => Some(Command::GoalCreate),
+            KeyCode::Char('e') if key.modifiers.is_empty() => Some(Command::GoalEdit),
+            KeyCode::Char('p') if key.modifiers.is_empty() => Some(Command::GoalPause),
+            KeyCode::Char('r') if key.modifiers.is_empty() => Some(Command::GoalResume),
+            KeyCode::Char('x') if key.modifiers.is_empty() => Some(Command::GoalComplete),
+            KeyCode::Char('d') if key.modifiers.is_empty() => Some(Command::GoalClear),
+            KeyCode::Enter if key.modifiers.is_empty() => Some(Command::PickerConfirm),
+            KeyCode::Backspace => Some(Command::PickerBackspace),
+            KeyCode::Char(c) if key.modifiers.is_empty() => {
+                Some(Command::PickerInput(c.to_string()))
+            }
+            _ => None,
+        }
+    }
+
     /// REQ-009 MONITOR 键位（FR-009-04，vim 风格）：`j/k` 焦点、`gg/G` 首尾、
     /// `Enter` 详情、`c` 问答、`f` 加油、`l` 定位、`s` KB 统计、`/` 过滤、
     /// `q` 退出、`?` 帮助。Chat/Filter 输入态复用 Insert 语义（Esc/Enter/
@@ -973,6 +1006,7 @@ fn mode_name_of(mode: InputMode) -> &'static str {
         | InputMode::CommandPalette
         | InputMode::Mention => "input(不可覆盖)",
         InputMode::Subagent => "subagent",
+        InputMode::Goal => "goal",
     }
 }
 

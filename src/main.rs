@@ -491,6 +491,8 @@ async fn run_connected(eff: Effective, token: String, client: DshClient) -> Resu
                 Mode::Mention => InputMode::Mention,
                 // REQ-007：subagent 目录（FR-007-01）。
                 Mode::Subagent => InputMode::Subagent,
+                // REQ-007：goal 面板。
+                Mode::Goal => InputMode::Goal,
             };
             if let Some(command) = decoder.decode(mode, input) {
                 commands.extend(app.handle_command(command));
@@ -1039,6 +1041,131 @@ async fn execute_one(
                 Err(error) => commands.extend(app.handle(AppEvent::SubagentListFailed {
                     parent_id,
                     generation,
+                    error,
+                })),
+            }
+        }
+        // ---------- REQ-007：goal 写操作（FR-007-02，AC-007-11/12/14） ----------
+        Cmd::GoalOp { request_id, op } => {
+            use dshtui::app::GoalMutation;
+            let Some(client) = client.as_ref() else {
+                let event = AppEvent::GoalOpFailed {
+                    request_id,
+                    op,
+                    error: ClientError::Transport("未连接（dsh web 不可达）".into()),
+                };
+                commands.extend(app.handle(event));
+                return;
+            };
+            let Some(agent_id) = app.active_session.clone() else {
+                let event = AppEvent::GoalOpFailed {
+                    request_id,
+                    op,
+                    error: ClientError::Transport("无活动会话".into()),
+                };
+                commands.extend(app.handle(event));
+                return;
+            };
+            let result: Result<Option<dshtui::api::types::GoalSnapshot>, (String, ClientError)> =
+                match op.clone() {
+                    GoalMutation::Create {
+                        objective,
+                        max_goal_rounds,
+                    } => {
+                        let req = dshtui::api::types::CreateGoalRequest {
+                            objective,
+                            max_goal_rounds,
+                        };
+                        dshtui::api::goals::create(&client.http, &client.base, &agent_id.0, &req)
+                            .await
+                            .map(|r| {
+                                Some(dshtui::api::types::GoalSnapshot {
+                                    id: r.id,
+                                    revision: r.revision,
+                                    ..Default::default()
+                                })
+                            })
+                            .map_err(|e| ("create".into(), e))
+                    }
+                    GoalMutation::Edit { objective } => {
+                        // goals/edit(agentId, ref, request{objective})（typert 实读）。
+                        let _ = objective;
+                        Err((
+                            "edit".into(),
+                            ClientError::Protocol("goals/edit 暂未接线".into()),
+                        ))
+                    }
+                    GoalMutation::Pause => {
+                        let ref_ = dshtui::api::types::GoalRef {
+                            id: app
+                                .goals
+                                .goal
+                                .as_ref()
+                                .map(|g| g.id.clone())
+                                .unwrap_or_default(),
+                            revision: app.goals.sent_revision.unwrap_or(0),
+                        };
+                        dshtui::api::goals::pause(&client.http, &client.base, &agent_id.0, &ref_)
+                            .await
+                            .map(Some)
+                            .map_err(|e| ("pause".into(), e))
+                    }
+                    GoalMutation::Resume => {
+                        let ref_ = dshtui::api::types::GoalRef {
+                            id: app
+                                .goals
+                                .goal
+                                .as_ref()
+                                .map(|g| g.id.clone())
+                                .unwrap_or_default(),
+                            revision: app.goals.sent_revision.unwrap_or(0),
+                        };
+                        dshtui::api::goals::resume(&client.http, &client.base, &agent_id.0, &ref_)
+                            .await
+                            .map(Some)
+                            .map_err(|e| ("resume".into(), e))
+                    }
+                    GoalMutation::Complete => {
+                        let ref_ = dshtui::api::types::GoalRef {
+                            id: app
+                                .goals
+                                .goal
+                                .as_ref()
+                                .map(|g| g.id.clone())
+                                .unwrap_or_default(),
+                            revision: app.goals.sent_revision.unwrap_or(0),
+                        };
+                        dshtui::api::goals::complete(&client.http, &client.base, &agent_id.0, &ref_)
+                            .await
+                            .map(Some)
+                            .map_err(|e| ("complete".into(), e))
+                    }
+                    GoalMutation::Clear => {
+                        let ref_ = dshtui::api::types::GoalRef {
+                            id: app
+                                .goals
+                                .goal
+                                .as_ref()
+                                .map(|g| g.id.clone())
+                                .unwrap_or_default(),
+                            revision: app.goals.sent_revision.unwrap_or(0),
+                        };
+                        dshtui::api::goals::clear(&client.http, &client.base, &agent_id.0, &ref_)
+                            .await
+                            .map(|_| None)
+                            .map_err(|e| ("clear".into(), e))
+                    }
+                };
+            let cleared = matches!(result, Ok(None));
+            match result {
+                Ok(updated) => commands.extend(app.handle(AppEvent::GoalOpDone {
+                    request_id,
+                    updated,
+                    cleared,
+                })),
+                Err((_op_name, error)) => commands.extend(app.handle(AppEvent::GoalOpFailed {
+                    request_id,
+                    op,
                     error,
                 })),
             }

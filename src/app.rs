@@ -73,6 +73,8 @@ pub enum Mode {
     Mention,
     /// subagent 目录（REQ-007 FR-007-01；`:subagents` 打开）。
     Subagent,
+    /// goal 面板（REQ-007 FR-007-02 half；`:goal` 打开）。
+    Goal,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -351,6 +353,8 @@ pub enum PaletteAction {
     EditWithEditor,
     /// REQ-007：`:subagents` 打开子代理目录（FR-007-01）。
     OpenSubagents,
+    /// REQ-007：`:goal` 打开 goal 面板（FR-007-02）。
+    OpenGoal,
 }
 
 /// 会话/workspace 写操作（REQ-006 FR-006-02 操作半；wire 端点 Step 1 已封装）。
@@ -404,6 +408,40 @@ impl WorkspaceOperation {
             self,
             WorkspaceOperation::ArchiveSession { .. } | WorkspaceOperation::DeleteWorkspace { .. }
         )
+    }
+}
+
+/// goal 写操作（REQ-007 FR-007-02；CAS revision 由面板 inflight 携带，
+/// wire 端点 agentId=active_session）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum GoalMutation {
+    /// `goals/create`（objective + 可选 maxGoalRounds）。
+    Create {
+        objective: String,
+        max_goal_rounds: Option<u64>,
+    },
+    /// `goals/edit`（objective）。
+    Edit {
+        objective: String,
+    },
+    /// `goals/pause` / `resume` / `complete`。
+    Pause,
+    Resume,
+    Complete,
+    /// `goals/clear`（危险，二次确认）。
+    Clear,
+}
+
+impl GoalMutation {
+    pub fn op_kind(&self) -> crate::model::GoalOpKind {
+        match self {
+            GoalMutation::Create { .. } => crate::model::GoalOpKind::Create,
+            GoalMutation::Edit { .. } => crate::model::GoalOpKind::Edit,
+            GoalMutation::Pause => crate::model::GoalOpKind::Pause,
+            GoalMutation::Resume => crate::model::GoalOpKind::Resume,
+            GoalMutation::Complete => crate::model::GoalOpKind::Complete,
+            GoalMutation::Clear => crate::model::GoalOpKind::Clear,
+        }
     }
 }
 
@@ -603,6 +641,11 @@ impl CommandPaletteState {
                 label: "subagents",
                 desc: "子代理目录（FR-007-01；需要活动会话）",
                 action: PaletteAction::OpenSubagents,
+            },
+            CommandPaletteItem::Local {
+                label: "goal",
+                desc: "goal 面板（单例；create/edit/pause/resume/complete/clear）",
+                action: PaletteAction::OpenGoal,
             },
             CommandPaletteItem::V04 {
                 label: "keymap",
@@ -998,6 +1041,16 @@ pub enum AppEvent {
         child_id: String,
         error: Option<ClientError>,
     },
+    GoalOpDone {
+        request_id: String,
+        updated: Option<crate::api::types::GoalSnapshot>,
+        cleared: bool,
+    },
+    GoalOpFailed {
+        request_id: String,
+        op: GoalMutation,
+        error: ClientError,
+    },
 }
 
 /// Orchestration commands emitted by the reducer (executed by the run loop).
@@ -1145,6 +1198,11 @@ pub enum Cmd {
         child_id: String,
         parent_id: String,
     },
+    /// `goals/*` 写操作（agentId=活动会话，CAS revision；requestId 幂等）。
+    GoalOp {
+        request_id: String,
+        op: GoalMutation,
+    },
 }
 
 #[derive(Debug)]
@@ -1231,6 +1289,10 @@ pub struct AppState {
     pub pending_image_attachments: Vec<crate::model::ImageAttachment>,
     /// REQ-007 FR-007-01：subagent 目录树（AC-007-07~10）。
     pub subagents: crate::model::SubagentViewState,
+    /// REQ-007 FR-007-02：goal 面板（单例 CAS；AC-007-11/12/14）。
+    pub goals: crate::model::GoalPanelState,
+    /// goal create/edit 输入子阶段是否激活（buffer 在 GoalPanelState）。
+    pub goal_input: bool,
     page_guard: PageGuard,
     /// 模型目录 fetch 单飞 generation（REQ-006 FR-006-01）：打开时自增，
     /// stale 响应（overlay 已关/已重开）直接丢弃（模式 15 in-flight 去重）。
@@ -1338,6 +1400,8 @@ impl Default for AppState {
             mention: crate::model::MentionState::default(),
             pending_image_attachments: Vec::new(),
             subagents: crate::model::SubagentViewState::default(),
+            goals: crate::model::GoalPanelState::default(),
+            goal_input: false,
             page_guard: PageGuard::default(),
             catalog_generation: 0,
             want_backfill: false,
@@ -1687,6 +1751,202 @@ impl AppState {
         }
     }
 
+    // ---------- REQ-007 V0.4 goal 面板（AC-007-11/12/14；FR-007-02 half） ----------
+
+    /// `:goal`：打开面板并读取当前活动会话 goal 投影（单例）。
+    pub fn open_goal_panel(&mut self) -> Vec<Cmd> {
+        if self.active_session.is_none() {
+            self.notice = Some("请先用 f/o 打开会话再查看 goal".into());
+            return vec![];
+        }
+        self.goals.open();
+        self.goal_input = false;
+        self.mode = Mode::Goal;
+        if self.active_window().is_none() {
+            self.goals.set_goal(None, false);
+        } else {
+            self.refresh_goal_from_projection();
+        }
+        vec![]
+    }
+
+    /// 从活动窗口 projections 读取 `goal` 投影刷新面板（ADR-008 只读，
+    /// 缺字段/Null → 空态）。
+    pub fn refresh_goal_from_projection(&mut self) {
+        // 无窗口时不做刷新（保留当前 state：stale 需等真实投影回 fresh，
+        // 空态在 open_goal_panel 已设置）。
+        let Some(window) = self.active_window() else {
+            return;
+        };
+        let snap = crate::model::ProjectionSnapshot::new(window.projections().clone());
+        match snap.goal() {
+            Some(gv) => self.goals.set_goal(Some(gv), false),
+            None => self.goals.set_goal(None, false),
+        }
+    }
+
+    /// goal 面板命令分流。
+    fn handle_goal_command(&mut self, cmd: crate::input::Command) -> Vec<Cmd> {
+        use crate::input::Command as C;
+        // 输入子阶段（create/edit objective）。
+        if self.goal_input {
+            match cmd {
+                C::PickerInput(t) => {
+                    self.goals.create_objective.push_str(&t);
+                    vec![]
+                }
+                C::PickerBackspace => {
+                    self.goals.create_objective.pop();
+                    vec![]
+                }
+                C::PickerConfirm => {
+                    let objective = std::mem::take(&mut self.goals.create_objective);
+                    self.goal_input = false;
+                    if objective.trim().is_empty() {
+                        self.notice = Some("goal objective 不能为空".into());
+                        return vec![];
+                    }
+                    let op = if self.goals.goal.is_none() {
+                        GoalMutation::Create {
+                            objective,
+                            max_goal_rounds: None,
+                        }
+                    } else {
+                        GoalMutation::Edit { objective }
+                    };
+                    self.send_goal_op(op)
+                }
+                C::ClosePicker | C::Quit => {
+                    self.goal_input = false;
+                    self.goals.create_objective.clear();
+                    vec![]
+                }
+                _ => vec![],
+            }
+        } else {
+            match cmd {
+                C::GoalCreate => {
+                    if self.goals.goal.is_some() {
+                        self.notice = Some("已有 goal（单例）；先 clear 再重建".into());
+                        return vec![];
+                    }
+                    self.goal_input = true;
+                    self.goals.create_objective.clear();
+                    vec![]
+                }
+                C::GoalEdit => {
+                    if self.goals.goal.is_none() {
+                        return vec![];
+                    }
+                    let obj = self
+                        .goals
+                        .goal
+                        .as_ref()
+                        .map(|g| g.objective.clone())
+                        .unwrap_or_default();
+                    self.goals.create_objective = obj;
+                    self.goal_input = true;
+                    vec![]
+                }
+                C::GoalPause => self.send_goal_op(GoalMutation::Pause),
+                C::GoalResume => self.send_goal_op(GoalMutation::Resume),
+                C::GoalComplete => self.send_goal_op(GoalMutation::Complete),
+                C::GoalClear => {
+                    // clear 二次确认（ConfirmDanger 先例）。
+                    if self.goals.goal.is_none() {
+                        return vec![];
+                    }
+                    self.goals.request_confirm(crate::model::GoalOpKind::Clear);
+                    self.notice = Some("clear 当前 goal？Enter 确认 / 其它键取消".into());
+                    vec![]
+                }
+                C::PickerConfirm => {
+                    // clear 确认态。
+                    if self.goals.confirm_pending == Some(crate::model::GoalOpKind::Clear) {
+                        return self.send_goal_op(GoalMutation::Clear);
+                    }
+                    vec![]
+                }
+                C::ClosePicker | C::Quit => {
+                    self.goals.close();
+                    self.mode = Mode::Normal;
+                    vec![]
+                }
+                _ => vec![],
+            }
+        }
+    }
+
+    /// 发起 goal 写操作：CAS revision=当前投影；单飞拒绝；stale 拒绝重读。
+    fn send_goal_op(&mut self, op: GoalMutation) -> Vec<Cmd> {
+        let kind = op.op_kind();
+        if kind != crate::model::GoalOpKind::Create && self.goals.goal.is_none() {
+            return vec![];
+        }
+        // Create 走空态（goal None）。
+        if !self.goals.begin_op(kind) {
+            self.notice = Some("goal 操作在途或 revision stale——先重读投影".into());
+            return vec![];
+        }
+        let request_id = crate::api::types::mint_request_id();
+        vec![Cmd::GoalOp { request_id, op }]
+    }
+
+    /// goal 写操作成功回执（requestId 匹配才 apply）。
+    pub fn goal_op_done(
+        &mut self,
+        request_id: &str,
+        updated: Option<crate::api::types::GoalSnapshot>,
+        cleared: bool,
+    ) {
+        if !self.goal_inflight_matches(request_id) {
+            return;
+        }
+        if cleared {
+            self.goals.settle_op(None);
+            self.notice = Some("goal 已 clear".into());
+            return;
+        }
+        if let Some(snap) = updated {
+            // 回执可能带回更新后快照（宽容）；随后投影帧也会刷新。
+            self.goals.settle_op(Some(crate::model::GoalView {
+                id: snap.id,
+                revision: snap.revision,
+                objective: snap.objective,
+                phase: snap.phase,
+                blocked_reason: snap.blocked_reason,
+                max_goal_rounds: snap.max_goal_rounds,
+                ..Default::default()
+            }));
+            self.notice = Some(format!("goal {}", snap.phase.map(|_| "更新").unwrap_or("")));
+        } else {
+            self.goals.settle_op(None);
+            self.refresh_goal_from_projection();
+        }
+    }
+
+    fn goal_inflight_matches(&self, _request_id: &str) -> bool {
+        // goal 单例串行：begin_op 保证 ≤1 在途，任一在途回执即当前 op
+        // （无列表并发，requestId 槽冗余）。
+        self.goals.inflight.is_some()
+    }
+
+    /// goal 写操作失败：GOAL_STALE_REVISION → stale 重读；其它 error.code
+    /// 展示，权限不自动重试。
+    pub fn goal_op_failed(&mut self, request_id: &str, op: &GoalMutation, error: &ClientError) {
+        if !self.goal_inflight_matches(request_id) {
+            return;
+        }
+        let stale = error.code().contains("STALE") || error.code().contains("CONFLICT");
+        self.goals.fail_op(error.code(), stale);
+        if stale {
+            self.notice = Some("goal revision 过期——已重读投影，可重试".into());
+            self.refresh_goal_from_projection();
+        } else {
+            self.notice = Some(format!("goal {} 失败: {error}", op.op_kind().as_str()));
+        }
+    }
+
     // ---------- REQ-007 V0.4 @ 提及（AC-007-23；model/mention + api/references） ----------
 
     /// `@` 词边界判定：@ 前是空或空白（不在路径/单词中间）。
@@ -1934,6 +2194,16 @@ impl AppState {
                 // 无 TUI 切换入口 D-037）。逐快照刷新：最新投影为准。
                 if let Some(p) = projections.as_ref() {
                     self.approval.policy_display = crate::api::approval::policy_hint(p);
+                }
+                // REQ-007：goal 投影逐快照刷新（面板打开时实时；ADR-008
+                // 只读官方 goal）。
+                if self.mode == Mode::Goal
+                    && self
+                        .active_session
+                        .as_ref()
+                        .is_some_and(|s| s == &session_id)
+                {
+                    self.refresh_goal_from_projection();
                 }
                 if running {
                     self.running_sessions.insert(session_id.clone());
@@ -2676,6 +2946,23 @@ impl AppState {
                 self.subagents_interrupt_done(child_id, error.as_ref());
                 vec![]
             }
+            // ---------- REQ-007 V0.4 goal 回执 ----------
+            AppEvent::GoalOpDone {
+                request_id,
+                updated,
+                cleared,
+            } => {
+                self.goal_op_done(&request_id, updated, cleared);
+                vec![]
+            }
+            AppEvent::GoalOpFailed {
+                request_id,
+                op,
+                error,
+            } => {
+                self.goal_op_failed(&request_id, &op, &error);
+                vec![]
+            }
         }
     }
 
@@ -3370,6 +3657,10 @@ impl AppState {
         if self.mode == Mode::Subagent {
             return self.handle_subagent_command(cmd);
         }
+        // REQ-007：goal 面板命令分流（AC-007-11/12/14）。
+        if self.mode == Mode::Goal {
+            return self.handle_goal_command(cmd);
+        }
         match cmd {
             C::MoveDown
             | C::MoveUp
@@ -3425,6 +3716,15 @@ impl AppState {
             C::SubagentInterrupt => {
                 // 仅 subagent 模态上下文有意义（已在 handle_subagent_command
                 // 分流）；此处兜底 no-op。
+                vec![]
+            }
+            C::GoalCreate
+            | C::GoalEdit
+            | C::GoalPause
+            | C::GoalResume
+            | C::GoalComplete
+            | C::GoalClear => {
+                // 仅 goal 模态有意义（已分流）；兜底 no-op。
                 vec![]
             }
             C::OpenPicker => {
@@ -3505,6 +3805,8 @@ impl AppState {
                 Mode::Mention => vec![],
                 // REQ-007：subagent Esc 已在 handle_subagent_command 拦截。
                 Mode::Subagent => vec![],
+                // REQ-007：goal Esc 已在 handle_goal_command 拦截。
+                Mode::Goal => vec![],
             },
             C::PickerDown => {
                 if self.approval.list_open && self.mode == Mode::Approval {
@@ -4672,6 +4974,7 @@ impl AppState {
                             self.external_edit_begin()
                         }
                         PaletteAction::OpenSubagents => self.open_subagents(),
+                        PaletteAction::OpenGoal => self.open_goal_panel(),
                         PaletteAction::ForkSession
                         | PaletteAction::RenameSession
                         | PaletteAction::ArchiveSession
@@ -8528,5 +8831,142 @@ mod tests {
             Some("gateway/agent-busy")
         );
         assert_eq!(s.mode, Mode::Subagent, "失败面板保持可重试/Esc");
+    }
+
+    // ---------- REQ-007 V0.4 goal 面板（AC-007-11/12/14） ----------
+
+    #[test]
+    fn goal_open_shows_projection_and_empty_state_ac007_11() {
+        let mut s = AppState::default();
+        let sid = SessionId("sess-g".into());
+        s.active_session = Some(sid.clone());
+        // 会话有 goal 投影。
+        let w = s.sessions.touch(&sid.0, 50);
+        let _ = w.apply(Incoming::Snapshot {
+            cursor: None,
+            records: vec![],
+            has_more: false,
+            projections: Some(serde_json::json!({
+                "goal": {"goal": {"id": "g1", "revision": 2, "objective": "交付",
+                                  "phase": "active"}, "roundsStarted": 1}
+            })),
+        });
+        let _ = s.handle_command(crate::input::Command::OpenCommandPalette);
+        s.command_palette.query = "goal".into();
+        let idx = s
+            .command_palette
+            .filtered()
+            .iter()
+            .position(|i| matches!(i, CommandPaletteItem::Local { label: "goal", .. }))
+            .expect("goal 入口");
+        s.command_palette.selection = idx;
+        let _cmds = s.handle_command(crate::input::Command::PickerConfirm);
+        assert_eq!(s.mode, Mode::Goal, "进入 goal 模态");
+        assert!(s.goals.visible);
+        assert_eq!(
+            s.goals.goal.as_ref().map(|g| g.objective.as_str()),
+            Some("交付")
+        );
+        assert_eq!(s.goals.goal.as_ref().map(|g| g.revision), Some(2));
+    }
+
+    #[test]
+    fn goal_pause_sends_cas_op_and_stale_failure_recovers_ac007_12_14() {
+        let mut s = AppState::default();
+        let sid = SessionId("sess-g".into());
+        s.active_session = Some(sid.clone());
+        s.goals.open();
+        s.goals.set_goal(
+            Some(crate::model::GoalView {
+                id: "g1".into(),
+                revision: 4,
+                objective: "交付".into(),
+                phase: Some(crate::api::types::GoalPhase::Active),
+                ..Default::default()
+            }),
+            false,
+        );
+        s.mode = Mode::Goal;
+        // p → pause CAS。
+        let cmds = s.handle_command(crate::input::Command::GoalPause);
+        assert!(
+            cmds.iter().any(|c| matches!(c, Cmd::GoalOp { .. })),
+            "发 pause"
+        );
+        assert_eq!(s.goals.inflight, Some(crate::model::GoalOpKind::Pause));
+        // GOAL_STALE_REVISION 失败 → stale 置位 + 重读提示。
+        let _ = s.handle(AppEvent::GoalOpFailed {
+            request_id: "x".into(),
+            op: GoalMutation::Pause,
+            error: ClientError::Remote {
+                code: "GOAL_STALE_REVISION".into(),
+                message: "stale".into(),
+                class: ErrorClass::UserFacing,
+            },
+        });
+        assert!(s.goals.stale_revision);
+        assert!(s.goals.inflight.is_none());
+        // 恢复：重读投影后（revision 6）再 resume 成功。
+        s.goals.set_goal(
+            Some(crate::model::GoalView {
+                id: "g1".into(),
+                revision: 6,
+                objective: "交付".into(),
+                phase: Some(crate::api::types::GoalPhase::Active),
+                ..Default::default()
+            }),
+            false,
+        );
+        let cmds = s.handle_command(crate::input::Command::GoalResume);
+        assert!(
+            cmds.iter().any(|c| matches!(c, Cmd::GoalOp { .. })),
+            "stale 恢复后可重试"
+        );
+    }
+
+    #[test]
+    fn goal_clear_double_confirm_and_create_input_ac007_14() {
+        let mut s = AppState::default();
+        let sid = SessionId("sess-g".into());
+        s.active_session = Some(sid.clone());
+        s.goals.open();
+        s.goals.set_goal(
+            Some(crate::model::GoalView {
+                id: "g1".into(),
+                revision: 2,
+                objective: "交付".into(),
+                phase: Some(crate::api::types::GoalPhase::Paused),
+                ..Default::default()
+            }),
+            false,
+        );
+        s.mode = Mode::Goal;
+        // d → confirm（不发）；Enter 确认 → 发 clear。
+        let cmds = s.handle_command(crate::input::Command::GoalClear);
+        assert!(cmds.is_empty(), "确认前不发");
+        let confirm_cmds = s.handle_command(crate::input::Command::PickerConfirm);
+        assert!(confirm_cmds.iter().any(|c| matches!(
+            c,
+            Cmd::GoalOp {
+                op: GoalMutation::Clear,
+                ..
+            }
+        )));
+        // clear 成功回执 → 单例清空。
+        let _ = s.handle(AppEvent::GoalOpDone {
+            request_id: "x".into(),
+            updated: None,
+            cleared: true,
+        });
+        assert!(s.goals.goal.is_none());
+        // 空态 create：c → input，字符 + Enter → 发 Create。
+        let _ = s.handle_command(crate::input::Command::GoalCreate);
+        assert!(s.goal_input);
+        let _ = s.handle_command(crate::input::Command::PickerInput("新目标".into()));
+        let cmds = s.handle_command(crate::input::Command::PickerConfirm);
+        assert!(
+            cmds.iter().any(|c| matches!(c, Cmd::GoalOp { op: GoalMutation::Create { objective, .. }, .. } if objective == "新目标")),
+            "create 发目标文本"
+        );
     }
 }
