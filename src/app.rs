@@ -340,6 +340,9 @@ pub enum PaletteAction {
     DeleteWorkspace,
     /// 移动会话到目标 workspace（输入 workspace id / 空 = 未分组）。
     MoveSession,
+    /// REQ-007：`:` theme 切换（dark↔light，立即重绘 + save_theme 持久化，
+    /// AC-007-20）。
+    ToggleTheme,
 }
 
 /// 会话/workspace 写操作（REQ-006 FR-006-02 操作半；wire 端点 Step 1 已封装）。
@@ -578,9 +581,10 @@ impl CommandPaletteState {
                 label: "settings",
                 desc: "设置面板（V0.4）",
             },
-            CommandPaletteItem::V04 {
+            CommandPaletteItem::Local {
                 label: "theme",
-                desc: "主题切换（V0.4）",
+                desc: "主题切换 dark↔light（AC-007-20）",
+                action: PaletteAction::ToggleTheme,
             },
             CommandPaletteItem::V04 {
                 label: "keymap",
@@ -1057,6 +1061,13 @@ pub enum Cmd {
         request_id: String,
         op: WorkspaceOperation,
     },
+    // ---------- REQ-007 V0.4 ----------
+    /// 主题切换后持久化 config.toml（AC-007-20；ADR-010 save_theme_config，
+    /// 主循环执行同步 IO）。
+    SaveUiTheme {
+        theme: String,
+        palette: std::collections::BTreeMap<String, String>,
+    },
 }
 
 #[derive(Debug)]
@@ -1119,6 +1130,11 @@ pub struct AppState {
     /// Details 列宽（config `[ui].details_width_cells` 注入；默认 45，
     /// clamp 30–60 由 layout 侧执行，Notes/04 §1）。
     pub details_width_cells: u16,
+    /// Effective palette（REQ-007 AC-007-20；config `[ui] theme/palette`
+    /// 注入；运行时 `:` theme 切换重绘并持久化，ADR-010）。
+    pub palette: crate::ui::theme::Palette,
+    /// User palette overrides kept on AppState (persisted on theme toggle).
+    pub palette_overrides: std::collections::BTreeMap<String, String>,
     page_guard: PageGuard,
     /// 模型目录 fetch 单飞 generation（REQ-006 FR-006-01）：打开时自增，
     /// stale 响应（overlay 已关/已重开）直接丢弃（模式 15 in-flight 去重）。
@@ -1199,6 +1215,8 @@ impl Default for AppState {
             height: 24,
             window_cap: 200,
             details_width_cells: crate::ui::layout::DEFAULT_DETAILS_WIDTH,
+            palette: crate::ui::theme::Palette::default(),
+            palette_overrides: std::collections::BTreeMap::new(),
             page_guard: PageGuard::default(),
             catalog_generation: 0,
             want_backfill: false,
@@ -1277,6 +1295,34 @@ impl AppState {
             ),
             None => String::new(),
         }
+    }
+
+    // ---------- REQ-007 V0.4 theme (AC-007-20) ----------
+
+    /// Apply config theme + palette overrides at startup (main loop injects
+    /// `eff.ui`). Invalid overrides produce warnings (returned for the
+    /// startup banner); never fatal.
+    pub fn apply_palette_config(
+        &mut self,
+        theme: &str,
+        palette: &std::collections::BTreeMap<String, String>,
+    ) -> Vec<String> {
+        self.palette_overrides = palette.clone();
+        let built = crate::ui::theme::Palette::build(theme, palette);
+        let warnings = built.warnings.clone();
+        self.palette = built;
+        warnings
+    }
+
+    /// `:` theme toggle: flip dark↔light, rebuild with current overrides.
+    pub fn toggle_theme(&mut self) {
+        let next = if self.palette.is_light() {
+            "dark"
+        } else {
+            "light"
+        };
+        self.palette = crate::ui::theme::Palette::build(next, &self.palette_overrides);
+        self.notice = Some(format!("主题: {next}"));
     }
 
     // ---------- reducer ----------
@@ -3915,6 +3961,14 @@ impl AppState {
                         PaletteAction::Help => {
                             self.help_open = true;
                             vec![]
+                        }
+                        PaletteAction::ToggleTheme => {
+                            // 立即重绘（palette 重建），并持久化 config.toml。
+                            self.toggle_theme();
+                            vec![Cmd::SaveUiTheme {
+                                theme: self.palette.theme.clone(),
+                                palette: self.palette_overrides.clone(),
+                            }]
                         }
                         PaletteAction::ForkSession
                         | PaletteAction::RenameSession
@@ -7087,5 +7141,81 @@ mod tests {
         assert!(cmds
             .iter()
             .any(|c| matches!(c, Cmd::LoadSessionList { .. })));
+    }
+
+    // ---------- REQ-007 V0.4: theme（AC-007-20） ----------
+
+    #[test]
+    fn palette_config_applies_overrides_and_reports_warnings() {
+        let mut s = AppState::default();
+        let mut over = std::collections::BTreeMap::new();
+        over.insert("accent".to_string(), "#ff0000".to_string());
+        over.insert("error".to_string(), "nope".to_string());
+        over.insert("bad_role".to_string(), "#000000".to_string());
+        let warnings = s.apply_palette_config("dark", &over);
+        assert!(
+            warnings.iter().any(|w| w.contains("nope")),
+            "warnings={warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("bad_role")),
+            "warnings={warnings:?}"
+        );
+        assert_eq!(
+            s.palette.color(crate::ui::theme::Role::Accent),
+            ratatui::style::Color::Rgb(255, 0, 0)
+        );
+        // 非法值回退默认色（不崩）。
+        assert_eq!(
+            s.palette.color(crate::ui::theme::Role::Error),
+            crate::ui::theme::dark_builtin(crate::ui::theme::Role::Error)
+        );
+    }
+
+    #[test]
+    fn palette_default_is_dark_and_apply_light_flips() {
+        let s = AppState::default();
+        assert!(!s.palette.is_light());
+        let mut s = AppState::default();
+        let _ = s.apply_palette_config("light", &std::collections::BTreeMap::new());
+        assert!(s.palette.is_light());
+        assert_eq!(
+            s.palette.color(crate::ui::theme::Role::Accent),
+            crate::ui::theme::light_builtin(crate::ui::theme::Role::Accent)
+        );
+    }
+
+    #[test]
+    fn toggle_theme_flips_and_emits_save_cmd() {
+        let mut s = AppState::default();
+        // 打开命令面板选中 theme 本地动作并 Enter。
+        s.handle_command(C::OpenCommandPalette);
+        s.command_palette.query = "theme".into();
+        let idx = s
+            .command_palette
+            .filtered()
+            .iter()
+            .position(|i| matches!(i, CommandPaletteItem::Local { label: "theme", .. }))
+            .expect("theme 是本地动作（非 V04 占位）");
+        s.command_palette.selection = idx;
+        let cmds = s.handle_command(C::PickerConfirm);
+        assert!(s.palette.is_light(), "dark→light 翻转");
+        assert!(
+            cmds.iter().any(|c| matches!(c, Cmd::SaveUiTheme { .. })),
+            "主题切换发出持久化命令"
+        );
+        assert_eq!(s.mode, Mode::Normal, "面板关闭");
+        // 再次切换回到 dark。
+        s.handle_command(C::OpenCommandPalette);
+        s.command_palette.query = "theme".into();
+        let idx = s
+            .command_palette
+            .filtered()
+            .iter()
+            .position(|i| matches!(i, CommandPaletteItem::Local { label: "theme", .. }))
+            .unwrap();
+        s.command_palette.selection = idx;
+        let _ = s.handle_command(C::PickerConfirm);
+        assert!(!s.palette.is_light(), "来回切换");
     }
 }

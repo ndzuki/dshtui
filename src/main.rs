@@ -330,6 +330,7 @@ async fn run_startup_guidance(
 /// frame — the first sidebar screen renders after the first `session/list`
 /// page instead of after the full pagination (AC-001-03).
 async fn run_connected(eff: Effective, token: String, client: DshClient) -> Result<(), String> {
+    let config_path = dshtui::config::default_config_path();
     let mut terminal = TerminalSession::enter().map_err(|e| e.to_string())?;
     let mut app = AppState::new(eff.perf.window_messages);
     // REQ-004：启动检测一次 Kitty 能力（06 §6）+ 注入图片缓存预算。
@@ -337,6 +338,12 @@ async fn run_connected(eff: Effective, token: String, client: DshClient) -> Resu
     app.set_cache_budget(eff.perf.cache_bytes);
     // REQ-005：详情列宽从 `[ui].details_width_cells` 注入（默认 45）。
     app.details_width_cells = eff.ui.details_width_cells;
+    // REQ-007：主题/palette 从 `[ui] theme/palette` 注入（AC-007-20）；非法
+    // 覆盖只警告不崩溃。
+    let palette_warnings = app.apply_palette_config(&eff.ui.theme, &eff.ui.palette);
+    for w in &palette_warnings {
+        eprintln!("警告: {w}");
+    }
     let mut decoder = KeyDecoder::new();
     let mut client = Some(client);
     let mut mux: Option<Mux> = None;
@@ -390,6 +397,7 @@ async fn run_connected(eff: Effective, token: String, client: DshClient) -> Resu
                 &mut app,
                 &mut commands,
                 eff.perf.page_size,
+                &config_path,
             )
             .await;
         }
@@ -448,6 +456,7 @@ async fn execute_one(
     app: &mut AppState,
     commands: &mut VecDeque<Cmd>,
     page_size: usize,
+    config_path: &std::path::Path,
 ) {
     match command {
         Cmd::LoadSessionList { cursor } => {
@@ -901,6 +910,18 @@ async fn execute_one(
                 },
             };
             commands.extend(app.handle(event));
+        }
+        // ---------- REQ-007：主题切换持久化（AC-007-20/ADR-010） ----------
+        Cmd::SaveUiTheme { theme, palette } => {
+            let result = dshtui::config::save_theme_config(config_path, &theme, &palette);
+            match result {
+                Ok(()) => {
+                    app.notice = Some(format!("主题已保存（重启后仍生效）: {theme}"));
+                }
+                Err(error) => {
+                    app.last_error = Some(format!("主题保存失败: {error}"));
+                }
+            }
         }
         Cmd::OpenExternal { target } => {
             // 仅用户显式触发才调用系统 open（REQ-003 §3 安全边界）。

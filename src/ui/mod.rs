@@ -18,6 +18,7 @@ pub mod search;
 pub mod sidebar;
 pub mod status;
 pub mod tabs;
+pub mod theme;
 pub mod trajectory;
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};

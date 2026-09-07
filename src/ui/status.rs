@@ -39,7 +39,11 @@ fn official_running(app: &AppState) -> bool {
 
 /// Render the two-line status bar: official projection fields + shortcut hints.
 pub fn render(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
+    use crate::ui::theme::Role;
     let depth = color_depth();
+    let accent = app.palette.color(Role::Accent);
+    let warn = app.palette.color(Role::Warn);
+    let ok = app.palette.color(Role::AssistantFg);
     let (label, color) = connection_label(app.conn, depth);
     let mut spans = vec![Span::styled(
         format!(" {label} "),
@@ -52,34 +56,26 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         crate::app::Mode::Insert => {
             spans.push(Span::styled(
                 " INSERT ",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(accent).add_modifier(Modifier::BOLD),
             ));
             // REQ-003 AC-003-06：运行中 composer 为 steer，状态条显示 STEER。
             if app.composer.steer {
                 spans.push(Span::styled(
                     " STEER ",
-                    Style::default()
-                        .fg(Color::Magenta)
-                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(accent).add_modifier(Modifier::BOLD),
                 ));
             }
         }
         crate::app::Mode::Search => {
             spans.push(Span::styled(
                 " SEARCH ",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(accent).add_modifier(Modifier::BOLD),
             ));
         }
         crate::app::Mode::Visual => {
             spans.push(Span::styled(
                 " VISUAL ",
-                Style::default()
-                    .fg(Color::Magenta)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(accent).add_modifier(Modifier::BOLD),
             ));
             // §4：VISUAL 选择区反色 + `selected N lines` 计数。
             if let Some(sel) = &app.yank.visual {
@@ -96,26 +92,20 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         crate::app::Mode::Approval => {
             spans.push(Span::styled(
                 " APPROVAL ",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(warn).add_modifier(Modifier::BOLD),
             ));
         }
         // REQ-005：Trajectory 模式指示（D-25）。
         crate::app::Mode::Trajectory => {
             spans.push(Span::styled(
                 " TRAJ ",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(accent).add_modifier(Modifier::BOLD),
             ));
             // 详情子层指示（D-25：Trajectory 内焦点子层）。
             if app.traj.detail_open && app.focus == crate::app::Focus::Details {
                 spans.push(Span::styled(
                     " DETAILS ",
-                    Style::default()
-                        .fg(Color::Magenta)
-                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(accent).add_modifier(Modifier::BOLD),
                 ));
             }
         }
@@ -123,18 +113,14 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         crate::app::Mode::ModelCatalog => {
             spans.push(Span::styled(
                 " MODEL ",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(accent).add_modifier(Modifier::BOLD),
             ));
         }
         // REQ-006：命令面板模式指示（FR-006-03）。
         crate::app::Mode::CommandPalette => {
             spans.push(Span::styled(
                 " CMD ",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(accent).add_modifier(Modifier::BOLD),
             ));
         }
         _ => {}
@@ -161,16 +147,14 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         };
         spans.push(Span::styled(
             format!("  {text}"),
-            Style::default().fg(Color::Cyan),
+            Style::default().fg(accent),
         ));
     }
     // 复制成功 toast（AC-003-08；`copied`）。
     if let Some(toast) = &app.yank.toast {
         spans.push(Span::styled(
             format!("  {toast} "),
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(ok).add_modifier(Modifier::BOLD),
         ));
     }
 
@@ -209,9 +193,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         if running && app.stop.requested_session.as_ref() == app.active_session.as_ref() {
             spans.push(Span::styled(
                 " 停止中…",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(warn).add_modifier(Modifier::BOLD),
             ));
         }
         // AC-006-08（FR-006-01/D-033）：状态条显示模型选择——next 与
