@@ -657,13 +657,15 @@ impl KeyDecoder {
     }
 
     /// REQ-007 subagent 目录键位（AC-007-07~10）：j/k 移动、Enter 展开/折叠
-    /// （has_children 拉取子目录）、x 中断（二次确认在 reducer）、Esc/q 关闭。
+    /// （has_children 拉取子目录）、o 打开 child 会话（address subagent）、
+    /// x 中断（二次确认在 reducer）、Esc/q 关闭。
     fn subagent(&mut self, key: KeyEvent) -> Option<Command> {
         self.pending_g = false;
         match key.code {
             KeyCode::Esc => Some(Command::ClosePicker),
             KeyCode::Char('q') if key.modifiers.is_empty() => Some(Command::ClosePicker),
             KeyCode::Enter if key.modifiers.is_empty() => Some(Command::PickerConfirm),
+            KeyCode::Char('o') if key.modifiers.is_empty() => Some(Command::OpenSelected),
             KeyCode::Char('j') if key.modifiers.is_empty() => Some(Command::PickerDown),
             KeyCode::Char('k') if key.modifiers.is_empty() => Some(Command::PickerUp),
             KeyCode::Char('x') if key.modifiers.is_empty() => Some(Command::SubagentInterrupt),

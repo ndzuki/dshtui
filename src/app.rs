@@ -1328,6 +1328,13 @@ pub enum Cmd {
         rating: String,
         note: Option<String>,
     },
+    /// REQ-007 AC-007-01：打开 subagent child 会话（follow 用 subagent
+    /// address；窗口按 child id 键控）。
+    OpenFollowSubagent {
+        parent_id: String,
+        child_id: String,
+        max_messages: usize,
+    },
 }
 
 #[derive(Debug)]
@@ -1430,6 +1437,9 @@ pub struct AppState {
     pub message_action: crate::model::MessageActionState,
     /// 菜单目标（打开时捕获，防窗口漂移后错位）。
     pub msg_action_target: Option<MessageActionTarget>,
+    /// REQ-007 AC-007-01：待打开的 subagent child（open_follow 用 subagent
+    /// address；由 main 消费一次后清空）。
+    pub pending_subagent_open: Option<(String, String)>,
     /// REQ-007 AC-007-15/16：settings 面板。
     pub settings: crate::model::SettingsPanelState,
     /// REQ-007 AC-007-18：skills 目录。
@@ -1551,6 +1561,7 @@ impl Default for AppState {
             show_timeline: false,
             message_action: crate::model::MessageActionState::default(),
             msg_action_target: None,
+            pending_subagent_open: None,
             settings: crate::model::SettingsPanelState::default(),
             skills: crate::model::SkillsCatalogState::default(),
             export: crate::model::ExportState::default(),
@@ -1797,6 +1808,41 @@ impl AppState {
         self.fetch_subagent_list(sid.0.clone())
     }
 
+    /// AC-007-01：打开选中 child 会话——以 child id 为活动会话 + follow 走
+    /// subagent address（main 依据 pending_subagent_open 消费）。
+    fn open_subagent_child(&mut self) -> Vec<Cmd> {
+        let Some(id) = self.subagents.selected_id() else {
+            return vec![];
+        };
+        let Some(parent) = self.subagents.parent_session_id.clone() else {
+            return vec![];
+        };
+        let child = SessionId(id.clone());
+        // 关闭面板 + 走 open_session（返回 OpenFollow/OpenControl）。
+        self.subagents.close();
+        self.mode = Mode::Normal;
+        let mut cmds = self.open_session(child);
+        // 把 OpenFollow 换成 OpenFollowSubagent（child 日志经 subagent
+        // address follow；control 对子代理不适用）。
+        self.pending_subagent_open = Some((parent.clone(), id.clone()));
+        cmds.retain(|c| !matches!(c, Cmd::OpenControl { .. }));
+        for c in &mut cmds {
+            if let Cmd::OpenFollow {
+                session_id,
+                max_messages,
+            } = c
+            {
+                let sid = session_id.0.clone();
+                *c = Cmd::OpenFollowSubagent {
+                    parent_id: parent.clone(),
+                    child_id: sid,
+                    max_messages: *max_messages,
+                };
+            }
+        }
+        cmds
+    }
+
     /// 拉取 `subagents/list(parent_id)`（generation 单飞）。
     fn fetch_subagent_list(&mut self, parent_id: String) -> Vec<Cmd> {
         self.subagents.loading = true;
@@ -1869,6 +1915,7 @@ impl AppState {
                 self.notice = Some("中断所选子代理？Enter 确认 / 其它键取消".into());
                 vec![]
             }
+            C::OpenSelected => self.open_subagent_child(),
             C::ClosePicker | C::Quit => {
                 self.subagents.close();
                 self.mode = Mode::Normal;
@@ -9722,6 +9769,51 @@ mod tests {
             error: None,
         });
         assert_eq!(s.subagents.last_error_code, None);
+    }
+
+    #[test]
+    fn subagent_child_open_uses_subagent_address_follow_ac007_01() {
+        let mut s = AppState {
+            active_session: Some(SessionId("p1".into())),
+            ..Default::default()
+        };
+        s.subagents.open("p1");
+        s.mode = Mode::Subagent;
+        s.subagents.set_catalog(
+            "p1",
+            crate::api::types::SubagentCatalog {
+                entries: vec![crate::api::types::SubagentListEntry::Child {
+                    id: "c1".into(),
+                    activity: "running".into(),
+                    has_children: false,
+                    mode: Some("continuable".into()),
+                    label: None,
+                }],
+                parent_available: true,
+            },
+        );
+        s.subagents.selected = 0;
+        let cmds = s.handle_command(crate::input::Command::OpenSelected);
+        assert_eq!(s.mode, Mode::Normal, "关闭面板");
+        assert!(!s.subagents.visible);
+        assert_eq!(s.active_session.as_ref().map(|s| s.0.as_str()), Some("c1"));
+        assert_eq!(
+            s.pending_subagent_open
+                .as_ref()
+                .map(|(p, c)| (p.as_str(), c.as_str())),
+            Some(("p1", "c1"))
+        );
+        assert!(
+            cmds.iter().any(
+                |c| matches!(c, Cmd::OpenFollowSubagent { parent_id, child_id, .. }
+                if parent_id == "p1" && child_id == "c1")
+            ),
+            "follow 走 subagent address"
+        );
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Cmd::OpenControl { .. })),
+            "子代理不订阅 control"
+        );
     }
 
     #[test]

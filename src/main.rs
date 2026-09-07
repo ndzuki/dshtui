@@ -608,6 +608,40 @@ async fn execute_one(
                 }
             }
         }
+        Cmd::OpenFollowSubagent {
+            parent_id,
+            child_id,
+            max_messages,
+        } => {
+            let Some(client) = client.as_ref() else {
+                return;
+            };
+            // subagent address（kind=subagent, parent+child+mode）follow child
+            // 日志（AC-007-01）。
+            let address = SessionAddress::subagent(&parent_id, &child_id, "continuable");
+            let opened = match open_mux_stream(client, mux, mux_generation, event_tx).await {
+                Ok(mux_ref) => session::open_follow(mux_ref, &address, max_messages).await,
+                Err(error) => Err(error),
+            };
+            let session_id = SessionId(child_id.clone());
+            match opened {
+                Ok(stream) => {
+                    let generation = mux_generation.load(Ordering::Relaxed);
+                    spawn_follow_reader(
+                        stream,
+                        session_id,
+                        event_tx.clone(),
+                        mux_generation.clone(),
+                        generation,
+                    );
+                }
+                Err(error) => {
+                    commands.extend(app.handle(AppEvent::FollowError { session_id, error }));
+                }
+            }
+            // 消费一次待开标记。
+            app.pending_subagent_open = None;
+        }
         Cmd::OpenFollow {
             session_id,
             max_messages,
