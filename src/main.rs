@@ -983,7 +983,12 @@ async fn execute_one(
 /// 编码时的视口区域（与 `ui::split` 同一 seam：ImageView 中心区尺寸）。
 fn encode_area(app: &AppState) -> ratatui::layout::Rect {
     let full = ratatui::layout::Rect::new(0, 0, app.width, app.height);
-    dshtui::ui::split(full, app.focus == dshtui::app::Focus::Details).center
+    dshtui::ui::split(
+        full,
+        app.focus == dshtui::app::Focus::Details,
+        app.details_width_cells,
+    )
+    .center
 }
 
 /// Open a stream on the shared mux, creating the mux connection first if needed.

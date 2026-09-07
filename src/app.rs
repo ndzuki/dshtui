@@ -560,6 +560,9 @@ pub struct AppState {
     pub height: u16,
     /// Window message cap (config).
     pub window_cap: usize,
+    /// Details 列宽（config `[ui].details_width_cells` 注入；默认 45，
+    /// clamp 30–60 由 layout 侧执行，Notes/04 §1）。
+    pub details_width_cells: u16,
     page_guard: PageGuard,
     want_backfill: bool,
     /// `loadThrough(seq)` 在途目标：每页合并后 reducer 判断是否已覆盖，
@@ -631,6 +634,7 @@ impl Default for AppState {
             width: 80,
             height: 24,
             window_cap: 200,
+            details_width_cells: crate::ui::layout::DEFAULT_DETAILS_WIDTH,
             page_guard: PageGuard::default(),
             want_backfill: false,
             load_through_target: None,

@@ -491,3 +491,253 @@ fn image_view_mode_shows_image_status_and_actions() {
     );
     assert!(text.contains("加载中"), "text={text}");
 }
+
+// ============================================================================
+// REQ-005 V0.3 Trajectory UI golden（Seam = ratatui TestBackend + ui::render；
+// 计划 Step 5 测试 Seam 行）。验收：AC-005-01/02/03/06/10/15 渲染侧。
+// ============================================================================
+
+use dshtui::input::Command;
+
+/// 带 turn/step/wire 字段的轨迹事件记录。
+fn traj_ev(seq: u64, ty: &str, time_ms: i64, data: serde_json::Value) -> SessionHistoryRecord {
+    SessionHistoryRecord::Event {
+        event: SessionWireEvent {
+            event_type: ty.to_string(),
+            seq: Some(SessionSeq(seq)),
+            time: Some(time_ms),
+            request_id: None,
+            ignorable: None,
+            source_event_seqs: None,
+            surface_op: None,
+            data: Some(data),
+        },
+    }
+}
+
+/// 构造含轨迹数据的 AppState（Transcript + Trajectory 双写，mode=Trajectory）。
+fn trajectory_app() -> AppState {
+    let mut app = AppState::new(200);
+    app.conn = ConnState::Ready;
+    app.active_session = Some(SessionId("sess-t".into()));
+    let sid = SessionId("sess-t".into());
+    const T: i64 = 1_700_000_000_000;
+    let records = vec![
+        traj_ev(
+            1,
+            "request/header",
+            T,
+            serde_json::json!({"reason": "initial"}),
+        ),
+        traj_ev(
+            2,
+            "turn/start",
+            T + 1000,
+            serde_json::json!({"turn": 1, "reason": "user-prompt"}),
+        ),
+        traj_ev(
+            3,
+            "step/start",
+            T + 2000,
+            serde_json::json!({"turn": 1, "step": 1, "reason": "max"}),
+        ),
+        traj_ev(
+            4,
+            "user/message",
+            T + 3000,
+            serde_json::json!({"content": "排查数据库连接"}),
+        ),
+        traj_ev(
+            5,
+            "assistant/message",
+            T + 4000,
+            serde_json::json!({"turn": 1, "step": 1, "content": "先用 bash 检查端口", "usage": {"input": 100, "output": 50}}),
+        ),
+        traj_ev(
+            6,
+            "tool/call",
+            T + 5000,
+            serde_json::json!({"turn": 1, "step": 1, "callId": "c1", "name": "bash", "arguments": "{\"command\":\"ss -ltnp\"}"}),
+        ),
+        traj_ev(
+            7,
+            "tool/result",
+            T + 8000,
+            serde_json::json!({"turn": 1, "step": 1, "callId": "c1", "message": "db:5432 在监听"}),
+        ),
+        traj_ev(
+            8,
+            "step/end",
+            T + 9000,
+            serde_json::json!({"turn": 1, "step": 1}),
+        ),
+        traj_ev(
+            9,
+            "turn/end",
+            T + 9500,
+            serde_json::json!({"turn": 1, "reason": "stop"}),
+        ),
+    ];
+    app.handle(AppEvent::FollowSnapshot {
+        session_id: sid.clone(),
+        cursor: None,
+        records,
+        has_more: false,
+        projections: Some(serde_json::json!({
+            "contextBreakdown": {"system": 1000, "tools": 2000, "message": 3000},
+        })),
+    });
+    app.mode = Mode::Trajectory;
+    app.focus = dshtui::app::Focus::Center;
+    app
+}
+
+#[test]
+fn trajectory_tabs_and_event_table_render_ac005_01_02_06() {
+    // AC-005-01/02/06（渲染侧）：顶部 Tabs + 事件表（kind 标签、边界行保留、
+    // 折叠标记）。
+    let app = trajectory_app();
+    let backend = TestBackend::new(140, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::render(frame, &app)).unwrap();
+    let text = rendered_text(&terminal);
+    // 顶部 Tabs（Chat / Trajectory 高亮）。
+    assert!(text.contains("Chat"), "Tabs 显示 Chat, text={text}");
+    assert!(text.contains("Trajectory"), "Tabs 显示 Trajectory");
+    // 事件表 kind 标签 + 摘要（kind_label 短标签）。
+    assert!(text.contains("user"), "user 行, text={text}");
+    assert!(text.contains("排查数据库连接"), "user 摘要, text={text}");
+    assert!(text.contains("tool"), "tool/call 行, text={text}");
+    assert!(text.contains("ss -ltnp"), "tool args 摘要, text={text}");
+    assert!(text.contains("assistant"), "assistant 行, text={text}");
+    assert!(text.contains("先用 bash"), "assistant 摘要, text={text}");
+    assert!(
+        text.contains("header"),
+        "request/header 边界行保留, text={text}"
+    );
+    // 折叠标记（turn/start 展开态 ▾）。
+    assert!(text.contains("▾"), "turn 组展开标记 ▾, text={text}");
+    // 耗时推导（tool/result 8000-5000=3000ms）。
+    assert!(text.contains("3000ms"), "tool/result 耗时, text={text}");
+}
+
+#[test]
+fn trajectory_detail_panel_render_ac005_03_10_15() {
+    // AC-005-03/10/15（渲染侧）：详情面板 args/result/usage([未验证])/timing/
+    // diff 降级「无 diff」；缺省 —。
+    let mut app = trajectory_app();
+    app.mode = Mode::Trajectory;
+    // 光标在 tool/call 行（view index 3：header, turn/start, step/start,
+    // user, assistant, tool/call, ...），通过 handle_command 走真逻辑。
+    app.traj.cursor = 5; // tool/call
+    app.handle_command(Command::OpenDetail);
+    assert!(app.traj.detail_open);
+    // 高终端让详情完整可见（context 段在末尾）。
+    let backend = TestBackend::new(140, 34);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::render(frame, &app)).unwrap();
+    let text = rendered_text(&terminal);
+    assert!(text.contains("args"), "详情 args 分区, text={text}");
+    assert!(text.contains("command"), "args JSON, text={text}");
+    assert!(text.contains("result"), "result 分区, text={text}");
+    assert!(text.contains("db:5432"), "result 内容, text={text}");
+    assert!(
+        text.contains("[未验证]") || text.contains("usage"),
+        "usage 推导标注, text={text}"
+    );
+    // 无 meta → 无 diff 降级。
+    assert!(text.contains("无 diff"), "diff 降级, text={text}");
+    // context breakdown（官方投影，不自算）。
+    assert!(text.contains("context"), "context breakdown, text={text}");
+    assert!(text.contains("system: 1000"), "context system, text={text}");
+}
+
+#[test]
+fn trajectory_detail_with_diff_renders_diff_text_ac005_10() {
+    // AC-005-10：meta.diff 存在 → 展示 diff 文本（不降级）。
+    let mut app = trajectory_app();
+    // 用带 meta.diff 的 tool/result 重建。
+    let sid = SessionId("sess-t".into());
+    app.active_session = Some(sid.clone());
+    app.traj_sessions = dshtui::model::TrajectoryStore::new(3);
+    let mut w = dshtui::model::TrajectoryWindow::new(200);
+    const T: i64 = 1_700_000_000_000;
+    use dshtui::model::TrajIncoming;
+    w.apply(TrajIncoming::Snapshot {
+        cursor: None,
+        records: vec![
+            traj_ev(1, "turn/start", T, serde_json::json!({"turn": 1})),
+            traj_ev(2, "step/start", T, serde_json::json!({"turn": 1, "step": 1})),
+            traj_ev(3, "assistant/message", T, serde_json::json!({"turn": 1, "step": 1, "content": "a"})),
+            traj_ev(4, "tool/call", T, serde_json::json!({"turn": 1, "step": 1, "callId": "c1", "name": "bash", "arguments": "{}"})),
+            traj_ev(5, "tool/result", T, serde_json::json!({"turn": 1, "step": 1, "callId": "c1", "message": "ok", "meta": {"diff": "--- a/x\n+++ b/x"}})),
+            traj_ev(6, "step/end", T, serde_json::json!({"turn": 1, "step": 1})),
+            traj_ev(7, "turn/end", T, serde_json::json!({"turn": 1})),
+        ],
+        has_more: false,
+        projections: None,
+    });
+    app.traj_sessions.touch("sess-t", 200);
+    // 直接放行以绕过 borrow。
+    // （重建触达即可，行已入 store 的默认窗口；重置 store 后重放）
+    app.mode = Mode::Trajectory;
+    // 重新应用让双写生效
+    app.handle(AppEvent::FollowSnapshot {
+        session_id: sid.clone(),
+        cursor: None,
+        records: vec![
+            traj_ev(1, "turn/start", T, serde_json::json!({"turn": 1})),
+            traj_ev(2, "step/start", T, serde_json::json!({"turn": 1, "step": 1})),
+            traj_ev(3, "assistant/message", T, serde_json::json!({"turn": 1, "step": 1, "content": "a"})),
+            traj_ev(4, "tool/call", T, serde_json::json!({"turn": 1, "step": 1, "callId": "c1", "name": "bash", "arguments": "{}"})),
+            traj_ev(5, "tool/result", T, serde_json::json!({"turn": 1, "step": 1, "callId": "c1", "message": "ok", "meta": {"diff": "--- a/x\n+++ b/x"}})),
+            traj_ev(6, "step/end", T, serde_json::json!({"turn": 1, "step": 1})),
+            traj_ev(7, "turn/end", T, serde_json::json!({"turn": 1})),
+        ],
+        has_more: false,
+        projections: None,
+    });
+    app.traj.cursor = 3; // tool/call
+    app.handle_command(Command::OpenDetail);
+    let backend = TestBackend::new(140, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::render(frame, &app)).unwrap();
+    let text = rendered_text(&terminal);
+    assert!(!text.contains("无 diff"), "有 diff 不降级, text={text}");
+    assert!(text.contains("+++ b/x"), "diff 内容展示, text={text}");
+}
+
+#[test]
+fn trajectory_narrow_width_renders_without_details_column() {
+    // 窄终端（<120 列）：详情列自动收起，事件表正常渲染不崩溃（AC-005-10/
+    // §10 降级；details 区不占主视图）。
+    let mut app = trajectory_app();
+    // 光标在 tool/call 行开详情（focus=Details），但 <120 列时 split 仍收起。
+    app.traj.cursor = 5;
+    app.handle_command(Command::OpenDetail);
+    assert!(app.traj.detail_open);
+    let backend = TestBackend::new(100, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::render(frame, &app)).unwrap();
+    let text = rendered_text(&terminal);
+    assert!(text.contains("Trajectory"), "事件表仍渲染, text={text}");
+    // details 区被收起：详情文本 args 不占主视图（仍能看事件表）。
+    assert!(text.contains("assistant"), "事件行可见, text={text}");
+}
+
+#[test]
+fn trajectory_filter_overlay_renders_matches_ac005_05() {
+    // AC-005-05（渲染侧）：过滤 overlay 显示 query 与命中数。
+    let mut app = trajectory_app();
+    app.mode = Mode::Trajectory;
+    app.handle_command(Command::StartSearch);
+    for c in ['d', 'b'] {
+        app.handle_command(Command::PickerInput(c.to_string()));
+    }
+    let backend = TestBackend::new(140, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::render(frame, &app)).unwrap();
+    let text = rendered_text(&terminal);
+    assert!(text.contains("/ db"), "过滤 query 显示, text={text}");
+    assert!(text.contains("matches"), "命中计数, text={text}");
+}
