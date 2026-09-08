@@ -48,7 +48,29 @@ pub struct Config {
     pub drafts: DraftsConfig,
     /// Export default target path (ADR-010).
     pub export: ExportConfig,
+    /// REQ-008 AC-008-09：文件日志轮转上限（`[log] max_bytes`，可选；
+    /// 缺省 5MB 行为不变）。
+    pub log: LogConfig,
 }
+
+/// `[log]` — 文件日志配置（REQ-008 FR-008-02 / Notes/06 §7）。
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct LogConfig {
+    /// 轮转触发字节数（默认 5MB，对齐 main `LOG_ROTATE_BYTES`）。
+    pub max_bytes: u64,
+}
+
+impl Default for LogConfig {
+    fn default() -> Self {
+        Self {
+            max_bytes: DEFAULT_LOG_MAX_BYTES,
+        }
+    }
+}
+
+/// 文件日志轮转上限默认 5MB（Notes/06 §7）。
+pub const DEFAULT_LOG_MAX_BYTES: u64 = 5 * 1024 * 1024;
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
@@ -91,6 +113,13 @@ pub struct PerfConfig {
     pub page_size: usize,
     pub cache_bytes: u64,
     pub rss_target_mb: u64,
+    /// REQ-008 AC-008-10：perf 日志开关（默认开；`log_path` 为空 = 禁用）。
+    #[serde(default = "default_perf_log_on")]
+    pub log: bool,
+    /// REQ-008 AC-008-10：perf 日志路径（默认 `/tmp/dshtui-perf.log`；
+    /// 空 = 禁用）。环境变量 `DSHTUI_PERF_LOG` 覆盖既有 monitor 用法。
+    #[serde(default)]
+    pub log_path: String,
 }
 
 /// `[keymap]` — per-mode command→key-sequence override table (REQ-007
@@ -189,10 +218,16 @@ const DETAILS_WIDTH_CELLS_MAX: u16 = 60;
 /// 图片缓存预算默认 32MB（REQ-004 §3；pub 供 AppState 默认缓存构造）。
 pub const DEFAULT_CACHE_BYTES: u64 = 32 * 1024 * 1024;
 const DEFAULT_RSS_TARGET_MB: u64 = 80;
+/// REQ-008 AC-008-10：perf 日志默认路径（Notes/06 §8 `/tmp/dshtui-perf.log`）。
+pub const DEFAULT_PERF_LOG_PATH: &str = "/tmp/dshtui-perf.log";
 /// `/agents` 轮询间隔默认 2s（FR-009-02）。
 const DEFAULT_POLL_AGENTS_MS: u64 = 2_000;
 /// `/kb-stats` 轮询间隔默认 30s（FR-009-02）。
 const DEFAULT_POLL_KB_MS: u64 = 30_000;
+
+fn default_perf_log_on() -> bool {
+    true
+}
 
 impl Default for ServerConfig {
     fn default() -> Self {
@@ -227,6 +262,8 @@ impl Default for PerfConfig {
             page_size: DEFAULT_PAGE_SIZE,
             cache_bytes: DEFAULT_CACHE_BYTES,
             rss_target_mb: DEFAULT_RSS_TARGET_MB,
+            log: default_perf_log_on(),
+            log_path: DEFAULT_PERF_LOG_PATH.to_string(),
         }
     }
 }
@@ -995,6 +1032,49 @@ window_messages = 100
     #[test]
     fn cli_monitor_missing_addr_value_fails() {
         assert!(parse_cli(["dshtui".to_string(), "monitor".into(), "--addr".into()]).is_err());
+    }
+
+    // ---------- REQ-008 Step 1：perf 日志开关/路径 + [log] max_bytes ----------
+
+    #[test]
+    fn perf_log_defaults_on_with_tmp_path() {
+        let cfg = Config::load(Some(std::path::Path::new("/nonexistent/dshtui.toml"))).unwrap();
+        assert!(cfg.perf.log, "AC-008-10 perf 日志默认开");
+        assert_eq!(cfg.perf.log_path, DEFAULT_PERF_LOG_PATH);
+        let eff = cfg.resolve(&Cli::default()).unwrap();
+        assert!(eff.perf.log);
+        assert_eq!(eff.perf.log_path, DEFAULT_PERF_LOG_PATH);
+    }
+
+    #[test]
+    fn perf_log_can_be_disabled_and_path_overridden() {
+        // log=false 关闭；log_path 可配。
+        let (_dir, path) = tmp_config(
+            "[perf]\nlog = false\nlog_path = \"\"\nwindow_messages = 200\npage_size = 50\ncache_bytes = 1\nrss_target_mb = 80\n",
+        );
+        let cfg = Config::load(Some(&path)).unwrap();
+        assert!(!cfg.perf.log);
+        assert!(cfg.perf.log_path.is_empty(), "空路径 = 禁用");
+
+        let (_dir2, path2) = tmp_config("[perf]\nlog_path = \"/var/tmp/my-perf.log\"\n");
+        let cfg2 = Config::load(Some(&path2)).unwrap();
+        assert!(cfg2.perf.log, "未写 log 保持默认开");
+        assert_eq!(cfg2.perf.log_path, "/var/tmp/my-perf.log");
+    }
+
+    #[test]
+    fn log_section_defaults_to_5mb_and_overridable() {
+        let cfg = Config::load(Some(std::path::Path::new("/nonexistent/dshtui.toml"))).unwrap();
+        assert_eq!(
+            cfg.log.max_bytes, DEFAULT_LOG_MAX_BYTES,
+            "缺省 5MB 行为不变"
+        );
+        let (_dir, path) = tmp_config("[log]\nmax_bytes = 1048576\n");
+        let cfg2 = Config::load(Some(&path)).unwrap();
+        assert_eq!(cfg2.log.max_bytes, 1_048_576);
+        // 非法未知字段仍 deny（不静默接受）。
+        let (_dir3, path3) = tmp_config("[log]\nnope = 1\n");
+        assert!(Config::load(Some(&path3)).is_err());
     }
 
     #[test]

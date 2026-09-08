@@ -1546,6 +1546,17 @@ pub struct AppState {
     view_temp_path: Option<std::path::PathBuf>,
     /// Non-Kitty viewer request target; stale completions must not launch a viewer.
     pub pending_viewer: Option<(SessionId, SessionSeq, AttachmentId)>,
+
+    // ---------- REQ-008 Step 1：perf 日志采集字段（AC-008-10） ----------
+    /// WS mux 重连累计次数（reducer 单调；`AppEvent::Reconnected` 路径 +1）。
+    /// perf 日志 `ws_reconnects` 字段。
+    pub ws_reconnects: u64,
+    /// 最近一次检索耗时 ms（远程 session/search 或本地 nucleo query 完成
+    /// 后记录；perf 日志 `search_ms` 字段）。
+    pub last_search_ms: Option<f64>,
+    /// 最近一次分页耗时 ms（session/page 完成后记录；perf 日志
+    /// `page_latency_ms` 字段）。
+    pub last_page_latency_ms: Option<f64>,
 }
 
 /// REQ-007 AC-007-24：读取本地图片文件 → base64 inline ImageAttachment。
@@ -1662,6 +1673,9 @@ impl Default for AppState {
             transient_files: Vec::new(),
             view_temp_path: None,
             pending_viewer: None,
+            ws_reconnects: 0,
+            last_search_ms: None,
+            last_page_latency_ms: None,
         }
     }
 }
@@ -3518,6 +3532,9 @@ impl AppState {
             AppEvent::Disconnected(reason) => self.handle_disconnected(reason),
             AppEvent::Reconnected => {
                 self.conn = ConnState::Ready;
+                // REQ-008 AC-008-10：WS 重连累计单调计数（每次完整重连 +1；
+                // perf 日志 ws_reconnects 字段）。
+                self.ws_reconnects = self.ws_reconnects.saturating_add(1);
                 // After recovery trigger refollow only once (no repeated
                 // repair); REQ-003 重开 control 流（运行态/审批降级状态读取）。
                 match self.active_session.clone() {
@@ -4185,7 +4202,10 @@ impl AppState {
     /// 用当前查询词重算窗口内即时命中（离线，无网络）。
     fn recompute_window_matches(&mut self) {
         let (filter, term) = self.search.terms();
+        // REQ-008 Step 1：本地 nucleo 检索耗时采集（AC-008-10 search_ms）。
+        let q_start = std::time::Instant::now();
         let matches = self.search_index.query(&term, filter);
+        self.last_search_ms = Some(q_start.elapsed().as_secs_f64() * 1000.0);
         self.search.window_matches = matches.iter().map(|m| m.item_index).collect();
         if self.search.window_matches.is_empty()
             || self.search.cursor >= self.search.window_matches.len()
@@ -7356,6 +7376,36 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn ws_reconnect_counter_is_monotonic_on_reconnected_ac008_10() {
+        let mut s = AppState::default();
+        assert_eq!(s.ws_reconnects, 0);
+        // 断开→重连一轮 +1；多轮单调。
+        s.handle(AppEvent::Disconnected("断网".into()));
+        s.handle(AppEvent::Reconnected);
+        assert_eq!(s.ws_reconnects, 1);
+        s.handle(AppEvent::Disconnected("again".into()));
+        s.handle(AppEvent::Reconnected);
+        assert_eq!(s.ws_reconnects, 2);
+        // 无断开直接 Reconnected（异常重放）也不回退——单调不减。
+        s.handle(AppEvent::Reconnected);
+        assert_eq!(s.ws_reconnects, 3);
+    }
+
+    #[test]
+    fn local_search_records_last_search_ms_ac008_10() {
+        let mut s = AppState::default();
+        assert_eq!(s.last_search_ms, None);
+        // 注入词触发窗口内匹配重算（无需远程）。
+        s.handle(AppEvent::Startup);
+        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle(snapshot("s1", false));
+        // search.terms 需要 query；直接调私有方法同模块可见。
+        s.search.query = "x".to_string();
+        s.recompute_window_matches();
+        assert!(s.last_search_ms.is_some(), "本地 nucleo query 后应记录耗时");
     }
 
     #[test]

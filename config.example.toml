@@ -20,6 +20,12 @@ window_messages = 200            # 转录本窗口条数
 page_size = 50                   # session/page 每页条数
 cache_bytes = 33554432           # 图片/历史缓存上限 32MB
 rss_target_mb = 80               # 超限触发 LRU 释放
+log = true                       # perf 日志开关（REQ-008 AC-008-10，默认开）
+log_path = "/tmp/dshtui-perf.log"  # perf 日志路径（空 = 禁用；
+                                 #   环境变量 DSHTUI_PERF_LOG 覆盖本项）
+
+[log]                            # REQ-008 AC-008-09：文件日志轮转
+max_bytes = 5242880              # 轮转上限（默认 5MB）
 
 # [keymap]                         # 默认内置键位；以下展示覆盖写法（REQ-007 V0.4）
 # 支持覆盖的 mode：normal/trajectory/visual/approval/approval_list/image_view/
