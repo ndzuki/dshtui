@@ -171,6 +171,7 @@ mod tests {
                 })],
             },
             time: None,
+            message_id: None,
         }
     }
 

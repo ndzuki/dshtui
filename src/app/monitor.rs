@@ -600,7 +600,7 @@ pub async fn run(eff: Effective) -> Result<(), String> {
         .unwrap_or(0);
     let mut app = MonitorAppState::new(kitty, now_ms as f64, now_ms ^ 0x9e37_79b9);
     let mut canvas = TownCanvas::new(app.next_image_id());
-    let mut decoder = KeyDecoder::new();
+    let mut decoder = KeyDecoder::from_effective(&eff);
 
     // 启动立即发出首次 `/agents`（AC-009-01：1s 内进入界面并发出首请求）；
     // `/health` 启动探测并发（§6：失败即提示启动指引，不等待轮询）。

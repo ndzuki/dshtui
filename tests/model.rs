@@ -1437,3 +1437,51 @@ fn trajectory_27turn_1144step_perf_ac005_14() {
     }
     println!("PERF {summary}");
 }
+
+// ============================================================================
+// REQ-007 V0.4: message.id retention (feedback CAS) + projection readers
+// ============================================================================
+
+#[test]
+fn assistant_message_retains_wire_message_id_ac007_27() {
+    use dshtui::model::Block;
+    let mut window = TranscriptWindow::new(20);
+    // assistant/message 事件 data 含官方 message id（messageFeedback 定位锚）。
+    window.apply(Incoming::FollowEvent(SessionWireEvent {
+        event_type: "assistant/message".into(),
+        seq: Some(SessionSeq(1)),
+        time: None,
+        request_id: None,
+        ignorable: None,
+        source_event_seqs: None,
+        surface_op: None,
+        data: Some(serde_json::json!({
+            "id": "msg-42",
+            "turn": 1, "step": 1
+        })),
+    }));
+    let last = window.blocks().last().cloned().unwrap();
+    match last {
+        Block::AssistantMessage { message_id, .. } => {
+            assert_eq!(message_id.as_deref(), Some("msg-42"));
+        }
+        _ => panic!("尾部必须是 assistant"),
+    }
+}
+
+#[test]
+fn projection_goal_plan_todos_readers_ac007_11_26() {
+    use dshtui::model::ProjectionSnapshot;
+    let p = ProjectionSnapshot::new(serde_json::json!({
+        "goal": {"goal": {"id": "g1", "revision": 2, "objective": "交付",
+                          "phase": "paused"}, "roundsStarted": 1},
+        "plan": {"active": true, "pending": false},
+        "todos": [{"content": "写 ADR", "status": "done"}]
+    }));
+    let g = p.goal().unwrap();
+    assert_eq!(g.revision, 2);
+    assert_eq!(g.rounds_started, Some(1));
+    assert_eq!(p.plan(), Some((true, false)));
+    assert_eq!(p.todos().len(), 1);
+    assert!(p.subagent_running_children().is_empty());
+}

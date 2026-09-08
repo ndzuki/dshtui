@@ -2,4 +2,4 @@
 
 pub mod keymap;
 
-pub use keymap::{map_key, Command, InputMode, KeyDecoder};
+pub use keymap::{map_key, Command, InputMode, KeyDecoder, Keymap};

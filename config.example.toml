@@ -10,6 +10,9 @@ theme = "dark"                   # dark / light（V0.1 仅 dark 生效）
 sidebar_width_cells = 32         # 左栏列数（终端窄时自动收窄/隐藏）
 details_width_cells = 45         # 右栏详情列宽 30–60（V0.3 轨迹详情；默认 45）
 show_turn_rail = false           # 右侧 turn 导航（V0.2）
+# editor = ""                    # `:edit` 编辑器（可选；选择链 $VISUAL→$EDITOR→此项，REQ-007 D-52）
+# max_image_count = 10           # 图片附件数量软上限（默认 10，REQ-007 D-51）
+# max_image_bytes = 20971520     # 单张图片字节软上限（默认 20 MiB，REQ-007 D-51）
 tick_ms = 33                     # 帧循环节拍
 
 [perf]
@@ -18,9 +21,30 @@ page_size = 50                   # session/page 每页条数
 cache_bytes = 33554432           # 图片/历史缓存上限 32MB
 rss_target_mb = 80               # 超限触发 LRU 释放
 
-[keymap]                         # 默认内置，允许覆盖（后期）
+# [keymap]                         # 默认内置键位；以下展示覆盖写法（REQ-007 V0.4）
+# 支持覆盖的 mode：normal/trajectory/visual/approval/approval_list/image_view/
+# help/monitor（字符兼作输入的模式不可覆盖）。command 名见 Notes/04 §3 冻结表。
+# 键序列支持单字符或 none（解绑）；g 为前缀键不可重绑；非法项警告并保默认。
+# [keymap.modes.normal]
+# move_down = "x"                 # j → x（原 j 失绑）
+# quit = "none"                   # 解绑 q（不退出）
+# [keymap.modes.image_view]
+# image_view_close = "c"
 
 [monitor]                         # REQ-009 V0.3 Agent Town 监控面板
 addr = "http://127.0.0.1:8799"    # OTR agent-server 地址（默认仅连 loopback）
 poll_agents_ms = 2000             # /agents 轮询间隔
 poll_kb_ms = 30000                # /kb-stats 轮询间隔
+
+# ---------- REQ-007 V0.4（ADR-010 本地持久化边界） ----------
+
+# [ui] 追加字段：
+#   palette = { accent = "#ff0000", ... }   # 语义角色 → 颜色覆盖（可选）
+#   show_timeline = false                   # 消息缩略时间线条（默认关，V0.4）
+
+[drafts]                       # 草稿落盘（ADR-010：仅草稿文本，session 键控）
+enabled = true                 # false 退化为纯内存注册表（REQ-003 语义）
+clear = false                  # 启动时清空已保存草稿
+
+[export]                       # 会话导出（官方 HTTP /api/session.export）
+default_dir = ""               # 导出默认目录（空 = 每次提示选择）

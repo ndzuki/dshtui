@@ -74,6 +74,18 @@ impl DraftRegistry {
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
     }
+
+    /// All session ids currently holding a draft (for persistence snapshot /
+    /// startup clear, AC-007-22).
+    pub fn session_ids(&self) -> Vec<SessionId> {
+        self.order.iter().cloned().collect()
+    }
+
+    /// Clear every session (startup `[drafts].clear` / disable path).
+    pub fn clear_all(&mut self) {
+        self.map.clear();
+        self.order.clear();
+    }
 }
 
 impl Default for DraftRegistry {

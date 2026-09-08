@@ -93,6 +93,83 @@ pub struct SearchMatch {
     pub positions: Vec<u32>,
 }
 
+// ---------- REQ-007 AC-007-31 additive: search query history ----------
+
+/// Search query history (additive to SearchState; memory-only cap 50 FIFO).
+/// `/` reopening can recall/recover recent queries (↑/↓ or list).
+#[derive(Debug, Clone, Default)]
+pub struct SearchHistory {
+    entries: std::collections::VecDeque<String>,
+    cap: usize,
+}
+
+impl SearchHistory {
+    pub fn new(cap: usize) -> Self {
+        Self {
+            entries: std::collections::VecDeque::new(),
+            cap: cap.max(1),
+        }
+    }
+
+    /// Record a committed query (dedupe consecutive identical, FIFO cap).
+    pub fn push(&mut self, query: &str) {
+        if query.trim().is_empty() {
+            return;
+        }
+        if self.entries.back().is_some_and(|last| last == query) {
+            return;
+        }
+        self.entries.push_back(query.to_string());
+        while self.entries.len() > self.cap {
+            self.entries.pop_front();
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Iterate most-recent-first (recall on `/` reopen, ↑ to go back).
+    pub fn recent(&self) -> impl DoubleEndedIterator<Item = &str> + Clone {
+        self.entries.iter().rev().map(String::as_str)
+    }
+}
+
+#[cfg(test)]
+mod search_history_tests {
+    use super::*;
+
+    #[test]
+    fn history_caps_and_dedupes_consecutive() {
+        let mut h = SearchHistory::new(3);
+        h.push("a");
+        h.push("a");
+        assert_eq!(h.len(), 1, "连续重复去重");
+        h.push("b");
+        h.push("c");
+        h.push("d");
+        assert_eq!(h.len(), 3, "FIFO 上限 3");
+        h.push("");
+        assert_eq!(h.len(), 3, "空查询不记");
+        let rec: Vec<&str> = h.recent().collect();
+        assert_eq!(rec, vec!["d", "c", "b"], "最近在前");
+    }
+
+    #[test]
+    fn recent_iteration_rev_order() {
+        let mut h = SearchHistory::new(50);
+        h.push("x");
+        h.push("y");
+        h.push("z");
+        let rec: Vec<&str> = h.recent().collect();
+        assert_eq!(rec, vec!["z", "y", "x"]);
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct SearchIndex {
     items: Vec<SearchItem>,
@@ -359,6 +436,7 @@ mod tests {
                 })],
             },
             time: None,
+            message_id: None,
         }
     }
 

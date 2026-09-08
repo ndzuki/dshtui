@@ -1,0 +1,511 @@
+//! Subagent view state (REQ-007 FR-007-01; pure model, no IO).
+//!
+//! `subagents/list` only returns DIRECT children (`hasChildren` guides
+//! recursion), so the tree is expanded lazily along the user's navigation
+//! path — never the whole depth-first tree (breadth bound: each level of the
+//! navigation path holds one catalog fetch).
+
+use std::collections::BTreeMap;
+
+use crate::api::types::SubagentCatalog;
+
+/// One expanded subagent node in the view.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SubagentNode {
+    /// Direct child session id (`childSessionId`).
+    pub id: String,
+    pub activity: String,
+    pub has_children: bool,
+    /// "one-shot" | "continuable" (None when the server omits it).
+    pub mode: Option<String>,
+    pub label: Option<String>,
+    /// Children fetched on demand (`subagents/list(childId)`) when the user
+    /// opens this node; `None` = not expanded yet.
+    pub children: Option<Vec<SubagentNode>>,
+}
+
+/// Subagent panel state.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SubagentViewState {
+    /// Panel visibility (open via `:` subagent action).
+    pub visible: bool,
+    /// Catalog for the CURRENT parent (the session the user opened the panel
+    /// from); re-fetched when the bound parent changes.
+    pub parent_session_id: Option<String>,
+    pub parent_available: bool,
+    pub roots: Vec<SubagentNode>,
+    /// Breadcrumb of expanded nodes on the navigation path (session ids).
+    pub nav_path: Vec<String>,
+    /// Cursor row (flattened display index).
+    pub selected: usize,
+    /// Confirm-pending action (interrupt target id).
+    pub interrupt_target: Option<String>,
+    pub last_error_code: Option<String>,
+    /// Whether the panel is mid-flight on the current parent (generation
+    /// guard — stale responses dropped).
+    pub loading: bool,
+}
+
+impl SubagentViewState {
+    pub fn open(&mut self, parent_session_id: &str) {
+        self.visible = true;
+        self.parent_session_id = Some(parent_session_id.to_string());
+        self.roots = Vec::new();
+        self.nav_path = Vec::new();
+        self.selected = 0;
+        self.loading = true;
+        self.last_error_code = None;
+    }
+
+    pub fn close(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Replace the catalog of the current parent / a navigation child.
+    /// `children_of` is the session id whose children this catalog serves
+    /// (== the current parent when on the root level).
+    pub fn set_catalog(&mut self, children_of: &str, cat: SubagentCatalog) {
+        self.loading = false;
+        self.parent_available = cat.parent_available;
+        let nodes = cat
+            .entries
+            .into_iter()
+            .filter_map(|e| match e {
+                crate::api::types::SubagentListEntry::Child {
+                    id,
+                    activity,
+                    has_children,
+                    mode,
+                    label,
+                } => Some(SubagentNode {
+                    id,
+                    activity,
+                    has_children,
+                    mode,
+                    label,
+                    children: None,
+                }),
+                // diagnostic rows carry no actionable id for this panel level.
+                crate::api::types::SubagentListEntry::Diagnostic { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        if self.parent_session_id.as_deref() == Some(children_of) && self.nav_path.is_empty() {
+            self.roots = nodes;
+        } else if let Some(level) = self.nav_path.iter().position(|p| p == children_of) {
+            // nav_path = expanded child ids from the root down. Attach the new
+            // catalog at nav_path[level]: walk down levels [0, level).
+            let mut container: &mut Vec<SubagentNode> = &mut self.roots;
+            for step in self.nav_path.iter().take(level) {
+                let Some(pos) = container.iter().position(|n| &n.id == step) else {
+                    return;
+                };
+                let Some(children) = container[pos].children.as_mut() else {
+                    // 未展开的层无子列表：不做半成品写入。
+                    return;
+                };
+                container = children;
+            }
+            if let Some(pos) = container.iter().position(|n| n.id == children_of) {
+                container[pos].children = Some(nodes);
+            }
+        }
+    }
+
+    /// 选中行对应 node 的 id（depth-first 平铺定位）。
+    pub fn selected_id(&self) -> Option<String> {
+        self.flatten().get(self.selected).map(|r| r.node.id.clone())
+    }
+
+    /// 定位并可能展开一个子代理：返回 (needs_fetch, target_id)。
+    /// - node 有 has_children 且 children 未展开 → 预置空 children + nav_path
+    ///   追加并请求拉取（needs_fetch=true）；
+    /// - node 有 has_children 且已展开 → 折叠（children=None，从 nav_path 移除）；
+    /// - 无 children 语义（诊断/叶子）→ needs_fetch=false。
+    pub fn toggle_expand(&mut self, id: &str) -> Option<(bool, String)> {
+        // 在平铺层找到该 node 的祖先路径并修改。
+        let target: Option<(Vec<String>, bool)> = {
+            fn find(
+                nodes: &[SubagentNode],
+                path: &[String],
+                id: &str,
+                out: &mut Vec<(Vec<String>, bool)>,
+            ) {
+                for n in nodes {
+                    let mut p = path.to_vec();
+                    p.push(n.id.clone());
+                    if n.id == id {
+                        out.push((p.clone(), n.has_children));
+                        return;
+                    }
+                    if let Some(ch) = &n.children {
+                        find(ch, &p, id, out);
+                    }
+                }
+            }
+            let mut found = Vec::new();
+            find(&self.roots, &[], id, &mut found);
+            found.pop()
+        };
+        let (ancestors, has_children) = target?;
+        if !has_children {
+            return Some((false, id.to_string())); // 叶子：无子目录
+        }
+        // 深挖到目标 node：ancestors 不含 id 自身（父链）。
+        let parent_chain = &ancestors[..ancestors.len().saturating_sub(1)];
+        let mut container: &mut Vec<SubagentNode> = &mut self.roots;
+        let mut target: Option<&mut SubagentNode> = None;
+        for a in parent_chain {
+            let Some(pos) = container.iter().position(|n| n.id == *a) else {
+                return Some((false, id.to_string()));
+            };
+            let Some(children) = container[pos].children.as_mut() else {
+                return Some((false, id.to_string()));
+            };
+            container = children;
+        }
+        if let Some(pos) = container.iter().position(|n| n.id == id) {
+            target = container.get_mut(pos);
+        }
+        if let Some(node) = target {
+            if node.children.is_some() {
+                // 折叠。
+                node.children = None;
+                self.nav_path.retain(|p| p != id);
+                return Some((false, id.to_string()));
+            }
+            node.children = Some(Vec::new());
+        }
+        if !self.nav_path.contains(&id.to_string()) {
+            self.nav_path.push(id.to_string());
+        }
+        Some((true, id.to_string()))
+    }
+
+    /// 面包屑：当前导航路径根 → 深（root/parent + expanded ids）。
+    pub fn breadcrumbs(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Some(root) = self.parent_session_id.clone() {
+            out.push(root);
+        }
+        out.extend(self.nav_path.iter().cloned());
+        out
+    }
+
+    /// Depth-first flattened rows (for list rendering & cursor navigation).
+    pub fn flatten(&self) -> Vec<SubagentNodeRef<'_>> {
+        fn walk<'a>(nodes: &'a [SubagentNode], depth: usize, out: &mut Vec<SubagentNodeRef<'a>>) {
+            for n in nodes {
+                out.push(SubagentNodeRef { node: n, depth });
+                if let Some(children) = &n.children {
+                    walk(children, depth + 1, out);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(&self.roots, 0, &mut out);
+        out
+    }
+
+    /// Immediate parent session id of a node in the tree. Roots are children
+    /// of the panel `parent_session_id`; deeper levels are children of the
+    /// enclosing expanded node (each level was fetched via
+    /// `subagents/list(level_parent)`). Opening a grandchild must address its
+    /// DIRECT parent — not the panel root (AC-007-01 nested children).
+    pub fn immediate_parent_of(&self, id: &str) -> Option<String> {
+        // Roots are children of parent_session_id; deeper levels inherit the
+        // enclosing node id as their parent.
+        fn find(
+            nodes: &[SubagentNode],
+            id: &str,
+            inherited: Option<&str>,
+            root_parent: &str,
+        ) -> Option<String> {
+            for n in nodes {
+                if n.id == id {
+                    // depth 1: parent = root parent; depth ≥2: parent =
+                    // enclosing expanded node (passed via inherited).
+                    return Some(
+                        inherited
+                            .map(str::to_string)
+                            .unwrap_or_else(|| root_parent.to_string()),
+                    );
+                }
+                if let Some(ch) = &n.children {
+                    if let Some(p) = find(ch, id, Some(&n.id), root_parent) {
+                        return Some(p);
+                    }
+                }
+            }
+            None
+        }
+        let root = self.parent_session_id.clone()?;
+        find(&self.roots, id, None, &root)
+    }
+
+    /// Update one node's activity (roots or any expanded level) after an
+    /// interruptByParent receipt (AC-007-09: running → stopped on success).
+    /// Returns true when the node was found and updated.
+    pub fn set_activity(&mut self, id: &str, activity: &str) -> bool {
+        fn find<'a>(nodes: &'a mut [SubagentNode], id: &str, out: &mut Vec<&'a mut SubagentNode>) {
+            for n in nodes {
+                if n.id == id {
+                    out.push(n);
+                    return;
+                }
+                if let Some(ch) = n.children.as_mut() {
+                    find(ch, id, out);
+                }
+            }
+        }
+        let mut found = Vec::new();
+        find(&mut self.roots, id, &mut found);
+        if let Some(node) = found.pop() {
+            node.activity = activity.to_string();
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Borrow of one flattened row with its depth (rendering indent).
+#[derive(Debug, Clone, Copy)]
+pub struct SubagentNodeRef<'a> {
+    pub node: &'a SubagentNode,
+    pub depth: usize,
+}
+
+/// Lineage breadcrumb — derived only from real data (`SessionMeta.parent_id`
+/// chains / subagent address fields); never fabricated.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LineageCrumb {
+    pub session_id: String,
+    pub title: Option<String>,
+    pub kind: String, // "session" | "subagent"
+}
+
+/// Assemble a breadcrumb trail from a leaf back to the root using the known
+/// parent map. `parents` maps session id → (title, parent_id or None).
+pub fn lineage_breadcrumbs(
+    leaf: &str,
+    parents: &BTreeMap<String, (Option<String>, Option<String>)>,
+) -> Vec<LineageCrumb> {
+    let mut out = Vec::new();
+    let mut cur = leaf.to_string();
+    let mut guard = 0;
+    loop {
+        guard += 1;
+        if guard > 64 {
+            break; // 防环兜底（异常数据）
+        }
+        let Some((title, parent)) = parents.get(&cur) else {
+            out.push(LineageCrumb {
+                session_id: cur,
+                title: None,
+                kind: "session".into(),
+            });
+            break;
+        };
+        out.push(LineageCrumb {
+            session_id: cur.clone(),
+            title: title.clone(),
+            kind: "session".into(),
+        });
+        match parent {
+            Some(p) if !p.is_empty() && p != &cur => cur = p.clone(),
+            _ => break,
+        }
+    }
+    out.reverse();
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::types::SubagentListEntry;
+
+    fn child(
+        id: &str,
+        activity: &str,
+        has_children: bool,
+        mode: Option<&str>,
+    ) -> SubagentListEntry {
+        SubagentListEntry::Child {
+            id: id.into(),
+            activity: activity.into(),
+            has_children,
+            mode: mode.map(String::from),
+            label: None,
+        }
+    }
+
+    fn catalog(entries: Vec<SubagentListEntry>) -> SubagentCatalog {
+        SubagentCatalog {
+            entries,
+            parent_available: true,
+        }
+    }
+
+    #[test]
+    fn open_sets_parent_and_loading() {
+        let mut s = SubagentViewState::default();
+        s.open("parent-1");
+        assert!(s.visible);
+        assert_eq!(s.parent_session_id.as_deref(), Some("parent-1"));
+        assert!(s.loading);
+    }
+
+    #[test]
+    fn set_catalog_roots_at_parent_level() {
+        let mut s = SubagentViewState::default();
+        s.open("p1");
+        s.set_catalog(
+            "p1",
+            catalog(vec![child("c1", "running", true, Some("continuable"))]),
+        );
+        assert!(!s.loading);
+        assert_eq!(s.roots.len(), 1);
+        assert_eq!(s.roots[0].id, "c1");
+        assert_eq!(s.flatten().len(), 1);
+    }
+
+    #[test]
+    fn set_catalog_attaches_to_nav_child_and_drops_diagnostics() {
+        let mut s = SubagentViewState::default();
+        s.open("p1");
+        s.set_catalog(
+            "p1",
+            catalog(vec![
+                child("c1", "running", true, Some("continuable")),
+                SubagentListEntry::Diagnostic {
+                    id: "c9".into(),
+                    reason: "corrupt".into(),
+                },
+            ]),
+        );
+        s.nav_path = vec!["c1".into()];
+        s.set_catalog("c1", catalog(vec![child("gc1", "inactive", false, None)]));
+        let rows = s.flatten();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].node.id, "c1");
+        assert_eq!(rows[1].depth, 1);
+        assert_eq!(rows[1].node.id, "gc1");
+    }
+
+    #[test]
+    fn lineage_breadcrumbs_reverse_chain_no_fabrication() {
+        let mut parents = BTreeMap::new();
+        parents.insert("leaf".into(), (Some("叶子".into()), Some("mid".into())));
+        parents.insert("mid".into(), (Some("中间".into()), Some("root".into())));
+        parents.insert("root".into(), (Some("根".into()), None));
+        let crumbs = lineage_breadcrumbs("leaf", &parents);
+        let ids: Vec<&str> = crumbs.iter().map(|c| c.session_id.as_str()).collect();
+        assert_eq!(ids, vec!["root", "mid", "leaf"]);
+        assert_eq!(crumbs[0].title.as_deref(), Some("根"));
+        // Unknown leaf: single crumb with no title, never invented.
+        let crumbs = lineage_breadcrumbs("ghost", &parents);
+        assert_eq!(crumbs.len(), 1);
+        assert_eq!(crumbs[0].title, None);
+    }
+
+    #[test]
+    fn lineage_guard_breaks_cycles() {
+        let mut parents = BTreeMap::new();
+        parents.insert("a".into(), (None, Some("b".into())));
+        parents.insert("b".into(), (None, Some("a".into())));
+        let crumbs = lineage_breadcrumbs("a", &parents);
+        assert!(crumbs.len() <= 65, "防环有界，得到 {}", crumbs.len());
+    }
+
+    #[test]
+    fn toggle_expand_collapse_and_breadcrumbs() {
+        use crate::api::types::SubagentListEntry;
+        fn child(id: &str, hc: bool) -> SubagentListEntry {
+            SubagentListEntry::Child {
+                id: id.into(),
+                activity: "inactive".into(),
+                has_children: hc,
+                mode: Some("continuable".into()),
+                label: None,
+            }
+        }
+        let mut v = SubagentViewState::default();
+        v.open("p1");
+        v.set_catalog(
+            "p1",
+            SubagentCatalog {
+                entries: vec![child("c1", true), child("c2", false)],
+                parent_available: true,
+            },
+        );
+        // 展开 c1 → needs_fetch + nav_path + children 占位。
+        let (need, id) = v.toggle_expand("c1").unwrap();
+        assert!(need);
+        assert_eq!(id, "c1");
+        assert_eq!(v.nav_path, vec!["c1"]);
+        // 拉回 c1 的子目录。
+        v.set_catalog(
+            "c1",
+            SubagentCatalog {
+                entries: vec![child("gc1", false)],
+                parent_available: true,
+            },
+        );
+        let rows = v.flatten();
+        assert_eq!(rows.len(), 3, "p1 根 2 + c1 子 1");
+        assert_eq!(rows[0].node.id, "c1");
+        assert_eq!(rows[1].node.id, "gc1", "c1 子行紧跟父后");
+        assert_eq!(rows[1].depth, 1);
+        assert_eq!(rows[2].node.id, "c2");
+        // 面包屑 root→c1。
+        assert_eq!(v.breadcrumbs(), vec!["p1", "c1"]);
+        // 折叠 c1。
+        let (need, _) = v.toggle_expand("c1").unwrap();
+        assert!(!need);
+        assert!(v.nav_path.is_empty());
+        assert_eq!(v.flatten().len(), 2);
+        // 叶子 c2 不拉取。
+        let (need, _) = v.toggle_expand("c2").unwrap();
+        assert!(!need);
+    }
+
+    #[test]
+    fn immediate_parent_of_nested_levels_ac007_01() {
+        use crate::api::types::SubagentListEntry;
+        fn child(id: &str, hc: bool) -> SubagentListEntry {
+            SubagentListEntry::Child {
+                id: id.into(),
+                activity: "inactive".into(),
+                has_children: hc,
+                mode: Some("continuable".into()),
+                label: None,
+            }
+        }
+        // 树：p1 → c1 → gc1（子代理孙代）。
+        let mut v = SubagentViewState::default();
+        v.open("p1");
+        v.set_catalog(
+            "p1",
+            SubagentCatalog {
+                entries: vec![child("c1", true)],
+                parent_available: true,
+            },
+        );
+        v.toggle_expand("c1");
+        v.set_catalog(
+            "c1",
+            SubagentCatalog {
+                entries: vec![child("gc1", false)],
+                parent_available: true,
+            },
+        );
+        // 根层直属 c1 → 立即父 = panel 根 p1。
+        assert_eq!(v.immediate_parent_of("c1").as_deref(), Some("p1"));
+        // 孙代 gc1 → 立即父 = 直属父 c1（非 panel 根！`subagents/list` 只列
+        // 直属，打开孙代必须以 c1 为 parentSessionId——AC-007-01 嵌套）。
+        assert_eq!(v.immediate_parent_of("gc1").as_deref(), Some("c1"));
+        // 未知 id → None。
+        assert_eq!(v.immediate_parent_of("zz"), None);
+    }
+}

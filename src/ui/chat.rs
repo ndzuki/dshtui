@@ -35,6 +35,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         &app.image_meta,
         &app.image_errors,
         app.kitty_capable,
+        &app.palette,
     );
     apply_highlights(&mut lines, app);
     draw_lines(
@@ -60,6 +61,7 @@ pub fn render_window(
     image_meta: &HashMap<AttachmentId, AttachmentRef>,
     image_errors: &HashMap<AttachmentId, String>,
     kitty_capable: bool,
+    palette: &crate::ui::theme::Palette,
 ) {
     let lines = window_lines_with_width(
         window,
@@ -67,6 +69,7 @@ pub fn render_window(
         image_meta,
         image_errors,
         kitty_capable,
+        palette,
     );
     draw_lines(frame, area, lines, offset, follow_tail);
 }
@@ -91,11 +94,65 @@ fn draw_lines(
     frame.render_widget(paragraph, area);
 }
 
+/// REQ-007 AC-007-29：timeline 缩略条（markers → 单字符图例）。`show_timeline`
+/// 开启时渲染在 Chat 顶部一行；markers 由 AppState 从本地窗口事件投影。
+/// 图例：`u`=user、`a`=assistant、`t`=tool；光标以 `>` 高亮。纯本地渲染，
+/// 无远端读取。
+pub fn render_timeline_strip(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
+    if !app.show_timeline || !app.timeline.show {
+        return;
+    }
+    use crate::model::timeline::TimelineMarkerKind as K;
+    let markers = &app.timeline.markers;
+    if markers.is_empty() {
+        return;
+    }
+    let mut spans: Vec<ratatui::text::Span<'static>> = Vec::new();
+    spans.push(ratatui::text::Span::styled(
+        " ⏱ ",
+        ratatui::style::Style::default().fg(Color::DarkGray),
+    ));
+    for (i, m) in markers.iter().enumerate() {
+        let ch = match m.kind {
+            K::User => "u",
+            K::Assistant => "a",
+            K::Tool => "t",
+        };
+        let style = if i == app.timeline.cursor {
+            ratatui::style::Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            ratatui::style::Style::default().fg(match m.kind {
+                K::User => Color::Cyan,
+                K::Assistant => Color::Green,
+                K::Tool => Color::Yellow,
+            })
+        };
+        spans.push(ratatui::text::Span::styled(ch.to_string(), style));
+    }
+    let line = ratatui::text::Line::from(spans);
+    let strip = Paragraph::new(line).block(
+        TuiBlock::default()
+            .borders(Borders::BOTTOM)
+            .border_style(Style::default().fg(Color::DarkGray)),
+    );
+    frame.render_widget(strip, area);
+}
+
 /// 窗口全部行：durable 块（markdown 块可多行）+ 乐观回显行。默认宽度 80
 /// （无上下文渲染）；`render`/`render_window` 用真实宽度走
 /// `window_lines_with_width`。
 pub fn window_lines(window: &TranscriptWindow) -> Vec<ChatLine> {
-    window_lines_with_width(window, 80, &HashMap::new(), &HashMap::new(), true)
+    window_lines_with_width(
+        window,
+        80,
+        &HashMap::new(),
+        &HashMap::new(),
+        true,
+        &crate::ui::theme::Palette::default(),
+    )
 }
 
 /// 窗口全部行（指定宽度：markdown 换行与渲染缓存 key 都依赖它）。
@@ -106,6 +163,7 @@ pub fn window_lines_with_width(
     image_meta: &HashMap<AttachmentId, AttachmentRef>,
     image_errors: &HashMap<AttachmentId, String>,
     kitty_capable: bool,
+    palette: &crate::ui::theme::Palette,
 ) -> Vec<ChatLine> {
     let len = window.len();
     let mut out = Vec::new();
@@ -117,6 +175,7 @@ pub fn window_lines_with_width(
             image_meta,
             image_errors,
             kitty_capable,
+            palette,
         ) {
             out.push(ChatLine {
                 block_index: Some(i),
@@ -127,9 +186,10 @@ pub fn window_lines_with_width(
     // 乐观回显（REQ-002）：durable 之外追加 pending/error 行；durable
     // 同 requestId 到达后 pending 被对账 retire，绝不重复显示。
     for echo in window.pending() {
+        // echo 前缀色走 palette（UserFg/Warn/Error 角色）。
         out.push(ChatLine {
             block_index: None,
-            line: echo_line(echo),
+            line: echo_line(echo, palette),
         });
     }
     out
@@ -166,20 +226,21 @@ pub fn apply_highlights(lines: &mut [ChatLine], app: &AppState) {
 }
 
 /// 乐观回显行：Pending → `…`（黄色）；Failed → `!`（红色）+ 稳定错误码。
-fn echo_line(echo: &PendingEcho) -> Line<'static> {
+fn echo_line(echo: &PendingEcho, palette: &crate::ui::theme::Palette) -> Line<'static> {
+    use crate::ui::theme::Role;
     let mut spans: Vec<Span<'static>> = Vec::new();
     match &echo.status {
         PendingEchoStatus::Pending => {
             spans.push(Span::styled(
                 "… ",
                 Style::default()
-                    .fg(Color::Yellow)
+                    .fg(palette.color(Role::Warn))
                     .add_modifier(Modifier::BOLD),
             ));
             spans.push(Span::styled(
                 "U echo ",
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(palette.color(Role::UserFg))
                     .add_modifier(Modifier::BOLD),
             ));
             spans.push(Span::raw(single_line(&echo.text)));
@@ -187,17 +248,19 @@ fn echo_line(echo: &PendingEcho) -> Line<'static> {
         PendingEchoStatus::Failed { code, .. } => {
             spans.push(Span::styled(
                 "! ",
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(palette.color(Role::Error))
+                    .add_modifier(Modifier::BOLD),
             ));
             spans.push(Span::styled(
                 "U echo ",
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(palette.color(Role::UserFg))
                     .add_modifier(Modifier::BOLD),
             ));
             spans.push(Span::styled(
                 format!("(发送失败 {code}) "),
-                Style::default().fg(Color::Red),
+                Style::default().fg(palette.color(Role::Error)),
             ));
             spans.push(Span::raw(single_line(&echo.text)));
         }
@@ -217,7 +280,9 @@ fn block_lines(
     image_meta: &HashMap<AttachmentId, AttachmentRef>,
     image_errors: &HashMap<AttachmentId, String>,
     kitty_capable: bool,
+    palette: &crate::ui::theme::Palette,
 ) -> Vec<Line<'static>> {
+    use crate::ui::theme::Role;
     let mut spans: Vec<Span<'static>> = Vec::new();
     match block {
         Block::UserMessage { seq, content, time } => {
@@ -227,20 +292,22 @@ fn block_lines(
                 spans.push(Span::styled(
                     "… ",
                     Style::default()
-                        .fg(Color::Yellow)
+                        .fg(palette.color(Role::Warn))
                         .add_modifier(Modifier::BOLD),
                 ));
             }
             spans.push(Span::styled(
                 format!("U {:>5} ", seq.0),
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(palette.color(Role::UserFg))
                     .add_modifier(Modifier::BOLD),
             ));
             spans.push(Span::raw(single_line(content)));
             vec![Line::from(spans)]
         }
-        Block::AssistantMessage { seq, chunks, time } => {
+        Block::AssistantMessage {
+            seq, chunks, time, ..
+        } => {
             push_time(&mut spans, *time);
             let running = chunks.rows.is_empty();
             if running {
@@ -255,7 +322,7 @@ fn block_lines(
             spans.push(Span::styled(
                 format!("A {:>5} ", seq.0),
                 Style::default()
-                    .fg(Color::Green)
+                    .fg(palette.color(Role::AssistantFg))
                     .add_modifier(Modifier::BOLD),
             ));
             if running {
@@ -299,7 +366,7 @@ fn block_lines(
             spans.push(Span::styled(
                 format!("T {:>5} ", seq.0),
                 Style::default()
-                    .fg(Color::Yellow)
+                    .fg(palette.color(Role::ToolFg))
                     .add_modifier(Modifier::BOLD),
             ));
             spans.push(Span::raw(format!(
@@ -324,9 +391,9 @@ fn block_lines(
                 format!("{} {:>5} ", if *is_error { "!" } else { "R" }, seq.0),
                 Style::default()
                     .fg(if *is_error {
-                        Color::Red
+                        palette.color(Role::Error)
                     } else {
-                        Color::Magenta
+                        palette.color(Role::Code)
                     })
                     .add_modifier(Modifier::BOLD),
             ));
@@ -387,7 +454,7 @@ fn block_lines(
                 spans.push(Span::raw(format!("{display_name} · ")));
                 spans.push(Span::styled(
                     format!("{display_dims} ✗ {err}"),
-                    Style::default().fg(Color::Red),
+                    Style::default().fg(palette.color(Role::Error)),
                 ));
             } else {
                 spans.push(Span::raw(format!("{display_name} · {display_dims}")));
@@ -533,6 +600,7 @@ mod tests {
                     &HashMap::new(),
                     &HashMap::new(),
                     true,
+                    &crate::ui::theme::Palette::default(),
                 )
             })
             .unwrap();
@@ -576,6 +644,7 @@ mod tests {
                     &HashMap::new(),
                     &HashMap::new(),
                     true,
+                    &crate::ui::theme::Palette::default(),
                 )
             })
             .unwrap();
@@ -619,6 +688,7 @@ mod tests {
                     &HashMap::new(),
                     &HashMap::new(),
                     true,
+                    &crate::ui::theme::Palette::default(),
                 )
             })
             .unwrap();
@@ -661,6 +731,7 @@ mod tests {
                     &HashMap::new(),
                     &HashMap::new(),
                     true,
+                    &crate::ui::theme::Palette::default(),
                 )
             })
             .unwrap();
@@ -699,6 +770,7 @@ mod tests {
                     &HashMap::new(),
                     &HashMap::new(),
                     true,
+                    &crate::ui::theme::Palette::default(),
                 )
             })
             .unwrap();
@@ -716,5 +788,106 @@ mod tests {
             0,
             "requestId 不出现在正文: {rendered}"
         );
+    }
+
+    #[test]
+    fn palette_roles_drive_user_prefix_color_ac007_20() {
+        // 默认 dark：UserFg=Cyan；palette 覆盖 accent/user_fg 后渲染必须读到
+        // 覆盖色（证明 theme/palette 真实接入渲染，而非仅解析）。
+        let mut window = TranscriptWindow::new(20);
+        window.apply(Incoming::Snapshot {
+            cursor: None,
+            records: vec![event(1, "user/message", Some("hi"))],
+            has_more: false,
+            projections: None,
+        });
+        let default_palette = crate::ui::theme::Palette::default();
+        let mut overrides = std::collections::BTreeMap::new();
+        overrides.insert("user_fg".to_string(), "#ff0000".to_string());
+        let red_palette = crate::ui::theme::Palette::build("dark", &overrides);
+
+        // 默认 palette 渲染：U 前缀 cell 为 Cyan。
+        let backend = TestBackend::new(30, 4);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render_window(
+                    frame,
+                    frame.area(),
+                    &window,
+                    0,
+                    true,
+                    &HashMap::new(),
+                    &HashMap::new(),
+                    true,
+                    &default_palette,
+                )
+            })
+            .unwrap();
+        let default_fg = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .find(|c| c.symbol() == "U")
+            .map(|c| c.fg)
+            .expect("U 前缀存在");
+        assert_eq!(default_fg, ratatui::style::Color::Cyan);
+
+        // 覆盖 palette 渲染：U 前缀 cell 变红。
+        let backend = TestBackend::new(30, 4);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render_window(
+                    frame,
+                    frame.area(),
+                    &window,
+                    0,
+                    true,
+                    &HashMap::new(),
+                    &HashMap::new(),
+                    true,
+                    &red_palette,
+                )
+            })
+            .unwrap();
+        let red_fg = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .find(|c| c.symbol() == "U")
+            .map(|c| c.fg)
+            .expect("U 前缀存在");
+        assert_eq!(red_fg, ratatui::style::Color::Rgb(255, 0, 0));
+    }
+
+    #[test]
+    fn timeline_strip_renders_markers_when_enabled_ac007_29() {
+        use crate::app::AppState;
+        let mut app = AppState::default();
+        app.show_timeline = true;
+        app.timeline.show = true;
+        use crate::model::timeline::TimelineMarkerKind as K;
+        app.timeline
+            .rebuild(&[K::User, K::Assistant, K::Tool, K::Assistant]);
+        let backend = TestBackend::new(60, 3);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_timeline_strip(frame, frame.area(), &app))
+            .unwrap();
+        let text = rendered_text(&terminal);
+        assert!(text.contains("⏱"), "时间图标, text={text}");
+        assert!(text.contains("ua"), "user+assistant 图例, text={text}");
+        assert!(text.contains("t"), "tool 图例, text={text}");
+        // 关闭时不渲染。
+        app.timeline.show = false;
+        let backend = TestBackend::new(60, 3);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_timeline_strip(frame, frame.area(), &app))
+            .unwrap();
+        assert!(!rendered_text(&terminal).contains("⏱"));
     }
 }

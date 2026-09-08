@@ -223,7 +223,7 @@ mod tests {
         let mut app = AppState::default();
         app.mode = Mode::CommandPalette;
         app.command_palette.visible = true;
-        // 前缀过滤聚焦 settings（V0.4 占位）→ 单行列表可见。
+        // settings 已转真实动作（REQ-007），keymap 仍为 V0.4 占位。
         app.command_palette.query = "settings".into();
         let backend = TestBackend::new(120, 14);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -232,9 +232,17 @@ mod tests {
             .unwrap();
         let text = rendered_text(&terminal);
         assert!(text.contains("Command"), "面板标题, text={text}");
-        assert!(text.contains("settings"), "V0.4 项, text={text}");
-        assert!(text.contains("V0.4"), "text={text}");
-        assert!(text.contains("执行"), "text={text}");
+        assert!(text.contains("settings"), "settings 真实动作, text={text}");
+        assert!(text.contains("白名单编辑"), "真实 desc, text={text}");
+        // keymap 仍 V0.4 占位。
+        app.command_palette.query = "keymap".into();
+        let backend = TestBackend::new(120, 14);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render(frame, frame.area(), &app))
+            .unwrap();
+        let text = rendered_text(&terminal);
+        assert!(text.contains("V0.4"), "keymap 仍是 V0.4 占位, text={text}");
         assert!(
             !text.contains("model catalog"),
             "过滤后不显示其它命令, text={text}"

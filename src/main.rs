@@ -17,7 +17,7 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use dshtui::api::session;
-use dshtui::api::types::{SessionAddress, SessionId, SessionSeq};
+use dshtui::api::types::{SessionAddress, SessionId, SessionRequestId, SessionSeq};
 use dshtui::api::workspace;
 use dshtui::api::{Backoff, ClientError, DshClient, Mux};
 use dshtui::app::{AppEvent, AppState, Cmd, Mode};
@@ -228,7 +228,7 @@ async fn run_startup_guidance(
     let mut app = AppState::new(eff.perf.window_messages);
     app.handle(AppEvent::StartupProbeFailed(error.to_string()));
     let mut terminal = TerminalSession::enter().map_err(|e| e.to_string())?;
-    let mut decoder = KeyDecoder::new();
+    let mut decoder = KeyDecoder::from_effective(&eff);
     let mut entering = false;
     let mut draft = String::new();
 
@@ -330,6 +330,7 @@ async fn run_startup_guidance(
 /// frame — the first sidebar screen renders after the first `session/list`
 /// page instead of after the full pagination (AC-001-03).
 async fn run_connected(eff: Effective, token: String, client: DshClient) -> Result<(), String> {
+    let config_path = dshtui::config::default_config_path();
     let mut terminal = TerminalSession::enter().map_err(|e| e.to_string())?;
     let mut app = AppState::new(eff.perf.window_messages);
     // REQ-004：启动检测一次 Kitty 能力（06 §6）+ 注入图片缓存预算。
@@ -337,7 +338,53 @@ async fn run_connected(eff: Effective, token: String, client: DshClient) -> Resu
     app.set_cache_budget(eff.perf.cache_bytes);
     // REQ-005：详情列宽从 `[ui].details_width_cells` 注入（默认 45）。
     app.details_width_cells = eff.ui.details_width_cells;
-    let mut decoder = KeyDecoder::new();
+    // REQ-007 AC-007-29：timeline 开关（`[ui].show_timeline`，默认关）。
+    app.show_timeline = eff.ui.show_timeline;
+    if app.show_timeline {
+        app.timeline.show = true;
+    }
+    // REQ-007 D-51：图片本地软上限注入（数量/单张字节，config `[ui]`）。
+    app.max_image_count = eff.ui.max_image_count;
+    app.max_image_bytes = eff.ui.max_image_bytes;
+    // REQ-007 D-52：`:edit` 编辑器链第三级（config `[ui].editor`）。
+    app.editor_fallback = eff.ui.editor.clone();
+    // REQ-007：主题/palette 从 `[ui] theme/palette` 注入（AC-007-20）；非法
+    // 覆盖只警告不崩溃。
+    let palette_warnings = app.apply_palette_config(&eff.ui.theme, &eff.ui.palette);
+    for w in &palette_warnings {
+        eprintln!("警告: {w}");
+    }
+    // REQ-007：草稿持久化接线（AC-007-22/ADR-010）——drafts.toml 路径注入 +
+    // 启动恢复/clear。
+    app.drafts_enabled = eff.drafts.enabled;
+    if app.drafts_enabled {
+        app.drafts_path = Some(dshtui::config::default_state_path());
+        if eff.drafts.clear {
+            // 启动清空：内存 + 落盘均清（空表立即写回）。
+            app.clear_all_drafts();
+            flush_drafts(&mut app);
+        } else if app.drafts_path.as_ref().is_some_and(|p| p.exists()) {
+            let path = app.drafts_path.clone().unwrap();
+            match std::fs::read_to_string(&path) {
+                Ok(raw) => match dshtui::model::DraftStore::from_toml(&raw) {
+                    Ok(store) => app.seed_drafts_from_store(store),
+                    Err(e) => eprintln!("警告: drafts.toml 解析失败，回退内存注册表: {e}"),
+                },
+                Err(e) => eprintln!("警告: drafts.toml 读取失败: {e}"),
+            }
+        }
+    }
+    let mut decoder = KeyDecoder::from_effective(&eff);
+    // REQ-007 AC-007-21：把生效覆盖行注入 AppState（帮助面板「我的键位」）。
+    if !eff.keymap.modes.is_empty() {
+        let km = dshtui::input::Keymap::build(&eff.keymap);
+        app.keymap_override_lines = km.override_lines();
+        // AC-007-21：非法/冲突键位给可读警告（不崩溃、不静默）——与 palette
+        // 警告同通道打 stderr。
+        for w in &km.warnings {
+            eprintln!("警告: keymap {w}");
+        }
+    }
     let mut client = Some(client);
     let mut mux: Option<Mux> = None;
     // Stream generations: stale stream tasks from a replaced mux must not
@@ -381,6 +428,36 @@ async fn run_connected(eff: Effective, token: String, client: DshClient) -> Resu
 
         // One command per iteration: list pagination renders between pages.
         if let Some(command) = commands.pop_front() {
+            // REQ-007 `:edit`（AC-007-25）：需要 TerminalSession 释放/恢复
+            // raw mode，主循环内联处理（execute_one 无 terminal 访问）。
+            if let Cmd::ExternalEdit { tmp_path, editor } = &command {
+                let mut outcome = Err(String::from("编辑器未运行"));
+                match terminal.suspend_for_editor() {
+                    Ok(()) => {
+                        outcome = run_editor_blocking(tmp_path, editor);
+                        if let Err(e) = terminal.resume_from_editor() {
+                            app.last_error = Some(format!("终端恢复失败: {e}"));
+                        }
+                    }
+                    Err(e) => {
+                        app.last_error = Some(format!("终端挂起失败: {e}"));
+                    }
+                }
+                let (ok, text, message) = match outcome {
+                    Ok(()) => {
+                        let text = std::fs::read_to_string(tmp_path).unwrap_or_default();
+                        (true, text, String::new())
+                    }
+                    Err(msg) => (false, String::new(), msg),
+                };
+                commands.extend(app.handle(AppEvent::ExternalEditDone {
+                    ok,
+                    tmp_path: tmp_path.clone(),
+                    text,
+                    message,
+                }));
+                continue;
+            }
             execute_one(
                 command,
                 &client,
@@ -390,6 +467,7 @@ async fn run_connected(eff: Effective, token: String, client: DshClient) -> Resu
                 &mut app,
                 &mut commands,
                 eff.perf.page_size,
+                &config_path,
             )
             .await;
         }
@@ -424,6 +502,19 @@ async fn run_connected(eff: Effective, token: String, client: DshClient) -> Resu
                 Mode::ModelCatalog => InputMode::ModelCatalog,
                 // REQ-006：命令面板 overlay（`:` 打开）。
                 Mode::CommandPalette => InputMode::CommandPalette,
+                // REQ-007：@ 提及（AC-007-23）。
+                Mode::Mention => InputMode::Mention,
+                // REQ-007：subagent 目录（FR-007-01）。
+                Mode::Subagent => InputMode::Subagent,
+                // REQ-007：goal 面板。
+                Mode::Goal => InputMode::Goal,
+                // REQ-007：jobs 只读面板。
+                Mode::Jobs => InputMode::Jobs,
+                // REQ-007：settings / skills / export / message action。
+                Mode::Settings => InputMode::Settings,
+                Mode::Skills => InputMode::Skills,
+                Mode::Export => InputMode::Export,
+                Mode::MessageAction => InputMode::MessageAction,
             };
             if let Some(command) = decoder.decode(mode, input) {
                 commands.extend(app.handle_command(command));
@@ -432,10 +523,50 @@ async fn run_connected(eff: Effective, token: String, client: DshClient) -> Resu
         while let Ok(event) = event_rx.try_recv() {
             commands.extend(app.handle(event));
         }
+        // REQ-007：草稿变更后主循环串行 flush（AC-007-22/ADR-010）。
+        if app.take_draft_dirty() {
+            flush_drafts(&mut app);
+        }
     }
     // REQ-004 退出清理：未入缓存的临时文件（缓存目录由 ImageCache Drop 清理）。
     app.cleanup_transient_files();
     Ok(())
+}
+
+/// REQ-007 AC-007-22：把内存草稿注册表 flush 到 drafts.toml（ADR-010 原子
+/// 写 0600）。best-effort：失败仅告警回退内存，不崩溃。
+fn flush_drafts(app: &mut AppState) {
+    let Some(path) = app.drafts_path.clone() else {
+        return;
+    };
+    let store = app.draft_store_snapshot();
+    match store.to_toml() {
+        Ok(toml_str) => {
+            if let Err(e) = dshtui::config::atomic_write_0600(&path, &toml_str) {
+                eprintln!("警告: drafts.toml 写入失败（草稿仍保留在内存）: {e}");
+            }
+        }
+        Err(e) => eprintln!("警告: drafts.toml 序列化失败: {e}"),
+    }
+}
+
+/// REQ-007 AC-007-25（prototype ✅）：前台运行 `$EDITOR <tmp>`（继承 stdio，
+/// raw mode 已由 TerminalSession::suspend_for_editor 释放）。错误串可断言。
+fn run_editor_blocking(tmp: &std::path::Path, editor: &str) -> Result<(), String> {
+    let status = std::process::Command::new(editor)
+        .arg(tmp)
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .status()
+        .map_err(|e| format!("无法启动编辑器 {editor}: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "编辑器 {editor} 异常退出（{status}），草稿已保留可重试"
+        ))
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -448,6 +579,7 @@ async fn execute_one(
     app: &mut AppState,
     commands: &mut VecDeque<Cmd>,
     page_size: usize,
+    config_path: &std::path::Path,
 ) {
     match command {
         Cmd::LoadSessionList { cursor } => {
@@ -485,6 +617,40 @@ async fn execute_one(
                     commands.extend(app.handle(AppEvent::Disconnected(error.to_string())));
                 }
             }
+        }
+        Cmd::OpenFollowSubagent {
+            parent_id,
+            child_id,
+            max_messages,
+        } => {
+            let Some(client) = client.as_ref() else {
+                return;
+            };
+            // subagent address（kind=subagent, parent+child+mode）follow child
+            // 日志（AC-007-01）。
+            let address = SessionAddress::subagent(&parent_id, &child_id, "continuable");
+            let opened = match open_mux_stream(client, mux, mux_generation, event_tx).await {
+                Ok(mux_ref) => session::open_follow(mux_ref, &address, max_messages).await,
+                Err(error) => Err(error),
+            };
+            let session_id = SessionId(child_id.clone());
+            match opened {
+                Ok(stream) => {
+                    let generation = mux_generation.load(Ordering::Relaxed);
+                    spawn_follow_reader(
+                        stream,
+                        session_id,
+                        event_tx.clone(),
+                        mux_generation.clone(),
+                        generation,
+                    );
+                }
+                Err(error) => {
+                    commands.extend(app.handle(AppEvent::FollowError { session_id, error }));
+                }
+            }
+            // 消费一次待开标记。
+            app.pending_subagent_open = None;
         }
         Cmd::OpenFollow {
             session_id,
@@ -573,6 +739,45 @@ async fn execute_one(
                 },
             };
             commands.extend(app.handle(event));
+        }
+        // REQ-007 AC-007-01/10：父→子发送（subagents/prompt）。
+        Cmd::SendSubagentPrompt {
+            parent_id,
+            child_id,
+            request_id,
+            content,
+        } => {
+            let Some(client) = client.as_ref() else {
+                let event = AppEvent::PromptFailed {
+                    session_id: SessionId(child_id.clone()),
+                    request_id: SessionRequestId(request_id.clone()),
+                    error: ClientError::Transport("未连接（dsh web 不可达）".into()),
+                };
+                commands.extend(app.handle(event));
+                return;
+            };
+            let req = dshtui::api::types::SubagentPromptRequest {
+                request_id: request_id.clone(),
+                parent_session_id: parent_id,
+                child_session_id: child_id.clone(),
+                mode: "continuable".into(),
+                content,
+            };
+            match dshtui::api::subagents::prompt(&client.http, &client.base, &req).await {
+                Ok(receipt) => {
+                    tracing::debug!(child = %child_id, message_id = ?receipt.message_id, "subagents/prompt accepted");
+                    // 复用 PromptAccepted（child 窗口回显对账）。
+                    commands.extend(app.handle(AppEvent::PromptAccepted {
+                        session_id: SessionId(child_id.clone()),
+                        request_id: SessionRequestId(request_id.clone()),
+                    }));
+                }
+                Err(error) => commands.extend(app.handle(AppEvent::PromptFailed {
+                    session_id: SessionId(child_id.clone()),
+                    request_id: SessionRequestId(request_id.clone()),
+                    error,
+                })),
+            }
         }
         Cmd::SendPrompt {
             session_id,
@@ -902,6 +1107,497 @@ async fn execute_one(
             };
             commands.extend(app.handle(event));
         }
+        // ---------- REQ-007 `:edit`（AC-007-25） ----------
+        // 内联处理（raw mode 挂起）：此 arm 不应到达（run_connected 循环已
+        // 拦截 Cmd::ExternalEdit）。
+        Cmd::ExternalEdit { .. } => {
+            app.last_error = Some("外部编辑器需主循环内联处理".into());
+        }
+        // ---------- REQ-007：@ 提及两源拉取（AC-007-23） ----------
+        // ---------- REQ-007：subagent 目录（FR-007-01，AC-007-07~10） ----------
+        Cmd::FetchSubagentList {
+            parent_id,
+            generation,
+        } => {
+            let Some(client) = client.as_ref() else {
+                let event = AppEvent::SubagentListFailed {
+                    parent_id,
+                    generation,
+                    error: ClientError::Transport("未连接（dsh web 不可达）".into()),
+                };
+                commands.extend(app.handle(event));
+                return;
+            };
+            match dshtui::api::subagents::list(&client.http, &client.base, &parent_id).await {
+                Ok(catalog) => commands.extend(app.handle(AppEvent::SubagentListed {
+                    parent_id,
+                    generation,
+                    catalog,
+                })),
+                Err(error) => commands.extend(app.handle(AppEvent::SubagentListFailed {
+                    parent_id,
+                    generation,
+                    error,
+                })),
+            }
+        }
+        // ---------- REQ-007：消息动作（AC-007-27/28） ----------
+        Cmd::ForkAtSeq { session_id, at_seq } => {
+            let Some(client) = client.as_ref() else {
+                let event = AppEvent::MessageActionFailed {
+                    op: dshtui::model::MessageActionKind::Branch,
+                    error: ClientError::Transport("未连接（dsh web 不可达）".into()),
+                };
+                commands.extend(app.handle(event));
+                return;
+            };
+            let sid = dshtui::api::types::SessionId(session_id.clone());
+            match dshtui::api::session::fork(&client.http, &client.base, &sid, Some(at_seq)).await {
+                Ok(v) => commands.extend(app.handle(AppEvent::MessageBranchDone {
+                    session_id: v.session_id,
+                })),
+                Err(error) => commands.extend(app.handle(AppEvent::MessageActionFailed {
+                    op: dshtui::model::MessageActionKind::Branch,
+                    error,
+                })),
+            }
+        }
+        Cmd::FeedbackPut {
+            session_id,
+            message_id,
+            rating,
+            note,
+        } => {
+            let Some(client) = client.as_ref() else {
+                let event = AppEvent::FeedbackPutFailed {
+                    error: ClientError::Transport("未连接（dsh web 不可达）".into()),
+                };
+                commands.extend(app.handle(event));
+                return;
+            };
+            let req = dshtui::api::types::MessageFeedbackPutRequest {
+                session_id,
+                message_id,
+                rating,
+                note,
+                if_version: None,
+            };
+            match dshtui::api::feedback::put(&client.http, &client.base, &req).await {
+                Ok(_) => commands.extend(app.handle(AppEvent::FeedbackPutDone)),
+                Err(error) => commands.extend(app.handle(AppEvent::FeedbackPutFailed { error })),
+            }
+        }
+        // ---------- REQ-007：会话导出（AC-007-17） ----------
+        // Background 下载（不阻塞帧循环）：每 chunk 上报进度 + 检查取消令牌
+        // （Esc 置位 → 任务中止并清理临时文件 → ExportCancelled 回执）。
+        Cmd::ExportSession { session_id, path } => {
+            let Some(client) = client.as_ref() else {
+                let event = AppEvent::ExportFailed {
+                    error: ClientError::Transport("未连接（dsh web 不可达）".into()),
+                };
+                commands.extend(app.handle(event));
+                return;
+            };
+            app.export_cancel.store(false, Ordering::Relaxed);
+            let http = client.http.clone();
+            let base = client.base.clone();
+            let cancel = app.export_cancel.clone();
+            let tx = event_tx.clone();
+            tokio::spawn(async move {
+                let mut progress = |bytes: u64| {
+                    let _ = tx.try_send(AppEvent::ExportProgress { bytes });
+                };
+                let is_cancelled = || cancel.load(Ordering::Relaxed);
+                let result = dshtui::api::export::download_export_progress(
+                    &http,
+                    &base,
+                    &session_id,
+                    &path,
+                    &mut progress,
+                    is_cancelled,
+                )
+                .await;
+                let cancelled = cancel.load(Ordering::Relaxed);
+                let event = match result {
+                    Ok(receipt) => AppEvent::ExportDone {
+                        bytes: receipt.bytes,
+                        path: receipt.final_path,
+                    },
+                    Err(_) if cancelled => AppEvent::ExportCancelled,
+                    Err(error) => AppEvent::ExportFailed { error },
+                };
+                let _ = tx.send(event).await;
+            });
+        }
+        // ---------- REQ-007 D-46：export page 重建兜底 ----------
+        // 官方导出路由不可用（404/5xx/transport，app 已分类）→ 以
+        // `session/page` 全量 records 重建 JSONL：每页检查取消令牌、上报
+        // 已收集 records；页错误/取消清 tmp 不留半成品。
+        Cmd::ExportRebuild {
+            session_id,
+            path,
+            address,
+            through_seq,
+        } => {
+            let Some(client) = client.as_ref() else {
+                let event = AppEvent::ExportRebuildFailed {
+                    error: ClientError::Transport("未连接（dsh web 不可达）".into()),
+                };
+                commands.extend(app.handle(event));
+                return;
+            };
+            app.export_cancel.store(false, Ordering::Relaxed);
+            let http = client.http.clone();
+            let base = client.base.clone();
+            let cancel = app.export_cancel.clone();
+            let tx = event_tx.clone();
+            tokio::spawn(async move {
+                let mut progress = |records: u64| {
+                    let _ = tx.try_send(AppEvent::ExportRebuildProgress { records });
+                };
+                let is_cancelled = || cancel.load(Ordering::Relaxed);
+                // through_seq = 会话最新 seq（app 由 follow 游标/窗口尾推导）；
+                // None = 空/未加载会话 → 直接写 header-only 文件（可恢复）。
+                let result = match through_seq {
+                    Some(seq) => {
+                        dshtui::api::export::rebuild_export_jsonl(
+                            &http,
+                            &base,
+                            &session_id,
+                            &address,
+                            seq,
+                            &path,
+                            &mut progress,
+                            is_cancelled,
+                        )
+                        .await
+                    }
+                    None => write_header_only_jsonl(&session_id, &path).await,
+                };
+                let cancelled = cancel.load(Ordering::Relaxed);
+                let event = match result {
+                    Ok(receipt) => AppEvent::ExportRebuildDone {
+                        path: receipt.final_path,
+                    },
+                    Err(_) if cancelled => AppEvent::ExportCancelled,
+                    Err(error) => AppEvent::ExportRebuildFailed { error },
+                };
+                let _ = tx.send(event).await;
+            });
+        }
+        // ---------- REQ-007：settings / skills（AC-007-15~19） ----------
+        Cmd::FetchSettingsDescribe => {
+            let Some(client) = client.as_ref() else {
+                let event = AppEvent::SettingsDescribeFailed {
+                    error: ClientError::Transport("未连接（dsh web 不可达）".into()),
+                };
+                commands.extend(app.handle(event));
+                return;
+            };
+            match dshtui::api::settings::describe(&client.http, &client.base).await {
+                Ok(value) => commands.extend(app.handle(AppEvent::SettingsDescribed { value })),
+                Err(error) => {
+                    commands.extend(app.handle(AppEvent::SettingsDescribeFailed { error }))
+                }
+            }
+        }
+        Cmd::FetchSkillsList => {
+            let Some(client) = client.as_ref() else {
+                let event = AppEvent::SkillsListFailed {
+                    error: ClientError::Transport("未连接（dsh web 不可达）".into()),
+                };
+                commands.extend(app.handle(event));
+                return;
+            };
+            let Some(sid) = app.active_session.clone() else {
+                let event = AppEvent::SkillsListFailed {
+                    error: ClientError::Transport("无活动会话".into()),
+                };
+                commands.extend(app.handle(event));
+                return;
+            };
+            match dshtui::api::skills::list(&client.http, &client.base, &sid.0).await {
+                Ok(value) => commands.extend(app.handle(AppEvent::SkillsListed { value })),
+                Err(error) => commands.extend(app.handle(AppEvent::SkillsListFailed { error })),
+            }
+        }
+        Cmd::SettingsUpdate {
+            ns,
+            key,
+            value,
+            revision,
+        } => {
+            let Some(client) = client.as_ref() else {
+                let event = AppEvent::SettingsUpdateFailed {
+                    ns,
+                    error: ClientError::Transport("未连接（dsh web 不可达）".into()),
+                };
+                commands.extend(app.handle(event));
+                return;
+            };
+            let patch = serde_json::json!({ key: value });
+            match dshtui::api::settings::update(
+                &client.http,
+                &client.base,
+                &ns,
+                patch,
+                Some(revision),
+            )
+            .await
+            {
+                Ok(view) => commands.extend(app.handle(AppEvent::SettingsUpdated { ns, view })),
+                Err(error) => {
+                    commands.extend(app.handle(AppEvent::SettingsUpdateFailed { ns, error }))
+                }
+            }
+        }
+        // ---------- REQ-007：goal 写操作（FR-007-02，AC-007-11/12/14） ----------
+        Cmd::GoalOp { request_id, op } => {
+            use dshtui::app::GoalMutation;
+            let Some(client) = client.as_ref() else {
+                let event = AppEvent::GoalOpFailed {
+                    request_id,
+                    op,
+                    error: ClientError::Transport("未连接（dsh web 不可达）".into()),
+                };
+                commands.extend(app.handle(event));
+                return;
+            };
+            let Some(agent_id) = app.active_session.clone() else {
+                let event = AppEvent::GoalOpFailed {
+                    request_id,
+                    op,
+                    error: ClientError::Transport("无活动会话".into()),
+                };
+                commands.extend(app.handle(event));
+                return;
+            };
+            let result: Result<Option<dshtui::api::types::GoalSnapshot>, (String, ClientError)> =
+                match op.clone() {
+                    GoalMutation::Create {
+                        objective,
+                        max_goal_rounds,
+                    } => {
+                        let req = dshtui::api::types::CreateGoalRequest {
+                            objective,
+                            max_goal_rounds,
+                        };
+                        dshtui::api::goals::create(&client.http, &client.base, &agent_id.0, &req)
+                            .await
+                            .map(|r| {
+                                Some(dshtui::api::types::GoalSnapshot {
+                                    id: r.id,
+                                    revision: r.revision,
+                                    ..Default::default()
+                                })
+                            })
+                            .map_err(|e| ("create".into(), e))
+                    }
+                    GoalMutation::Edit { objective } => {
+                        // goals/edit(agentId, ref, request)（typert 实读 0.1.2-rc.1：
+                        // 三平铺参数 agentId/ref/request{objective?,maxGoalRounds?}，CAS revision）。
+                        let ref_ = dshtui::api::types::GoalRef {
+                            id: app
+                                .goals
+                                .goal
+                                .as_ref()
+                                .map(|g| g.id.clone())
+                                .unwrap_or_default(),
+                            revision: app.goals.sent_revision.unwrap_or(0),
+                        };
+                        let max_goal_rounds =
+                            app.goals.goal.as_ref().and_then(|g| g.max_goal_rounds);
+                        let req = dshtui::api::types::CreateGoalRequest {
+                            objective,
+                            max_goal_rounds,
+                        };
+                        dshtui::api::goals::edit(
+                            &client.http,
+                            &client.base,
+                            &agent_id.0,
+                            &ref_,
+                            &req,
+                        )
+                        .await
+                        .map(Some)
+                        .map_err(|e| ("edit".into(), e))
+                    }
+                    GoalMutation::Pause => {
+                        let ref_ = dshtui::api::types::GoalRef {
+                            id: app
+                                .goals
+                                .goal
+                                .as_ref()
+                                .map(|g| g.id.clone())
+                                .unwrap_or_default(),
+                            revision: app.goals.sent_revision.unwrap_or(0),
+                        };
+                        dshtui::api::goals::pause(&client.http, &client.base, &agent_id.0, &ref_)
+                            .await
+                            .map(Some)
+                            .map_err(|e| ("pause".into(), e))
+                    }
+                    GoalMutation::Resume => {
+                        let ref_ = dshtui::api::types::GoalRef {
+                            id: app
+                                .goals
+                                .goal
+                                .as_ref()
+                                .map(|g| g.id.clone())
+                                .unwrap_or_default(),
+                            revision: app.goals.sent_revision.unwrap_or(0),
+                        };
+                        dshtui::api::goals::resume(&client.http, &client.base, &agent_id.0, &ref_)
+                            .await
+                            .map(Some)
+                            .map_err(|e| ("resume".into(), e))
+                    }
+                    GoalMutation::Complete => {
+                        let ref_ = dshtui::api::types::GoalRef {
+                            id: app
+                                .goals
+                                .goal
+                                .as_ref()
+                                .map(|g| g.id.clone())
+                                .unwrap_or_default(),
+                            revision: app.goals.sent_revision.unwrap_or(0),
+                        };
+                        dshtui::api::goals::complete(&client.http, &client.base, &agent_id.0, &ref_)
+                            .await
+                            .map(Some)
+                            .map_err(|e| ("complete".into(), e))
+                    }
+                    GoalMutation::Clear => {
+                        let ref_ = dshtui::api::types::GoalRef {
+                            id: app
+                                .goals
+                                .goal
+                                .as_ref()
+                                .map(|g| g.id.clone())
+                                .unwrap_or_default(),
+                            revision: app.goals.sent_revision.unwrap_or(0),
+                        };
+                        dshtui::api::goals::clear(&client.http, &client.base, &agent_id.0, &ref_)
+                            .await
+                            .map(|_| None)
+                            .map_err(|e| ("clear".into(), e))
+                    }
+                };
+            let cleared = matches!(result, Ok(None));
+            match result {
+                Ok(updated) => commands.extend(app.handle(AppEvent::GoalOpDone {
+                    request_id,
+                    updated,
+                    cleared,
+                })),
+                Err((_op_name, error)) => commands.extend(app.handle(AppEvent::GoalOpFailed {
+                    request_id,
+                    op,
+                    error,
+                })),
+            }
+        }
+        Cmd::SubagentInterrupt {
+            child_id,
+            parent_id,
+        } => {
+            let Some(client) = client.as_ref() else {
+                let event = AppEvent::SubagentInterruptDone {
+                    child_id,
+                    error: Some(ClientError::Transport("未连接（dsh web 不可达）".into())),
+                };
+                commands.extend(app.handle(event));
+                return;
+            };
+            match dshtui::api::subagents::interrupt_by_parent(
+                &client.http,
+                &client.base,
+                &child_id,
+                &parent_id,
+            )
+            .await
+            {
+                Ok(_) => commands.extend(app.handle(AppEvent::SubagentInterruptDone {
+                    child_id,
+                    error: None,
+                })),
+                Err(error) => commands.extend(app.handle(AppEvent::SubagentInterruptDone {
+                    child_id,
+                    error: Some(error),
+                })),
+            }
+        }
+        Cmd::FetchMentionCandidates {
+            generation,
+            agent_id,
+            query,
+        } => {
+            let Some(client) = client.as_ref() else {
+                let event = AppEvent::MentionCandidatesFailed {
+                    generation,
+                    error: ClientError::Transport("未连接（dsh web 不可达）".into()),
+                };
+                commands.extend(app.handle(event));
+                return;
+            };
+            let files = dshtui::api::references::file_references(
+                &client.http,
+                &client.base,
+                &agent_id,
+                &query,
+            )
+            .await;
+            let sessions = dshtui::api::references::session_candidates(
+                &client.http,
+                &client.base,
+                &agent_id,
+                &query,
+            )
+            .await;
+            // 任一源失败不阻塞另一源；两源皆失败才报错。
+            match (files, sessions) {
+                (Ok(files), Ok(sessions)) => {
+                    commands.extend(app.handle(AppEvent::MentionCandidates {
+                        generation,
+                        files,
+                        sessions,
+                    }));
+                }
+                (Err(fe), Err(se)) => {
+                    tracing::warn!(fe = %fe, se = %se, "@ 两源候选拉取均失败");
+                    let code = if fe.code() == "transport" { se } else { fe };
+                    commands.extend(app.handle(AppEvent::MentionCandidatesFailed {
+                        generation,
+                        error: code,
+                    }));
+                }
+                (Ok(files), Err(_)) => {
+                    commands.extend(app.handle(AppEvent::MentionCandidates {
+                        generation,
+                        files,
+                        sessions: Vec::new(),
+                    }));
+                }
+                (Err(_), Ok(sessions)) => {
+                    commands.extend(app.handle(AppEvent::MentionCandidates {
+                        generation,
+                        files: Vec::new(),
+                        sessions,
+                    }));
+                }
+            }
+        }
+        Cmd::SaveUiTheme { theme, palette } => {
+            let result = dshtui::config::save_theme_config(config_path, &theme, &palette);
+            match result {
+                Ok(()) => {
+                    app.notice = Some(format!("主题已保存（重启后仍生效）: {theme}"));
+                }
+                Err(error) => {
+                    app.last_error = Some(format!("主题保存失败: {error}"));
+                }
+            }
+        }
         Cmd::OpenExternal { target } => {
             // 仅用户显式触发才调用系统 open（REQ-003 §3 安全边界）。
             match open::that(&target) {
@@ -1054,6 +1750,7 @@ async fn execute_one(
                                         font_size,
                                         area,
                                         frame_id,
+                                        1.0,
                                     ) {
                                         Ok(f) => event_tx.blocking_send(AppEvent::AttachmentReady {
                                             session_id,
@@ -1126,86 +1823,37 @@ async fn execute_one(
             media_type,
         } => {
             // REQ-004 缓存命中：从临时文件重解码 + kitty 编码（不重复拉取）。
-            let meta = app.image_meta.get(&attachment_id).cloned();
-            let font_size = dshtui::ui::image::terminal_font_size();
-            let area = encode_area(app);
-            let frame_id = app.next_kitty_frame_id();
-            let cache = std::sync::Arc::clone(&app.image_cache);
-            let event_tx = event_tx.clone();
-            tokio::task::spawn_blocking::<_, ()>(move || {
-                let event = match std::fs::read(&temp_file) {
-                    Ok(bytes) => match dshtui::ui::image::decode_image(&bytes, &media_type) {
-                        Ok(decoded) => {
-                            let meta = meta.unwrap_or_else(|| dshtui::model::AttachmentRef {
-                                attachment_id: attachment_id.clone(),
-                                media_type: media_type.clone(),
-                                bytes: bytes.len() as u64,
-                                width: decoded.width as u64,
-                                height: decoded.height as u64,
-                                name: None,
-                                original_dimensions: None,
-                            });
-                            let entry = match cache.get(&attachment_id) {
-                                Some(e) => e,
-                                None => dshtui::model::ImageCacheEntry {
-                                    attachment_id: attachment_id.clone(),
-                                    media_type: media_type.clone(),
-                                    bytes: bytes.len() as u64,
-                                    width: decoded.width as u64,
-                                    height: decoded.height as u64,
-                                    temp_file: temp_file.clone(),
-                                    last_used: 0,
-                                },
-                            };
-                            match dshtui::ui::image::kitty_frame(
-                                image::DynamicImage::ImageRgba8(decoded.rgba),
-                                font_size,
-                                area,
-                                frame_id,
-                            ) {
-                                Ok(f) => AppEvent::AttachmentReady {
-                                    session_id,
-                                    attachment_id,
-                                    block_seq,
-                                    meta,
-                                    frame: Some(dshtui::app::KittyFrame(f)),
-                                    entry,
-                                    cached: true,
-                                    for_viewer: false,
-                                },
-                                Err(e) => AppEvent::AttachmentFailed {
-                                    session_id,
-                                    attachment_id,
-                                    block_seq,
-                                    code: e.code,
-                                    message: e.message,
-                                    retryable: false,
-                                    for_viewer: false,
-                                },
-                            }
-                        }
-                        Err(e) => AppEvent::AttachmentFailed {
-                            session_id,
-                            attachment_id,
-                            block_seq,
-                            code: e.code,
-                            message: e.message,
-                            retryable: false,
-                            for_viewer: false,
-                        },
-                    },
-                    Err(e) => AppEvent::AttachmentFailed {
-                        session_id,
-                        attachment_id,
-                        block_seq,
-                        code: "io".into(),
-                        message: format!("缓存文件读取失败: {e}"),
-                        retryable: false,
-                        for_viewer: false,
-                    },
-                };
-                let _ = event_tx.blocking_send(event);
-            });
+            spawn_cached_frame_render(
+                app,
+                event_tx,
+                session_id,
+                attachment_id,
+                block_seq,
+                temp_file,
+                media_type,
+                1.0, // zoom=1 = 整图 fit（与既有行为一致）
+            );
+        }
+        Cmd::RenderImageViewZoom {
+            session_id,
+            attachment_id,
+            block_seq,
+            temp_file,
+            media_type,
+            zoom,
+        } => {
+            // REQ-007 D-45：zoom 重编码——同一缓存 temp_file，按 zoom 中心
+            // 裁剪放大（AttachmentReady 回流存 image_frame，与打开路径共用）。
+            spawn_cached_frame_render(
+                app,
+                event_tx,
+                session_id,
+                attachment_id,
+                block_seq,
+                temp_file,
+                media_type,
+                zoom,
+            );
         }
         Cmd::OpenSystemViewer { path } => {
             // AC-004-05/07：`open`/`xdg-open` 子进程不阻塞（spawn 不 wait）。
@@ -1251,6 +1899,151 @@ fn encode_area(app: &AppState) -> ratatui::layout::Rect {
         app.details_width_cells,
     )
     .center
+}
+
+/// D-46：空/未加载会话的 page 重建——只写 header 行（records=0，可恢复；
+/// 会话有内容时 app 侧会带 through_seq 走真实分页）。
+async fn write_header_only_jsonl(
+    session_id: &str,
+    path: &std::path::Path,
+) -> Result<dshtui::api::export::ExportReceipt, ClientError> {
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
+    let tmp_name = format!(
+        "{}.rebuild-{}",
+        path.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "export".into()),
+        std::process::id()
+    );
+    let tmp_path = match parent {
+        Some(p) => {
+            if let Err(e) = tokio::fs::create_dir_all(p).await {
+                return Err(ClientError::Transport(format!(
+                    "创建导出目录失败（{}）: {e}",
+                    p.display()
+                )));
+            }
+            p.join(&tmp_name)
+        }
+        None => std::path::PathBuf::from(&tmp_name),
+    };
+    let header = dshtui::model::export::rebuild_header_line(session_id);
+    let bytes = header.len() as u64;
+    match tokio::fs::write(&tmp_path, header.as_bytes()).await {
+        Ok(()) => {}
+        Err(e) => {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            return Err(ClientError::Transport(format!(
+                "导出重建写入失败（{}）: {e}",
+                tmp_path.display()
+            )));
+        }
+    }
+    tokio::fs::rename(&tmp_path, path)
+        .await
+        .map_err(|e| ClientError::Transport(format!("导出落盘 rename 失败: {e}")))?;
+    Ok(dshtui::api::export::ExportReceipt {
+        bytes,
+        final_path: path.to_path_buf(),
+    })
+}
+
+/// 从缓存/视图临时文件重解码 + kitty 编码（不重复远程拉取）。`zoom` =
+/// 1.0 整图 fit（RenderCachedImage 打开路径），≠1.0 按 zoom 中心裁剪放大
+/// （REQ-007 D-45 RenderImageViewZoom 路径）。结果经 `AttachmentReady`
+/// 回流（与打开路径共用事件）。
+#[allow(clippy::too_many_arguments)]
+fn spawn_cached_frame_render(
+    app: &mut AppState,
+    event_tx: &mpsc::Sender<AppEvent>,
+    session_id: dshtui::api::types::SessionId,
+    attachment_id: dshtui::api::types::AttachmentId,
+    block_seq: dshtui::api::types::SessionSeq,
+    temp_file: std::path::PathBuf,
+    media_type: dshtui::api::types::MediaType,
+    zoom: f32,
+) {
+    let meta = app.image_meta.get(&attachment_id).cloned();
+    let font_size = dshtui::ui::image::terminal_font_size();
+    let area = encode_area(app);
+    let frame_id = app.next_kitty_frame_id();
+    let cache = std::sync::Arc::clone(&app.image_cache);
+    let event_tx = event_tx.clone();
+    tokio::task::spawn_blocking::<_, ()>(move || {
+        let event = match std::fs::read(&temp_file) {
+            Ok(bytes) => match dshtui::ui::image::decode_image(&bytes, &media_type) {
+                Ok(decoded) => {
+                    let meta = meta.unwrap_or_else(|| dshtui::model::AttachmentRef {
+                        attachment_id: attachment_id.clone(),
+                        media_type: media_type.clone(),
+                        bytes: bytes.len() as u64,
+                        width: decoded.width as u64,
+                        height: decoded.height as u64,
+                        name: None,
+                        original_dimensions: None,
+                    });
+                    let entry = match cache.get(&attachment_id) {
+                        Some(e) => e,
+                        None => dshtui::model::ImageCacheEntry {
+                            attachment_id: attachment_id.clone(),
+                            media_type: media_type.clone(),
+                            bytes: bytes.len() as u64,
+                            width: decoded.width as u64,
+                            height: decoded.height as u64,
+                            temp_file: temp_file.clone(),
+                            last_used: 0,
+                        },
+                    };
+                    match dshtui::ui::image::kitty_frame(
+                        image::DynamicImage::ImageRgba8(decoded.rgba),
+                        font_size,
+                        area,
+                        frame_id,
+                        zoom,
+                    ) {
+                        Ok(f) => AppEvent::AttachmentReady {
+                            session_id,
+                            attachment_id,
+                            block_seq,
+                            meta,
+                            frame: Some(dshtui::app::KittyFrame(f)),
+                            entry,
+                            cached: true,
+                            for_viewer: false,
+                        },
+                        Err(e) => AppEvent::AttachmentFailed {
+                            session_id,
+                            attachment_id,
+                            block_seq,
+                            code: e.code,
+                            message: e.message,
+                            retryable: false,
+                            for_viewer: false,
+                        },
+                    }
+                }
+                Err(e) => AppEvent::AttachmentFailed {
+                    session_id,
+                    attachment_id,
+                    block_seq,
+                    code: e.code,
+                    message: e.message,
+                    retryable: false,
+                    for_viewer: false,
+                },
+            },
+            Err(e) => AppEvent::AttachmentFailed {
+                session_id,
+                attachment_id,
+                block_seq,
+                code: "io".into(),
+                message: format!("缓存文件读取失败: {e}"),
+                retryable: false,
+                for_viewer: false,
+            },
+        };
+        let _ = event_tx.blocking_send(event);
+    });
 }
 
 /// Open a stream on the shared mux, creating the mux connection first if needed.
@@ -1502,6 +2295,23 @@ impl TerminalSession {
         Ok(Self {
             terminal: Terminal::new(backend)?,
         })
+    }
+
+    /// `:edit`（AC-007-25，prototype ✅）：释放 raw mode + 退出 alt-screen，
+    /// 让前台 `$EDITOR` 可交互；与 `enter()` 完全互逆，无需新终端框架。
+    fn suspend_for_editor(&mut self) -> io::Result<()> {
+        disable_raw_mode()?;
+        execute!(self.terminal.backend_mut(), LeaveAlternateScreen)?;
+        self.terminal.show_cursor()?;
+        Ok(())
+    }
+
+    /// 编辑器退出后恢复 raw mode + 重进 alt-screen（与挂起前一致）。
+    fn resume_from_editor(&mut self) -> io::Result<()> {
+        enable_raw_mode()?;
+        execute!(self.terminal.backend_mut(), EnterAlternateScreen)?;
+        self.terminal.clear()?;
+        Ok(())
     }
 }
 

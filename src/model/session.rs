@@ -42,6 +42,9 @@ pub enum Block {
         seq: SessionSeq,
         chunks: PackedChunks,
         time: Option<i64>,
+        /// Assistant message identity (`message.id` from the wire `data`),
+        /// retained for `messageFeedback` CAS targeting (REQ-007 AC-007-27).
+        message_id: Option<String>,
     },
     ToolCall {
         seq: SessionSeq,
@@ -634,6 +637,7 @@ fn blocks_from_event(ev: &SessionWireEvent, seq: SessionSeq) -> Vec<Block> {
             seq,
             chunks: PackedChunks::default(),
             time,
+            message_id: str_of("id"),
         }
     } else if t.starts_with("tool/call") {
         Block::ToolCall {
@@ -721,7 +725,12 @@ fn host_block(t: &str, data: &Value, time: Option<i64>, seq: SessionSeq) -> Bloc
                 ..ChunkData::default()
             }));
         }
-        Block::AssistantMessage { seq, chunks, time }
+        Block::AssistantMessage {
+            seq,
+            chunks,
+            time,
+            message_id: str_of("id"),
+        }
     } else if t.starts_with("tool/call") {
         Block::ToolCall {
             seq,

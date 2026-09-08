@@ -10,9 +10,16 @@ pub mod attachment;
 pub mod auth;
 pub mod commands;
 pub mod envelope;
+pub mod export;
+pub mod feedback;
+pub mod goals;
 pub mod monitor;
 pub mod mux;
+pub mod references;
 pub mod session;
+pub mod settings;
+pub mod skills;
+pub mod subagents;
 pub mod types;
 pub mod workspace;
 
@@ -97,9 +104,14 @@ pub async fn unary(
         .map_err(|e| ClientError::Transport(format!("{method} 请求失败（{url}）: {e}")))?;
     let status = resp.status();
     if !status.is_success() {
-        return Err(ClientError::Http(format!(
-            "{method} HTTP {status}（{url}）"
-        )));
+        // D-50/D-46：HTTP 非 2xx 返回结构化状态（404/5xx 与 401/403 可区分；
+        // 供端点不可用降级分类——feedback 本地标记/export page 兜底）。类
+        // 别由 envelope::ClientError::class() 依据状态码派生（401/403 →
+        // PermissionDenied，其余 UserFacing）。
+        return Err(ClientError::HttpStatus {
+            status: status.as_u16(),
+            url: url.clone(),
+        });
     }
     let resp_body: envelope::ServerResponse = resp
         .json()

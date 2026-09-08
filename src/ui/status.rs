@@ -13,8 +13,8 @@ use crate::ui::layout::{color_depth, ColorDepth};
 /// 快捷键提示行（FR-001-05，README 键位口径；[/] 搜索为 REQ-002 预留但仍展示）。
 const HINT_LINE: &str = "[i]输入 [/]搜索 [f]切换 [gt]轨迹 [M]模型 [:]命令 [gv]视图 [?]帮助 [q]退出";
 /// IMAGEVIEW 模式提示行（REQ-004 D-14/05 §10：`o` 系统查看器 `y` 复制路径
-/// `q` 关闭）。
-const IMAGE_HINT_LINE: &str = "[o]系统查看器 [y]复制路径 [q]关闭";
+/// `q` 关闭；REQ-007 D-45 zoom `+`/`-`/`0`）。
+const IMAGE_HINT_LINE: &str = "[o]系统查看器 [y]复制路径 [+/-]缩放 [0]重置 [q]关闭";
 /// REQ-005 Trajectory 列表提示行（Notes/05 §7：j/k 选择 Enter 详情 z 折叠
 /// / 搜索 gt 回对话）。
 const TRAJ_HINT_LINE: &str = "[j/k]选择 [Enter]详情 [z]折叠 [/]搜索 [gt]回对话";
@@ -39,7 +39,11 @@ fn official_running(app: &AppState) -> bool {
 
 /// Render the two-line status bar: official projection fields + shortcut hints.
 pub fn render(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
+    use crate::ui::theme::Role;
     let depth = color_depth();
+    let accent = app.palette.color(Role::Accent);
+    let warn = app.palette.color(Role::Warn);
+    let ok = app.palette.color(Role::AssistantFg);
     let (label, color) = connection_label(app.conn, depth);
     let mut spans = vec![Span::styled(
         format!(" {label} "),
@@ -52,34 +56,26 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         crate::app::Mode::Insert => {
             spans.push(Span::styled(
                 " INSERT ",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(accent).add_modifier(Modifier::BOLD),
             ));
             // REQ-003 AC-003-06：运行中 composer 为 steer，状态条显示 STEER。
             if app.composer.steer {
                 spans.push(Span::styled(
                     " STEER ",
-                    Style::default()
-                        .fg(Color::Magenta)
-                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(accent).add_modifier(Modifier::BOLD),
                 ));
             }
         }
         crate::app::Mode::Search => {
             spans.push(Span::styled(
                 " SEARCH ",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(accent).add_modifier(Modifier::BOLD),
             ));
         }
         crate::app::Mode::Visual => {
             spans.push(Span::styled(
                 " VISUAL ",
-                Style::default()
-                    .fg(Color::Magenta)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(accent).add_modifier(Modifier::BOLD),
             ));
             // §4：VISUAL 选择区反色 + `selected N lines` 计数。
             if let Some(sel) = &app.yank.visual {
@@ -96,26 +92,20 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         crate::app::Mode::Approval => {
             spans.push(Span::styled(
                 " APPROVAL ",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(warn).add_modifier(Modifier::BOLD),
             ));
         }
         // REQ-005：Trajectory 模式指示（D-25）。
         crate::app::Mode::Trajectory => {
             spans.push(Span::styled(
                 " TRAJ ",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(accent).add_modifier(Modifier::BOLD),
             ));
             // 详情子层指示（D-25：Trajectory 内焦点子层）。
             if app.traj.detail_open && app.focus == crate::app::Focus::Details {
                 spans.push(Span::styled(
                     " DETAILS ",
-                    Style::default()
-                        .fg(Color::Magenta)
-                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(accent).add_modifier(Modifier::BOLD),
                 ));
             }
         }
@@ -123,18 +113,14 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         crate::app::Mode::ModelCatalog => {
             spans.push(Span::styled(
                 " MODEL ",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(accent).add_modifier(Modifier::BOLD),
             ));
         }
         // REQ-006：命令面板模式指示（FR-006-03）。
         crate::app::Mode::CommandPalette => {
             spans.push(Span::styled(
                 " CMD ",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(accent).add_modifier(Modifier::BOLD),
             ));
         }
         _ => {}
@@ -161,16 +147,14 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         };
         spans.push(Span::styled(
             format!("  {text}"),
-            Style::default().fg(Color::Cyan),
+            Style::default().fg(accent),
         ));
     }
     // 复制成功 toast（AC-003-08；`copied`）。
     if let Some(toast) = &app.yank.toast {
         spans.push(Span::styled(
             format!("  {toast} "),
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(ok).add_modifier(Modifier::BOLD),
         ));
     }
 
@@ -194,6 +178,14 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         if let Some(title) = title {
             spans.push(Span::raw(format!(" {}", truncate(&title, 24))));
         }
+        // REQ-007 AC-007-01/07：打开中的 subagent child 状态条标 lineage
+        // （`◉subagent ▸ parent`，仅用登记实据）。
+        if let Some((parent_id, _child_id)) = app.active_subagent_parent() {
+            spans.push(Span::styled(
+                format!(" ◉subagent ▸ {parent_id}"),
+                Style::default().fg(Color::Cyan),
+            ));
+        }
         if let Some(cwd) = cwd {
             spans.push(Span::styled(
                 format!(" {}", truncate(&cwd, 30)),
@@ -204,14 +196,21 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
             if running { " ●run" } else { " ○idle" },
             Style::default().fg(if running { Color::Green } else { Color::Gray }),
         ));
+        // REQ-007 AC-007-13：jobs 指示位（control 镜像 active 计数，ADR-008
+        // 只读不自算总量）。
+        let jobs_active = app.jobs.active_count();
+        if jobs_active > 0 {
+            spans.push(Span::styled(
+                format!(" jobs:{jobs_active}"),
+                Style::default().fg(Color::Yellow),
+            ));
+        }
         // 本地停止转场（AC-002-05）：requested 且官方投影仍 running →
         // 「停止中」；投影翻转即结束（FollowSnapshot 清空 requested）。
         if running && app.stop.requested_session.as_ref() == app.active_session.as_ref() {
             spans.push(Span::styled(
                 " 停止中…",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(warn).add_modifier(Modifier::BOLD),
             ));
         }
         // AC-006-08（FR-006-01/D-033）：状态条显示模型选择——next 与
@@ -228,6 +227,33 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         };
         if let Some(model) = model_display {
             spans.push(Span::raw(format!(" {model}")));
+        }
+        // REQ-007 AC-007-26：plan-mode chip（官方 plan 投影仅 active/pending，
+        // ADR-008 只读；缺字段 → 不显示）。
+        if let Some((active, pending)) = projections.plan() {
+            let text = if active {
+                " ◉plan"
+            } else if pending {
+                " plan…"
+            } else {
+                " plan-off"
+            };
+            spans.push(Span::styled(text, Style::default().fg(Color::Blue)));
+        }
+        // REQ-007 AC-007-11：goal 状态 chip（官方 goal 投影，ADR-008；缺字段
+        // → 不显示，TUI 不自算）。
+        if let Some(goal) = projections.goal() {
+            let phase = match goal.phase {
+                Some(crate::api::types::GoalPhase::Active) => "◉active",
+                Some(crate::api::types::GoalPhase::Paused) => "◉paused",
+                Some(crate::api::types::GoalPhase::Blocked) => "◉blocked",
+                Some(crate::api::types::GoalPhase::Complete) => "✓done",
+                None => "◉goal",
+            };
+            spans.push(Span::styled(
+                format!(" {phase}"),
+                Style::default().fg(Color::Cyan),
+            ));
         }
         let context = projections.context_pressure();
         if let (Some(used), Some(total)) = (context.pressure_tokens, context.projected_tokens) {
@@ -692,6 +718,75 @@ mod tests {
         assert!(
             !rendered.contains("[s]停止"),
             "idle 不显示停止提示, text={rendered}"
+        );
+    }
+    #[test]
+    fn plan_chip_shows_when_projection_active_ac007_26() {
+        let mut app = crate::app::AppState::default();
+        let sid = crate::api::types::SessionId("s-p".into());
+        app.active_session = Some(sid.clone());
+        let w = app.sessions.touch(&sid.0, 50);
+        let _ = w.apply(crate::model::Incoming::Snapshot {
+            cursor: None,
+            records: vec![],
+            has_more: false,
+            projections: Some(serde_json::json!({
+                "running": false,
+                "plan": {"active": true, "pending": false}
+            })),
+        });
+        let backend = ratatui::backend::TestBackend::new(120, 3);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render(frame, frame.area(), &app))
+            .unwrap();
+        let text = rendered_text(&terminal);
+        assert!(text.contains("◉plan"), "plan active chip, text={text}");
+    }
+
+    #[test]
+    fn subagent_child_lineage_shows_in_status_ac007_01_07() {
+        let mut app = crate::app::AppState::default();
+        let sid = crate::api::types::SessionId("c1".into());
+        app.active_session = Some(sid.clone());
+        // 打开 child 时登记 parent（open_subagent_child 写入）。
+        app.subagent_parents.insert("c1".into(), "p1".into());
+        let w = app.sessions.touch(&sid.0, 50);
+        let _ = w.apply(crate::model::Incoming::Snapshot {
+            cursor: None,
+            records: vec![],
+            has_more: false,
+            projections: Some(serde_json::json!({"running": false})),
+        });
+        let backend = ratatui::backend::TestBackend::new(120, 3);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render(frame, frame.area(), &app))
+            .unwrap();
+        let text = rendered_text(&terminal);
+        assert!(
+            text.contains("◉subagent ▸ p1"),
+            "child 打开态状态条显示 lineage, text={text}"
+        );
+        // 普通会话（未登记 parent）不显示该标记。
+        let mut app2 = crate::app::AppState::default();
+        let sid2 = crate::api::types::SessionId("s1".into());
+        app2.active_session = Some(sid2.clone());
+        let w2 = app2.sessions.touch(&sid2.0, 50);
+        let _ = w2.apply(crate::model::Incoming::Snapshot {
+            cursor: None,
+            records: vec![],
+            has_more: false,
+            projections: Some(serde_json::json!({"running": false})),
+        });
+        let mut terminal2 =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 3)).unwrap();
+        terminal2
+            .draw(|frame| render(frame, frame.area(), &app2))
+            .unwrap();
+        assert!(
+            !rendered_text(&terminal2).contains("subagent"),
+            "普通会话无 subagent 标记"
         );
     }
 }

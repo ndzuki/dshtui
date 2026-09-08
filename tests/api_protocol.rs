@@ -374,6 +374,69 @@ async fn prompt_unary_surfaces_remote_error_code_and_class() {
 }
 
 #[tokio::test]
+async fn unary_http_error_is_structured_status_d50() {
+    // D-50/D-46：unary 对 HTTP 非 2xx 返回结构化 HttpStatus（404/5xx 与
+    // 401/403 可区分）——feedback 端点不可用降级 / export 兜底分类的前提。
+    // 404 → HttpStatus{404}（UserFacing、http_status()=404）。
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let request = read_request(&mut socket).await;
+        assert!(request.starts_with("POST /api/messageFeedback/put HTTP/1.1"));
+        write_http_json(&mut socket, "404 Not Found", &json!({})).await;
+    });
+    let http = reqwest::Client::new();
+    let err = dshtui::api::feedback::put(
+        &http,
+        &format!("http://{addr}"),
+        &dshtui::api::types::MessageFeedbackPutRequest {
+            session_id: "s1".into(),
+            message_id: "m1".into(),
+            rating: "positive".into(),
+            note: None,
+            if_version: None,
+        },
+    )
+    .await
+    .unwrap_err();
+    match &err {
+        ClientError::HttpStatus { status, .. } => {
+            assert_eq!(*status, 404, "404 结构化状态码");
+            assert_eq!(err.class(), ErrorClass::UserFacing);
+            assert_eq!(err.http_status(), Some(404));
+        }
+        other => panic!("预期 HttpStatus，得到 {other:?}"),
+    }
+    server.await.unwrap();
+
+    // 401 → class PermissionDenied（权限类可区分，不降级不自动重试）。
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let _ = read_request(&mut socket).await;
+        write_http_json(&mut socket, "401 Unauthorized", &json!({})).await;
+    });
+    let http = reqwest::Client::new();
+    let err = dshtui::api::feedback::put(
+        &http,
+        &format!("http://{addr}"),
+        &dshtui::api::types::MessageFeedbackPutRequest {
+            session_id: "s1".into(),
+            message_id: "m1".into(),
+            rating: "negative".into(),
+            note: None,
+            if_version: None,
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.class(), ErrorClass::PermissionDenied, "401 → 权限类");
+    server.await.unwrap();
+}
+
+#[tokio::test]
 async fn cancel_unary_returns_typed_accepted_receipt() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -1206,4 +1269,771 @@ async fn command_execute_surfaces_remote_error_code_ac006_13() {
         other => panic!("expected Remote error, got {other:?}"),
     }
     server.await.unwrap();
+}
+
+// ============================================================================
+// REQ-007 V0.4: subagents/goals/settings/skills/references/feedback/export wire
+// mock（0.1.2-rc.1 实读：subagents interruptByParent 三个位置参数平铺；
+// goals agentId+ref CAS；settings expectedRevision；export 同源 HTTP 路由）。
+// ============================================================================
+
+#[tokio::test]
+async fn subagents_list_flat_args_and_typed_catalog() {
+    use dshtui::api::types::{SubagentCatalog, SubagentListEntry};
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let request = read_request(&mut socket).await;
+        assert!(request.starts_with("POST /api/subagents/list HTTP/1.1"));
+        let body: Value = serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(body["method"], "subagents/list");
+        // parentSessionId 平铺（非 request 嵌套）。
+        assert_eq!(body["payload"]["args"]["parentSessionId"], "parent-1");
+        let rpc_id = body["rpcId"].as_str().unwrap().to_string();
+        write_json_response(
+            &mut socket,
+            json!({
+                "type": "server-response", "rpcId": rpc_id,
+                "result": {"ok": true, "value": {
+                    "entries": [
+                        {"kind": "child", "id": "c1", "activity": "running",
+                         "hasChildren": true, "mode": "continuable", "label": "走查"},
+                        {"kind": "diagnostic", "id": "c2", "reason": "corrupt"}
+                    ],
+                    "parentAvailable": true
+                }}
+            }),
+        )
+        .await;
+    });
+    let http = reqwest::Client::new();
+    let cat: SubagentCatalog =
+        dshtui::api::subagents::list(&http, &format!("http://{addr}"), "parent-1")
+            .await
+            .unwrap();
+    assert_eq!(cat.entries.len(), 2);
+    assert!(cat.parent_available);
+    match &cat.entries[0] {
+        SubagentListEntry::Child {
+            id, activity, mode, ..
+        } => {
+            assert_eq!(id, "c1");
+            assert_eq!(activity, "running");
+            assert_eq!(mode.as_deref(), Some("continuable"));
+        }
+        other => panic!("expected child, got {other:?}"),
+    }
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn subagents_prompt_nests_request_and_returns_message_id() {
+    use dshtui::api::types::{PromptContentPart, SubagentPromptRequest};
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let request = read_request(&mut socket).await;
+        assert!(request.starts_with("POST /api/subagents/prompt HTTP/1.1"));
+        let body: Value = serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(body["method"], "subagents/prompt");
+        let req = &body["payload"]["args"]["request"];
+        assert_eq!(req["parentSessionId"], "parent-1");
+        assert_eq!(req["childSessionId"], "c1");
+        assert_eq!(req["mode"], "continuable");
+        assert_eq!(req["content"][0]["type"], "text");
+        let rpc_id = body["rpcId"].as_str().unwrap().to_string();
+        write_json_response(
+            &mut socket,
+            json!({
+                "type": "server-response", "rpcId": rpc_id,
+                "result": {"ok": true, "value": {"messageId": "msg-1", "accepted": true}}
+            }),
+        )
+        .await;
+    });
+    let http = reqwest::Client::new();
+    let receipt = dshtui::api::subagents::prompt(
+        &http,
+        &format!("http://{addr}"),
+        &SubagentPromptRequest {
+            request_id: "r-1".into(),
+            parent_session_id: "parent-1".into(),
+            child_session_id: "c1".into(),
+            mode: "continuable".into(),
+            content: vec![PromptContentPart::Text {
+                text: "继续".into(),
+            }],
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(receipt.message_id.as_deref(), Some("msg-1"));
+    assert_eq!(receipt.accepted, Some(true));
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn subagents_interrupt_by_parent_three_flat_positional_args() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let request = read_request(&mut socket).await;
+        assert!(request.starts_with("POST /api/subagents/interruptByParent HTTP/1.1"));
+        let body: Value = serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(body["method"], "subagents/interruptByParent");
+        // 三个位置参数平铺（wire 校正：非 request 嵌套）。
+        let args = &body["payload"]["args"];
+        assert_eq!(args["childSessionId"], "c1");
+        assert_eq!(args["parentSessionId"], "parent-1");
+        assert_eq!(args["mode"], "continuable");
+        assert!(args.get("request").is_none(), "不得嵌套 request");
+        let rpc_id = body["rpcId"].as_str().unwrap().to_string();
+        write_json_response(
+            &mut socket,
+            json!({
+                "type": "server-response", "rpcId": rpc_id,
+                "result": {"ok": true, "value": {"accepted": true}}
+            }),
+        )
+        .await;
+    });
+    let http = reqwest::Client::new();
+    let receipt = dshtui::api::subagents::interrupt_by_parent(
+        &http,
+        &format!("http://{addr}"),
+        "c1",
+        "parent-1",
+    )
+    .await
+    .unwrap();
+    assert_eq!(receipt.accepted, Some(true));
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn goals_create_pause_clear_agent_id_and_cas_args() {
+    use dshtui::api::types::{CreateGoalRequest, GoalRef};
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let seen: std::sync::Arc<std::sync::Mutex<Vec<(String, Value)>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen2 = seen.clone();
+    let server = tokio::spawn(async move {
+        for _ in 0..3 {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut socket).await;
+            let body: Value =
+                serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+            let method = body["method"].as_str().unwrap().to_string();
+            seen2
+                .lock()
+                .unwrap()
+                .push((method.clone(), body["payload"]["args"].clone()));
+            let rpc_id = body["rpcId"].as_str().unwrap().to_string();
+            let value = match method.as_str() {
+                "goals/create" => json!({"ref": {"id": "g1", "revision": 1}}),
+                "goals/pause" => json!({"goal": {"id": "g1", "revision": 2,
+                    "objective": "交付", "phase": "paused"}}),
+                _ => json!({"id": "g1", "revision": 3}),
+            };
+            write_json_response(
+                &mut socket,
+                json!({
+                    "type": "server-response", "rpcId": rpc_id,
+                    "result": {"ok": true, "value": value}
+                }),
+            )
+            .await;
+        }
+    });
+    let http = reqwest::Client::new();
+    let base = format!("http://{addr}");
+    let created = dshtui::api::goals::create(
+        &http,
+        &base,
+        "agent-1",
+        &CreateGoalRequest {
+            objective: "交付".into(),
+            max_goal_rounds: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(created.id, "g1");
+    assert_eq!(created.revision, 1);
+    let paused = dshtui::api::goals::pause(
+        &http,
+        &base,
+        "agent-1",
+        &GoalRef {
+            id: "g1".into(),
+            revision: 1,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(paused.phase, Some(dshtui::api::types::GoalPhase::Paused));
+    let cleared = dshtui::api::goals::clear(
+        &http,
+        &base,
+        "agent-1",
+        &GoalRef {
+            id: "g1".into(),
+            revision: 2,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(cleared.id, "g1");
+    server.await.unwrap();
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen[0].0, "goals/create");
+    assert_eq!(seen[0].1["agentId"], "agent-1");
+    assert_eq!(seen[0].1["request"]["objective"], "交付");
+    assert_eq!(seen[1].0, "goals/pause");
+    assert_eq!(seen[1].1["agentId"], "agent-1");
+    assert_eq!(seen[1].1["ref"]["id"], "g1");
+    assert_eq!(seen[1].1["ref"]["revision"], 1, "CAS revision 随请求上送");
+    assert_eq!(seen[2].0, "goals/clear");
+    assert_eq!(seen[2].1["ref"]["revision"], 2);
+}
+
+#[tokio::test]
+async fn goals_edit_three_flat_args_with_cas_and_objective() {
+    use dshtui::api::types::{CreateGoalRequest, GoalRef};
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let seen: std::sync::Arc<std::sync::Mutex<Vec<(String, Value)>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen2 = seen.clone();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let request = read_request(&mut socket).await;
+        let body: Value = serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        seen2.lock().unwrap().push((
+            body["method"].as_str().unwrap().to_string(),
+            body["payload"]["args"].clone(),
+        ));
+        let rpc_id = body["rpcId"].as_str().unwrap().to_string();
+        write_json_response(
+            &mut socket,
+            json!({
+                "type": "server-response", "rpcId": rpc_id,
+                "result": {"ok": true, "value": {"goal": {
+                    "id": "g1", "revision": 4, "objective": "新目标",
+                    "phase": "active"
+                }}}
+            }),
+        )
+        .await;
+    });
+    let http = reqwest::Client::new();
+    let base = format!("http://{addr}");
+    let edited = dshtui::api::goals::edit(
+        &http,
+        &base,
+        "agent-1",
+        &GoalRef {
+            id: "g1".into(),
+            revision: 3,
+        },
+        &CreateGoalRequest {
+            objective: "新目标".into(),
+            max_goal_rounds: Some(5),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(edited.objective, "新目标");
+    assert_eq!(edited.revision, 4);
+    server.await.unwrap();
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen[0].0, "goals/edit");
+    assert_eq!(seen[0].1["agentId"], "agent-1");
+    assert_eq!(seen[0].1["ref"]["id"], "g1");
+    assert_eq!(seen[0].1["ref"]["revision"], 3, "CAS revision 随请求上送");
+    assert_eq!(seen[0].1["request"]["objective"], "新目标");
+    assert_eq!(seen[0].1["request"]["maxGoalRounds"], 5);
+}
+
+#[tokio::test]
+async fn settings_describe_and_update_with_expected_revision_cas() {
+    use dshtui::api::types::{SettingsNamespaceView, SettingsPathOpView};
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        for _ in 0..2 {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut socket).await;
+            let body: Value =
+                serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+            let method = body["method"].as_str().unwrap().to_string();
+            let rpc_id = body["rpcId"].as_str().unwrap().to_string();
+            match method.as_str() {
+                "settings/describe" => {
+                    assert_eq!(body["payload"]["args"], json!({}));
+                    write_json_response(
+                        &mut socket,
+                        json!({
+                            "type": "server-response", "rpcId": rpc_id,
+                            "result": {"ok": true, "value": {
+                                "writable": true, "hasDocument": true,
+                                "namespaces": [{
+                                    "ns": "ui-theme", "schema": {"type": "object"},
+                                    "value": {"preference": "dark"},
+                                    "applies": "live", "secrets": [], "revision": 4
+                                }]
+                            }}
+                        }),
+                    )
+                    .await;
+                }
+                _ => {
+                    let args = &body["payload"]["args"];
+                    assert_eq!(args["ns"], "locale");
+                    assert_eq!(args["expectedRevision"], 4);
+                    assert_eq!(args["patch"]["preference"], "zh-CN");
+                    write_json_response(
+                        &mut socket,
+                        json!({
+                            "type": "server-response", "rpcId": rpc_id,
+                            "result": {"ok": true, "value": {
+                                "namespace": {
+                                    "ns": "locale", "schema": {"type": "object"},
+                                    "value": {"preference": "zh-CN"},
+                                    "applies": "live", "secrets": [], "revision": 5
+                                }
+                            }}
+                        }),
+                    )
+                    .await;
+                }
+            }
+        }
+    });
+    let http = reqwest::Client::new();
+    let base = format!("http://{addr}");
+    let describe = dshtui::api::settings::describe(&http, &base).await.unwrap();
+    assert!(describe.writable);
+    assert_eq!(describe.namespaces.len(), 1);
+    assert_eq!(describe.namespaces[0].ns, "ui-theme");
+    assert_eq!(describe.namespaces[0].revision, 4);
+    let updated: SettingsNamespaceView = dshtui::api::settings::update(
+        &http,
+        &base,
+        "locale",
+        json!({"preference": "zh-CN"}),
+        Some(4),
+    )
+    .await
+    .unwrap();
+    assert_eq!(updated.ns, "locale");
+    assert_eq!(updated.revision, 5);
+    // mutate 路径 op 形状（单元覆盖于模块内测试，此处仅确认编译可达）。
+    let _op = SettingsPathOpView {
+        path: "preference".into(),
+        op_kind: "set".into(),
+        value: Some(json!("dark")),
+    };
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn skills_list_session_scoped_and_typed_entries() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let request = read_request(&mut socket).await;
+        assert!(request.starts_with("POST /api/skills/list HTTP/1.1"));
+        let body: Value = serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(body["method"], "skills/list");
+        assert_eq!(body["payload"]["args"]["sessionId"], "sess-1");
+        let rpc_id = body["rpcId"].as_str().unwrap().to_string();
+        write_json_response(
+            &mut socket,
+            json!({
+                "type": "server-response", "rpcId": rpc_id,
+                "result": {"ok": true, "value": {
+                    "skills": [
+                        {"name": "bash", "description": "执行 shell", "modelInvocable": true}
+                    ]
+                }}
+            }),
+        )
+        .await;
+    });
+    let http = reqwest::Client::new();
+    let skills = dshtui::api::skills::list(&http, &format!("http://{addr}"), "sess-1")
+        .await
+        .unwrap();
+    assert_eq!(skills.skills.len(), 1);
+    assert_eq!(skills.skills[0].name, "bash");
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn references_two_sources_flat_agent_args() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let methods: std::sync::Arc<std::sync::Mutex<Vec<(String, Value)>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let methods2 = methods.clone();
+    let server = tokio::spawn(async move {
+        for _ in 0..2 {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut socket).await;
+            let body: Value =
+                serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+            let method = body["method"].as_str().unwrap().to_string();
+            methods2
+                .lock()
+                .unwrap()
+                .push((method.clone(), body["payload"]["args"].clone()));
+            let rpc_id = body["rpcId"].as_str().unwrap().to_string();
+            let value = if method == "fileReferences/list" {
+                json!([{"path": "src/api/mod.rs", "kind": "file"},
+                       {"path": "src/api", "kind": "directory"}])
+            } else {
+                json!([{"sessionId": "s1", "label": "部署排查", "mention": "@[部署排查](dsh-session:s1)",
+                        "sameWorkspace": true, "createdAt": 1}])
+            };
+            write_json_response(
+                &mut socket,
+                json!({
+                    "type": "server-response", "rpcId": rpc_id,
+                    "result": {"ok": true, "value": value}
+                }),
+            )
+            .await;
+        }
+    });
+    let http = reqwest::Client::new();
+    let base = format!("http://{addr}");
+    let files = dshtui::api::references::file_references(&http, &base, "agent-1", "src/api")
+        .await
+        .unwrap();
+    assert_eq!(files.len(), 2);
+    assert_eq!(files[0].kind, "file");
+    let sessions = dshtui::api::references::session_candidates(&http, &base, "agent-1", "部署")
+        .await
+        .unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].session_id, "s1");
+    server.await.unwrap();
+    let seen = methods.lock().unwrap();
+    assert_eq!(seen[0].0, "fileReferences/list");
+    assert_eq!(seen[0].1["agentId"], "agent-1");
+    assert_eq!(seen[0].1["query"], "src/api");
+    assert_eq!(seen[1].0, "sessionReferenceResolver/candidates");
+    assert_eq!(seen[1].1["agentId"], "agent-1");
+}
+
+#[tokio::test]
+async fn feedback_put_nests_cas_fields_and_lists() {
+    use dshtui::api::types::MessageFeedbackPutRequest;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        for _ in 0..2 {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut socket).await;
+            let body: Value =
+                serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+            let method = body["method"].as_str().unwrap().to_string();
+            let rpc_id = body["rpcId"].as_str().unwrap().to_string();
+            match method.as_str() {
+                "messageFeedback/put" => {
+                    let req = &body["payload"]["args"]["request"];
+                    assert_eq!(req["sessionId"], "sess-1");
+                    assert_eq!(req["messageId"], "m1");
+                    assert_eq!(req["rating"], "positive");
+                    assert_eq!(req["ifVersion"], 2);
+                    write_json_response(
+                        &mut socket,
+                        json!({"type": "server-response", "rpcId": rpc_id,
+                               "result": {"ok": true, "value": {"accepted": true}}}),
+                    )
+                    .await;
+                }
+                _ => {
+                    assert_eq!(body["payload"]["args"]["sessionId"], "sess-1");
+                    write_json_response(
+                        &mut socket,
+                        json!({"type": "server-response", "rpcId": rpc_id,
+                        "result": {"ok": true, "value": {
+                            "items": [{"messageId": "m1", "rating": "positive"}]
+                        }}}),
+                    )
+                    .await;
+                }
+            }
+        }
+    });
+    let http = reqwest::Client::new();
+    let base = format!("http://{addr}");
+    let put = dshtui::api::feedback::put(
+        &http,
+        &base,
+        &MessageFeedbackPutRequest {
+            session_id: "sess-1".into(),
+            message_id: "m1".into(),
+            rating: "positive".into(),
+            note: None,
+            if_version: Some(2),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(put["accepted"], true);
+    let list = dshtui::api::feedback::list(&http, &base, "sess-1")
+        .await
+        .unwrap();
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0].rating, "positive");
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn export_downloads_official_route_and_streams_to_file() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        // GET 请求无 body；读头到 \r\n\r\n。
+        let mut raw = Vec::new();
+        let mut buf = [0_u8; 2048];
+        loop {
+            let n = socket.read(&mut buf).await.unwrap();
+            raw.extend_from_slice(&buf[..n]);
+            if raw.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+        let head = String::from_utf8_lossy(&raw).into_owned();
+        assert!(
+            head.starts_with(
+                "GET /api/session.export?sessionId=sess-1&includeDescendants=true HTTP/1.1"
+            ),
+            "head={head}"
+        );
+        // 模拟流式 ZIP 响应体（两段，验证逐 chunk 落盘）。
+        let body = b"PK\x03\x04export-bytes";
+        let len = body.len();
+        socket
+            .write_all(
+                format!("HTTP/1.1 200 OK\r\nContent-Type: application/zip\r\nContent-Length: {len}\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+        socket.write_all(body).await.unwrap();
+        socket.flush().await.unwrap();
+    });
+    let http = reqwest::Client::new();
+    // 测试自建独立目录（进程内 /tmp 同一会话可见；结束清理）。
+    let tmp = std::env::temp_dir().join(format!("dshtui-export-test-{}", std::process::id()));
+    let target = tmp.join("session-export.zip");
+    let receipt =
+        dshtui::api::export::download_export(&http, &format!("http://{addr}"), "sess-1", &target)
+            .await
+            .unwrap();
+    assert_eq!(receipt.bytes, body_len());
+    assert!(target.exists(), "目标文件落盘");
+    let tmp_name = format!("session-export.zip.tmp-{}", std::process::id());
+    assert!(!tmp.join(tmp_name).exists(), "临时文件已改名不残留");
+    let data = std::fs::read(&target).unwrap();
+    assert_eq!(&data, b"PK\x03\x04export-bytes");
+    // 清理临时目录（测试自建，会话内清理）。
+    let _ = std::fs::remove_dir_all(&tmp);
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn export_stream_error_cleans_up_tmp_and_leaves_no_half_product() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut raw = Vec::new();
+        let mut buf = [0_u8; 2048];
+        loop {
+            let n = socket.read(&mut buf).await.unwrap();
+            raw.extend_from_slice(&buf[..n]);
+            if raw.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+        // 头声明大 Content-Length 但只写一半就断连 → reqwest chunk() 报 stream error。
+        socket
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/zip\r\nContent-Length: 100000\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        socket.write_all(b"PK\x03\x04partial").await.unwrap();
+        socket.flush().await.unwrap();
+        // 直接 drop 断连。
+    });
+    let http = reqwest::Client::new();
+    let tmp = std::env::temp_dir().join(format!("dshtui-export-fail-{}", std::process::id()));
+    let target = tmp.join("session-export.zip");
+    let _ = std::fs::create_dir_all(&tmp);
+    let result =
+        dshtui::api::export::download_export(&http, &format!("http://{addr}"), "sess-1", &target)
+            .await;
+    assert!(result.is_err(), "断流必须报错");
+    assert!(!target.exists(), "目标路径不留半成品");
+    let tmp_name = format!("session-export.zip.tmp-{}", std::process::id());
+    assert!(!tmp.join(tmp_name).exists(), "临时文件已清理: tmp leak");
+    let _ = std::fs::remove_dir_all(&tmp);
+    server.await.unwrap();
+}
+
+fn body_len() -> u64 {
+    b"PK\x03\x04export-bytes".len() as u64
+}
+
+#[tokio::test]
+async fn export_progress_reports_bytes_and_cancel_aborts_clean() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        // 接受两条连接：①成功流 ②取消路径（客户端会提前断开）。
+        for _ in 0..2 {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            let mut raw = Vec::new();
+            let mut buf = [0_u8; 4096];
+            while let Ok(n) = socket.read(&mut buf).await {
+                if n == 0 {
+                    break;
+                }
+                raw.extend_from_slice(&buf[..n]);
+                if raw.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            // 分多段发（50×100=5000 字节），让 progress 回调被触发。
+            if socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/zip\r\nContent-Length: 5000\r\n\r\n",
+                )
+                .await
+                .is_err()
+            {
+                continue;
+            }
+            for _ in 0..50 {
+                if socket.write_all(&[0u8; 100]).await.is_err() {
+                    break; // 客户端已断开（取消路径）。
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            let _ = socket.flush().await;
+        }
+    });
+    let http = reqwest::Client::new();
+    let tmp = std::env::temp_dir().join(format!("dshtui-export-cancel-{}", std::process::id()));
+    let target = tmp.join("session-export.zip");
+    let _ = std::fs::create_dir_all(&tmp);
+    let cancel = AtomicBool::new(false);
+    let mut reported: Vec<u64> = Vec::new();
+    let result = dshtui::api::export::download_export_progress(
+        &http,
+        &format!("http://{addr}"),
+        "sess-1",
+        &target,
+        &mut |b| reported.push(b),
+        || cancel.load(Ordering::Relaxed),
+    )
+    .await;
+    assert!(result.is_ok(), "不取消时应成功: {result:?}");
+    assert!(!reported.is_empty(), "进度回调已触发");
+    assert!(reported.windows(2).all(|w| w[1] >= w[0]), "bytes 单调递增");
+    assert!(target.exists(), "文件落盘");
+    // 取消路径：置位令牌 → 中止 + 清理 tmp + 可识别错误。
+    // （用新 client 避免连接池复用已被服务端关闭的首条连接。）
+    let http2 = reqwest::Client::new();
+    let tmp2 = std::env::temp_dir().join(format!("dshtui-export-cancel2-{}", std::process::id()));
+    let target2 = tmp2.join("session-export.zip");
+    let _ = std::fs::create_dir_all(&tmp2);
+    let cancel2 = AtomicBool::new(true);
+    let result2 = dshtui::api::export::download_export_progress(
+        &http2,
+        &format!("http://{addr}"),
+        "sess-1",
+        &target2,
+        &mut |_| {},
+        || cancel2.load(Ordering::Relaxed),
+    )
+    .await;
+    assert!(result2.is_err(), "取消必须中止");
+    assert!(!target2.exists(), "取消不留半成品");
+    let err = result2.err().unwrap();
+    let msg = format!("{err}");
+    assert!(msg.contains("导出已取消"), "取消错误串稳定: {msg}");
+    let tmp_name = format!("session-export.zip.tmp-{}", std::process::id());
+    assert!(
+        !tmp2.join(&tmp_name).exists() && !tmp.join(&tmp_name).exists(),
+        "临时文件均清理"
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
+    let _ = std::fs::remove_dir_all(&tmp2);
+    server.await.unwrap();
+}
+
+#[test]
+fn control_jobs_parse_baseline_replacement_and_tolerates_bad_rows() {
+    // replacement frame: bare array
+    let jobs = dshtui::api::session::parse_jobs(&json!([
+        {"id": "j1", "kind": "session/prompt", "label": "跑测试",
+         "status": "running", "startedAt": 1},
+        {"id": "j2", "kind": "tool/call", "label": "bash", "status": "completed"}
+    ]));
+    assert_eq!(jobs.len(), 2);
+    assert_eq!(jobs[0].id, "j1");
+    assert_eq!(
+        jobs[0].status,
+        Some(dshtui::api::types::SessionJobStatus::Running)
+    );
+    assert_eq!(
+        jobs[1].status,
+        Some(dshtui::api::types::SessionJobStatus::Completed)
+    );
+
+    // baseline per-session object + wrapper
+    let jobs = dshtui::api::session::parse_jobs(&json!({
+        "sess-1": [{"id": "j1", "kind": "k", "label": "l", "status": "stopping"}]
+    }));
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(
+        jobs[0].status,
+        Some(dshtui::api::types::SessionJobStatus::Stopping)
+    );
+    let jobs = dshtui::api::session::parse_jobs(&json!({
+        "items": [{"id": "j3", "kind": "k", "label": "l", "status": "failed"}]
+    }));
+    assert_eq!(
+        jobs[0].status,
+        Some(dshtui::api::types::SessionJobStatus::Failed)
+    );
+
+    // bad row skipped, never fatal; empty tolerated
+    let jobs = dshtui::api::session::parse_jobs(&json!([
+        {"id": "ok", "kind": "k", "label": "l", "status": "killed"},
+        {"id": 42}
+    ]));
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(
+        jobs[0].status,
+        Some(dshtui::api::types::SessionJobStatus::Killed)
+    );
+    assert!(dshtui::api::session::parse_jobs(&json!({})).is_empty());
+    assert!(dshtui::api::session::parse_jobs(&json!(null)).is_empty());
 }

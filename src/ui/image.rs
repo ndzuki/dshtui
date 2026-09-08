@@ -81,19 +81,70 @@ pub fn terminal_font_size() -> (u16, u16) {
 /// 大图降采样到视口 + kitty 编码（ratatui-image 0.10 kitty 后端；
 /// `Resize::Fit` 保持宽高比，原型已验证）。`id` 为 kitty image id（每帧唯一，
 /// 由调用方分配）。
+///
+/// `zoom`（REQ-007 D-45）：1.0 = 整图 fit 视口（与既有 `Fit(None)` 行为逐位
+/// 一致）；`zoom > 1` = 中心放大——先按 zoom 求「可见源窗口」并裁出中心区，
+/// 再放大回视口（ratatui-image 0.10 `Resize::Fit` 只收缩/适配到 area、无缩放
+/// 因子 API——放大必须中心裁剪，原型验证不同 zoom 产出不同帧/尺寸）；
+/// `zoom < 1` = 整图等比缩小显示（缩到 fit×zoom）。
 pub fn kitty_frame(
     image: image::DynamicImage,
     font_size: (u16, u16),
     area: Rect,
     id: u8,
+    zoom: f32,
 ) -> Result<Box<dyn Protocol>, ImageDecodeError> {
-    let source = ImageSource::new(image, font_size);
+    let zoomed = zoom_image(&image, font_size, area, zoom);
+    let source = ImageSource::new(zoomed, font_size);
     Kitty::from_source(&source, Resize::Fit(None), None, area, id)
         .map(|k| Box::new(k) as Box<dyn Protocol>)
         .map_err(|e| ImageDecodeError {
             code: "encode/failed".into(),
             message: format!("kitty 帧编码失败: {e}"),
         })
+}
+
+/// Zoom 像素变换纯函数（D-45 headless seam）。
+///
+/// 语义：`scale` 1.0 → 返回原图（整图 fit）；scale<1 → 整图缩到
+/// fit×scale；scale>1 → 中心窗口放大到视口。返回已裁/缩放的 RGBA 图，
+/// 交给 `Resize::Fit(None)` 编码时 rect 必然 ≤ 视口。
+fn zoom_image(
+    image: &image::DynamicImage,
+    font_size: (u16, u16),
+    area: Rect,
+    zoom: f32,
+) -> image::DynamicImage {
+    if (zoom - 1.0).abs() < f32::EPSILON {
+        return image.clone();
+    }
+    let (w, h) = (image.width() as f64, image.height() as f64);
+    let area_px = (
+        area.width as f64 * font_size.0 as f64,
+        area.height as f64 * font_size.1 as f64,
+    );
+    // fit_scale：整图放入视口（不放大）。与 Resize::Fit 的 min(area,desired)
+    // 语义对齐：源小于视口时仍按 1.0（不 upscale）。
+    let fit_scale = (area_px.0 / w).min(area_px.1 / h).min(1.0);
+    if zoom < 1.0 {
+        // 整图等比缩小：目标显示像素 = fit×zoom。
+        let tw = (w * fit_scale * zoom as f64).round().max(1.0) as u32;
+        let th = (h * fit_scale * zoom as f64).round().max(1.0) as u32;
+        return image.resize(tw, th, image::imageops::FilterType::Triangle);
+    }
+    // zoom > 1：显示放大 = 每源像素占用 (fit_scale×zoom) 屏像素 → 可见源窗口
+    // = area_px / (fit_scale×zoom)（≤ 源，中心裁剪），再放大填满 area。
+    let scale = fit_scale * zoom as f64;
+    let win_w = (area_px.0 / scale).round().clamp(1.0, w) as u32;
+    let win_h = (area_px.1 / scale).round().clamp(1.0, h) as u32;
+    let x0 = (w as u32 - win_w) / 2;
+    let y0 = (h as u32 - win_h) / 2;
+    let crop = image.crop_imm(x0, y0, win_w.max(1), win_h.max(1));
+    crop.resize(
+        area_px.0.max(1.0) as u32,
+        area_px.1.max(1.0) as u32,
+        image::imageops::FilterType::Triangle,
+    )
 }
 
 // ---------- 降级链（ADR-005：Kitty → 占位框 + 路径提示） ----------
@@ -203,7 +254,7 @@ mod tests {
     fn kitty_frame_downscales_large_image_and_emits_protocol_bytes() {
         let big: image::DynamicImage =
             ImageBuffer::from_fn(1920, 1080, |_, _| image::Rgb::<u8>([7, 7, 7])).into();
-        let frame = kitty_frame(big, (8, 16), Rect::new(0, 0, 80, 20), 3).unwrap();
+        let frame = kitty_frame(big, (8, 16), Rect::new(0, 0, 80, 20), 3, 1.0).unwrap();
         // 降采样：rect 必须适配视口（fit 保持宽高比）。
         let rect = frame.rect();
         assert!(rect.width <= 80 && rect.height <= 20, "rect={rect:?}");
@@ -223,6 +274,78 @@ mod tests {
             .iter()
             .any(|cell| cell.symbol().starts_with('\u{1b}') && cell.symbol().contains("_G"));
         assert!(found, "必须产出 Kitty graphics protocol 帧字节");
+    }
+
+    #[test]
+    fn kitty_frame_zoom1_matches_fit_and_different_scales_differ_ac007_06() {
+        // D-45 headless seam：zoom=1 与纯 Fit 一致；zoom>1 中心放大（帧内容/
+        // 尺寸不同）；zoom<1 整图缩小（帧尺寸更小）。像素级对比以 encoded
+        // 帧的 transmit payload（含图像尺寸 s/v）判定，不同 zoom 必不同。
+        let area = Rect::new(0, 0, 80, 20);
+        let big: image::DynamicImage =
+            ImageBuffer::from_fn(1280, 960, |_, _| image::Rgb::<u8>([9, 9, 9])).into();
+        let f1 = kitty_frame(big.clone(), (8, 16), area, 1, 1.0).unwrap();
+        let f1b = kitty_frame(big.clone(), (8, 16), area, 1, 1.0).unwrap();
+        assert_eq!(f1.rect(), f1b.rect(), "zoom=1 两次一致");
+        let f2 = kitty_frame(big.clone(), (8, 16), area, 2, 2.0).unwrap();
+        // zoom2 中心放大 → rect 变大（向视口扩展）或至少不缩水；且帧 payload
+        // 与 zoom1 不同（不同 scale 产出不同帧）。
+        assert_ne!(f1.rect(), f2.rect(), "zoom=1 与 zoom=2 rect 不同");
+        assert!(f2.rect().width >= f1.rect().width && f2.rect().height >= f1.rect().height);
+        let f05 = kitty_frame(big.clone(), (8, 16), area, 3, 0.5).unwrap();
+        assert!(
+            f05.rect().width <= f1.rect().width && f05.rect().height <= f1.rect().height,
+            "zoom=0.5 整图缩小: {:?} vs {:?}",
+            f05.rect(),
+            f1.rect()
+        );
+        // 帧字节不同（内容/缩放不同）——编码为 escape payload。
+        let payload = |f: &dyn Protocol| {
+            let backend = TestBackend::new(120, 40);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal
+                .draw(|fr| {
+                    fr.render_widget(
+                        ratatui_image::Image::new(f),
+                        ratatui::layout::Rect::new(0, 0, 120, 40),
+                    );
+                })
+                .unwrap();
+            let mut s = String::new();
+            for cell in terminal.backend().buffer().content() {
+                if cell.symbol().contains("_G") {
+                    s.push_str(cell.symbol());
+                }
+            }
+            s
+        };
+        assert_ne!(
+            payload(f1.as_ref()),
+            payload(f2.as_ref()),
+            "zoom1 vs zoom2 帧不同"
+        );
+        assert_ne!(
+            payload(f1.as_ref()),
+            payload(f05.as_ref()),
+            "zoom1 vs zoom0.5 帧不同"
+        );
+    }
+
+    #[test]
+    fn zoom_image_pure_function_small_image_upscale_within_area() {
+        // 小图（天然 < 视口）：zoom=1 保持自然大小；zoom=2 放大至视口内。
+        let small: image::DynamicImage =
+            ImageBuffer::from_fn(320, 240, |_, _| image::Rgb::<u8>([10, 10, 10])).into();
+        let f1 = kitty_frame(small.clone(), (8, 16), Rect::new(0, 0, 80, 20), 1, 1.0).unwrap();
+        let f2 = kitty_frame(small.clone(), (8, 16), Rect::new(0, 0, 80, 20), 2, 2.0).unwrap();
+        // 放大档位让整图占更多视口（rect 增大且不超视口）。
+        assert!(
+            f2.rect().width > f1.rect().width && f2.rect().height > f1.rect().height,
+            "小图 zoom2 放大: {} vs {}",
+            f2.rect(),
+            f1.rect()
+        );
+        assert!(f2.rect().width <= 80 && f2.rect().height <= 20);
     }
 
     #[test]

@@ -69,6 +69,22 @@ pub enum Mode {
     /// 命令面板 overlay（REQ-006 FR-006-03，`:` 打开；ADR-007 独立模态，
     /// 不串 SEARCH）。
     CommandPalette,
+    /// @ 提及候选（REQ-007 AC-007-23；composer INSERT 内 `@` 触发）。
+    Mention,
+    /// subagent 目录（REQ-007 FR-007-01；`:subagents` 打开）。
+    Subagent,
+    /// goal 面板（REQ-007 FR-007-02 half；`:goal` 打开）。
+    Goal,
+    /// jobs 只读面板（REQ-007 FR-007-02 half；`:jobs` 打开）。
+    Jobs,
+    /// settings 面板（REQ-007 FR-007-03 half；`:settings` 打开）。
+    Settings,
+    /// skills 目录（REQ-007 FR-007-03 half；`:skills` 打开）。
+    Skills,
+    /// 会话导出（REQ-007 FR-007-04；`:export` 打开）。
+    Export,
+    /// 消息动作菜单（REQ-007 AC-007-27/28；`m` 打开）。
+    MessageAction,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -163,6 +179,9 @@ pub struct SearchState {
     /// Enter 后进入结果巡览：n/N/y/j/k 为命令；未锁定时它们是输入字符
     /// （AC-003-05 与「输入实时过滤」的模态内两段式）。
     pub results_locked: bool,
+    /// REQ-007 AC-007-31：query 历史回忆游标（None=不在回忆；
+    /// Some(i)=正在回看第 i 条 recent）。仅空 query 编辑态可用 ↑ 触发。
+    pub recall_cursor: Option<usize>,
 }
 
 impl SearchState {
@@ -340,6 +359,23 @@ pub enum PaletteAction {
     DeleteWorkspace,
     /// 移动会话到目标 workspace（输入 workspace id / 空 = 未分组）。
     MoveSession,
+    /// REQ-007：`:` theme 切换（dark↔light，立即重绘 + save_theme 持久化，
+    /// AC-007-20）。
+    ToggleTheme,
+    /// REQ-007：`:` `edit` —— 用 $EDITOR 编辑当前 composer 草稿（AC-007-25）。
+    EditWithEditor,
+    /// REQ-007：`:subagents` 打开子代理目录（FR-007-01）。
+    OpenSubagents,
+    /// REQ-007：`:goal` 打开 goal 面板（FR-007-02）。
+    OpenGoal,
+    /// REQ-007：`:jobs` 打开 jobs 只读面板。
+    OpenJobs,
+    /// REQ-007：`:settings` 打开 settings 面板。
+    OpenSettings,
+    /// REQ-007：`:skills` 打开 skills 目录。
+    OpenSkills,
+    /// REQ-007：`:export` 打开会话导出。
+    OpenExport,
 }
 
 /// 会话/workspace 写操作（REQ-006 FR-006-02 操作半；wire 端点 Step 1 已封装）。
@@ -393,6 +429,64 @@ impl WorkspaceOperation {
             self,
             WorkspaceOperation::ArchiveSession { .. } | WorkspaceOperation::DeleteWorkspace { .. }
         )
+    }
+}
+
+/// 消息动作菜单目标（AC-007-27）：聚焦块的捕获快照。
+#[derive(Debug, Clone, PartialEq)]
+pub struct MessageActionTarget {
+    pub session_id: SessionId,
+    pub seq: u64,
+    /// block 种类：UserMessage（retry 需要 content）| AssistantMessage
+    /// （feedback 需要 message_id）。
+    pub kind: MsgTargetKind,
+    /// retry 重发内容（UserMessage content）。
+    pub user_text: Option<String>,
+    /// assistant message.id（feedback 定位锚）。
+    pub message_id: Option<String>,
+    /// 目标所属 turn 是否 running（运行中动作需二次确认，AC-007-28）。
+    pub running: bool,
+    /// 是否为静止轮次的末条 user 消息（branch 门槛）。
+    pub is_last_user: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MsgTargetKind {
+    User,
+    Assistant,
+}
+
+/// goal 写操作（REQ-007 FR-007-02；CAS revision 由面板 inflight 携带，
+/// wire 端点 agentId=active_session）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum GoalMutation {
+    /// `goals/create`（objective + 可选 maxGoalRounds）。
+    Create {
+        objective: String,
+        max_goal_rounds: Option<u64>,
+    },
+    /// `goals/edit`（objective）。
+    Edit {
+        objective: String,
+    },
+    /// `goals/pause` / `resume` / `complete`。
+    Pause,
+    Resume,
+    Complete,
+    /// `goals/clear`（危险，二次确认）。
+    Clear,
+}
+
+impl GoalMutation {
+    pub fn op_kind(&self) -> crate::model::GoalOpKind {
+        match self {
+            GoalMutation::Create { .. } => crate::model::GoalOpKind::Create,
+            GoalMutation::Edit { .. } => crate::model::GoalOpKind::Edit,
+            GoalMutation::Pause => crate::model::GoalOpKind::Pause,
+            GoalMutation::Resume => crate::model::GoalOpKind::Resume,
+            GoalMutation::Complete => crate::model::GoalOpKind::Complete,
+            GoalMutation::Clear => crate::model::GoalOpKind::Clear,
+        }
     }
 }
 
@@ -574,21 +668,49 @@ impl CommandPaletteState {
                 desc: "删除光标所在 workspace（危险，二次确认）",
                 action: PaletteAction::DeleteWorkspace,
             },
-            CommandPaletteItem::V04 {
+            CommandPaletteItem::Local {
                 label: "settings",
-                desc: "设置面板（V0.4）",
+                desc: "settings 白名单编辑（AC-007-15/16）",
+                action: PaletteAction::OpenSettings,
             },
-            CommandPaletteItem::V04 {
+            CommandPaletteItem::Local {
+                label: "skills",
+                desc: "skills 目录只读 + 复制引用（AC-007-18）",
+                action: PaletteAction::OpenSkills,
+            },
+            CommandPaletteItem::Local {
                 label: "theme",
-                desc: "主题切换（V0.4）",
+                desc: "主题切换 dark↔light（AC-007-20）",
+                action: PaletteAction::ToggleTheme,
+            },
+            CommandPaletteItem::Local {
+                label: "edit",
+                desc: "用 $EDITOR 编辑当前草稿（AC-007-25；composer 打开时可用）",
+                action: PaletteAction::EditWithEditor,
+            },
+            CommandPaletteItem::Local {
+                label: "subagents",
+                desc: "子代理目录（FR-007-01；需要活动会话）",
+                action: PaletteAction::OpenSubagents,
+            },
+            CommandPaletteItem::Local {
+                label: "goal",
+                desc: "goal 面板（单例；create/edit/pause/resume/complete/clear）",
+                action: PaletteAction::OpenGoal,
+            },
+            CommandPaletteItem::Local {
+                label: "jobs",
+                desc: "jobs 只读列表（官方无停止，指引 web）",
+                action: PaletteAction::OpenJobs,
             },
             CommandPaletteItem::V04 {
                 label: "keymap",
                 desc: "键位编辑（V0.4）",
             },
-            CommandPaletteItem::V04 {
+            CommandPaletteItem::Local {
                 label: "export",
-                desc: "导出/存档（V0.4）",
+                desc: "导出会话 ZIP（官方 /api/session.export）",
+                action: PaletteAction::OpenExport,
             },
         ]
     }
@@ -941,6 +1063,105 @@ pub enum AppEvent {
         op_name: String,
         error: ClientError,
     },
+    // ---------- REQ-007 V0.4 `:edit`（AC-007-25，prototype 验证） ----------
+    /// 外部编辑器退出后的回执（main 释放/恢复 raw mode 并执行 $EDITOR）。
+    ExternalEditDone {
+        ok: bool,
+        tmp_path: std::path::PathBuf,
+        text: String,
+        message: String,
+    },
+    // ---------- REQ-007 V0.4 @ 提及（AC-007-23） ----------
+    /// `fileReferences/list` + `sessionReferenceResolver/candidates` 结果
+    /// （generation 守卫：stale 丢弃）。
+    MentionCandidates {
+        generation: u64,
+        files: Vec<crate::api::types::FileReferenceCandidate>,
+        sessions: Vec<crate::api::types::SessionReferenceMentionCandidate>,
+    },
+    MentionCandidatesFailed {
+        generation: u64,
+        error: ClientError,
+    },
+    // ---------- REQ-007 V0.4 subagent 回执 ----------
+    SubagentListed {
+        parent_id: String,
+        generation: u64,
+        catalog: crate::api::types::SubagentCatalog,
+    },
+    SubagentListFailed {
+        parent_id: String,
+        generation: u64,
+        error: ClientError,
+    },
+    SubagentInterruptDone {
+        child_id: String,
+        error: Option<ClientError>,
+    },
+    GoalOpDone {
+        request_id: String,
+        updated: Option<crate::api::types::GoalSnapshot>,
+        cleared: bool,
+    },
+    GoalOpFailed {
+        request_id: String,
+        op: GoalMutation,
+        error: ClientError,
+    },
+    SettingsDescribed {
+        value: crate::api::types::SettingsDescribeValue,
+    },
+    SettingsDescribeFailed {
+        error: ClientError,
+    },
+    SettingsUpdated {
+        ns: String,
+        view: crate::api::types::SettingsNamespaceView,
+    },
+    SettingsUpdateFailed {
+        ns: String,
+        error: ClientError,
+    },
+    SkillsListed {
+        value: crate::api::types::SkillListValue,
+    },
+    SkillsListFailed {
+        error: ClientError,
+    },
+    ExportDone {
+        bytes: u64,
+        path: std::path::PathBuf,
+    },
+    ExportProgress {
+        bytes: u64,
+    },
+    ExportFailed {
+        error: ClientError,
+    },
+    ExportCancelled,
+    // ---------- REQ-007 D-46 export page 重建兜底 ----------
+    /// Rebuild 进度（已收集 records 数）。
+    ExportRebuildProgress {
+        records: u64,
+    },
+    ExportRebuildDone {
+        path: std::path::PathBuf,
+    },
+    ExportRebuildFailed {
+        error: ClientError,
+    },
+    // ---------- REQ-007 V0.4 消息动作回执 ----------
+    MessageBranchDone {
+        session_id: String,
+    },
+    MessageActionFailed {
+        op: crate::model::MessageActionKind,
+        error: ClientError,
+    },
+    FeedbackPutDone,
+    FeedbackPutFailed {
+        error: ClientError,
+    },
 }
 
 /// Orchestration commands emitted by the reducer (executed by the run loop).
@@ -1021,6 +1242,16 @@ pub enum Cmd {
         temp_file: std::path::PathBuf,
         media_type: crate::api::types::MediaType,
     },
+    /// REQ-007 D-45 zoom：同缓存 temp_file 路径重编码，但按 `zoom` 中心裁剪
+    /// 放大（AttachmentReady 回流存 image_frame，与打开路径共用）。
+    RenderImageViewZoom {
+        session_id: SessionId,
+        attachment_id: AttachmentId,
+        block_seq: SessionSeq,
+        temp_file: std::path::PathBuf,
+        media_type: crate::api::types::MediaType,
+        zoom: f32,
+    },
     /// 系统查看器打开原图（`open`/`xdg-open` 子进程不阻塞）。
     OpenSystemViewer {
         path: std::path::PathBuf,
@@ -1057,6 +1288,95 @@ pub enum Cmd {
         request_id: String,
         op: WorkspaceOperation,
     },
+    // ---------- REQ-007 V0.4 ----------
+    /// 主题切换后持久化 config.toml（AC-007-20；ADR-010 save_theme_config，
+    /// 主循环执行同步 IO）。
+    SaveUiTheme {
+        theme: String,
+        palette: std::collections::BTreeMap<String, String>,
+    },
+    /// `:edit` 外部编辑器（main 内联：TerminalSession 释放/恢复 raw mode +
+    /// 前台运行 $EDITOR，AC-007-25）。
+    ExternalEdit {
+        tmp_path: std::path::PathBuf,
+        editor: String,
+    },
+    /// `@` 两源候选拉取（fileReferences + sessionReferenceResolver；
+    /// generation 单飞去重，AC-007-23）。
+    FetchMentionCandidates {
+        generation: u64,
+        agent_id: String,
+        query: String,
+    },
+    // ---------- REQ-007 V0.4 subagent（AC-007-07~10） ----------
+    /// `subagents/list(parentId)` 拉取（generation 单飞）。
+    FetchSubagentList {
+        parent_id: String,
+        generation: u64,
+    },
+    /// `subagents/interruptByParent`（位置参数：child/parent/mode）。
+    SubagentInterrupt {
+        child_id: String,
+        parent_id: String,
+    },
+    /// `goals/*` 写操作（agentId=活动会话，CAS revision；requestId 幂等）。
+    GoalOp {
+        request_id: String,
+        op: GoalMutation,
+    },
+    /// `settings/describe` 拉取（打开面板时一次）。
+    FetchSettingsDescribe,
+    /// `skills/list(sessionId)` 拉取。
+    FetchSkillsList,
+    /// `settings/update(ns, patch, expectedRevision)`（白名单 key 编辑 CAS）。
+    SettingsUpdate {
+        ns: String,
+        key: String,
+        value: serde_json::Value,
+        revision: u64,
+    },
+    /// 会话导出：官方同源 HTTP `/api/session.export` 流式落盘。
+    ExportSession {
+        session_id: String,
+        path: std::path::PathBuf,
+    },
+    /// REQ-007 D-46：官方导出路由不可用（404/5xx/transport）→ `session/page`
+    /// 全量 records 重建 JSONL 兜底。
+    ExportRebuild {
+        session_id: String,
+        path: std::path::PathBuf,
+        /// page 目标 address（session 或 subagent 形态，与打开会话一致）。
+        address: crate::api::types::SessionAddress,
+        /// 起始 through_seq（会话最新 seq；None = 空会话，只写 header 行）。
+        through_seq: Option<SessionSeq>,
+    },
+    // ---------- REQ-007 V0.4 消息动作（AC-007-27/28） ----------
+    /// 分支：`session/fork atSeq`（静止轮次末条 user 消息）。
+    ForkAtSeq {
+        session_id: String,
+        at_seq: u64,
+    },
+    /// feedback：`messageFeedback/put`（messageId=assistant message.id）。
+    FeedbackPut {
+        session_id: String,
+        message_id: String,
+        rating: String,
+        note: Option<String>,
+    },
+    /// REQ-007 AC-007-01：打开 subagent child 会话（follow 用 subagent
+    /// address；窗口按 child id 键控）。
+    OpenFollowSubagent {
+        parent_id: String,
+        child_id: String,
+        max_messages: usize,
+    },
+    /// REQ-007 AC-007-01/10：父→子 `subagents/prompt`（child 打开态发送）。
+    SendSubagentPrompt {
+        parent_id: String,
+        child_id: String,
+        request_id: String,
+        content: Vec<PromptContentPart>,
+    },
 }
 
 #[derive(Debug)]
@@ -1082,6 +1402,13 @@ pub struct AppState {
     pub draft: Option<DraftState>,
     /// Cross-session draft registry (memory only, LRU 20).
     pub drafts: DraftRegistry,
+    /// REQ-007 AC-007-22 / ADR-010: draft persistence switches + dirty flag.
+    /// `drafts_enabled=false` degrades to the memory registry (REQ-003
+    /// semantics); the main loop flushes on `take_draft_dirty()`.
+    pub drafts_enabled: bool,
+    /// 持久化目标路径（main 注入 `default_state_path()`）；None = 不落盘。
+    pub drafts_path: Option<std::path::PathBuf>,
+    draft_dirty: bool,
     /// Global input history (↑/↓, ≤50, memory only).
     pub history: InputHistory,
     /// 搜索 overlay + 窗口索引（随窗口重建）。
@@ -1119,6 +1446,65 @@ pub struct AppState {
     /// Details 列宽（config `[ui].details_width_cells` 注入；默认 45，
     /// clamp 30–60 由 layout 侧执行，Notes/04 §1）。
     pub details_width_cells: u16,
+    /// Effective palette（REQ-007 AC-007-20；config `[ui] theme/palette`
+    /// 注入；运行时 `:` theme 切换重绘并持久化，ADR-010）。
+    pub palette: crate::ui::theme::Palette,
+    /// User palette overrides kept on AppState (persisted on theme toggle).
+    pub palette_overrides: std::collections::BTreeMap<String, String>,
+    /// REQ-007 AC-007-21：生效 `[keymap]` 覆盖差异行（帮助面板联动；
+    /// 空 = 内置键位无覆盖）。
+    pub keymap_override_lines: Vec<String>,
+    /// REQ-007 AC-007-25：外部编辑器挂起/回填状态机（`edit with $EDITOR`）。
+    pub external_edit: crate::model::ExternalEditState,
+    /// REQ-007 AC-007-23：@ 提及候选（files+sessions 两源）。
+    pub mention: crate::model::MentionState,
+    /// REQ-007 AC-007-24：本次发送在途的图片附件（submit 预检通过后暂存；
+    /// 发送后清空）。
+    pub pending_image_attachments: Vec<crate::model::ImageAttachment>,
+    /// REQ-007 FR-007-01：subagent 目录树（AC-007-07~10）。
+    pub subagents: crate::model::SubagentViewState,
+    /// REQ-007 FR-007-02：goal 面板（单例 CAS；AC-007-11/12/14）。
+    pub goals: crate::model::GoalPanelState,
+    /// goal create/edit 输入子阶段是否激活（buffer 在 GoalPanelState）。
+    pub goal_input: bool,
+    /// REQ-007 AC-007-13：jobs 只读镜像（session/control 帧维护）。
+    pub jobs: crate::model::JobsPanelState,
+    /// REQ-007 AC-007-31：搜索 query 历史（上限 50 FIFO，最近在前）。
+    pub query_history: crate::model::SearchHistory,
+    /// REQ-007 AC-007-29：timeline 缩略条（`[ui].show_timeline` 控制）。
+    pub timeline: crate::model::TimelineState,
+    /// config `[ui].show_timeline`（默认 false）。
+    pub show_timeline: bool,
+    /// REQ-007 AC-007-27/28：消息动作菜单状态。
+    pub message_action: crate::model::MessageActionState,
+    /// 菜单目标（打开时捕获，防窗口漂移后错位）。
+    pub msg_action_target: Option<MessageActionTarget>,
+    /// REQ-007 AC-007-01：待打开的 subagent child（open_follow 用 subagent
+    /// address；由 main 消费一次后清空）。
+    pub pending_subagent_open: Option<(String, String)>,
+    /// REQ-007 AC-007-01/10：child session → parent session 映射（child
+    /// 打开时记录；composer 发送经 subagents/prompt 路由，父→子消息块可见）。
+    pub subagent_parents: std::collections::HashMap<String, String>,
+    /// REQ-007 AC-007-22 / D-49：在途发送的原始草稿全文（session → 发送前
+    /// composer 全文，含图片路径行）。成功（PromptAccepted）即弃；失败
+    /// （PromptFailed，任意类）回填注册表供手动重试——draft 仅存未发送内容、
+    /// 成功才清空。仅内存，随回执生命周期（模式 15 单飞）。
+    pub pending_prompt_texts: std::collections::HashMap<String, String>,
+    /// REQ-007 D-51：图片本地软上限（数量/单张字节）——config `[ui]`
+    /// max_image_count/max_image_bytes 注入，与官方 imageLimits 叠加双校验。
+    pub max_image_count: usize,
+    pub max_image_bytes: u64,
+    /// REQ-007 D-52：`:edit` 编辑器选择链第三级（config `[ui].editor`；
+    /// `$VISUAL`→`$EDITOR`→此项）。
+    pub editor_fallback: Option<String>,
+    /// REQ-007 AC-007-15/16：settings 面板。
+    pub settings: crate::model::SettingsPanelState,
+    /// REQ-007 AC-007-18：skills 目录。
+    pub skills: crate::model::SkillsCatalogState,
+    /// REQ-007 AC-007-17：会话导出。
+    pub export: crate::model::ExportState,
+    /// 导出取消令牌（background 下载任务每 chunk 检查；Esc 置位）。
+    pub export_cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     page_guard: PageGuard,
     /// 模型目录 fetch 单飞 generation（REQ-006 FR-006-01）：打开时自增，
     /// stale 响应（overlay 已关/已重开）直接丢弃（模式 15 in-flight 去重）。
@@ -1162,6 +1548,32 @@ pub struct AppState {
     pub pending_viewer: Option<(SessionId, SessionSeq, AttachmentId)>,
 }
 
+/// REQ-007 AC-007-24：读取本地图片文件 → base64 inline ImageAttachment。
+/// 只读真实本地文件（路径须经 image_path_lines 预筛，URL/引用不落此路径）。
+/// 失败返回稳定可断言的中文错误串。
+fn read_image_attachment(path: &str) -> Result<crate::model::ImageAttachment, String> {
+    use base64::Engine as _;
+    // `~/` 展开为 $HOME（AC-007-24 本地路径；looks_like_local_path 接受家目录形态）。
+    let expanded = if let Some(rest) = path.strip_prefix("~/") {
+        std::env::var_os("HOME")
+            .map(|h| std::path::Path::new(&h).join(rest))
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.to_string())
+    } else {
+        path.to_string()
+    };
+    let mt = crate::model::image_attachment::media_type_from_path(&expanded)?;
+    let bytes = std::fs::read(&expanded)
+        .map_err(|e| format!("图片读取失败（{expanded}）: {e}——已保留草稿，可修正后重发"))?;
+    let data_base64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    Ok(crate::model::ImageAttachment {
+        path: expanded.clone(),
+        media_type: mt,
+        data_base64,
+        bytes: bytes.len(),
+    })
+}
+
 impl Default for AppState {
     fn default() -> Self {
         Self {
@@ -1179,6 +1591,9 @@ impl Default for AppState {
             composer: ComposerState::default(),
             draft: None,
             drafts: DraftRegistry::new(20),
+            drafts_enabled: true,
+            drafts_path: None,
+            draft_dirty: false,
             history: InputHistory::new(50),
             search: SearchState::default(),
             search_index: SearchIndex::new(),
@@ -1199,6 +1614,31 @@ impl Default for AppState {
             height: 24,
             window_cap: 200,
             details_width_cells: crate::ui::layout::DEFAULT_DETAILS_WIDTH,
+            palette: crate::ui::theme::Palette::default(),
+            palette_overrides: std::collections::BTreeMap::new(),
+            keymap_override_lines: Vec::new(),
+            external_edit: crate::model::ExternalEditState::default(),
+            mention: crate::model::MentionState::default(),
+            pending_image_attachments: Vec::new(),
+            subagents: crate::model::SubagentViewState::default(),
+            goals: crate::model::GoalPanelState::default(),
+            goal_input: false,
+            jobs: crate::model::JobsPanelState::default(),
+            query_history: crate::model::SearchHistory::new(50),
+            timeline: crate::model::TimelineState::default(),
+            show_timeline: false,
+            message_action: crate::model::MessageActionState::default(),
+            msg_action_target: None,
+            pending_subagent_open: None,
+            subagent_parents: std::collections::HashMap::new(),
+            pending_prompt_texts: std::collections::HashMap::new(),
+            max_image_count: 10,
+            max_image_bytes: 20 * 1024 * 1024,
+            editor_fallback: None,
+            settings: crate::model::SettingsPanelState::default(),
+            skills: crate::model::SkillsCatalogState::default(),
+            export: crate::model::ExportState::default(),
+            export_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             page_guard: PageGuard::default(),
             catalog_generation: 0,
             want_backfill: false,
@@ -1276,6 +1716,1463 @@ impl AppState {
                 "请启动 dsh web / 检查 127.0.0.1:3080（dsh web --host 127.0.0.1 --port 3080）后重试。\n{g}\n[r] 重试  [q] 退出"
             ),
             None => String::new(),
+        }
+    }
+
+    // ---------- REQ-007 V0.4 theme (AC-007-20) ----------
+
+    /// Apply config theme + palette overrides at startup (main loop injects
+    /// `eff.ui`). Invalid overrides produce warnings (returned for the
+    /// startup banner); never fatal.
+    pub fn apply_palette_config(
+        &mut self,
+        theme: &str,
+        palette: &std::collections::BTreeMap<String, String>,
+    ) -> Vec<String> {
+        self.palette_overrides = palette.clone();
+        let built = crate::ui::theme::Palette::build(theme, palette);
+        let warnings = built.warnings.clone();
+        self.palette = built;
+        warnings
+    }
+
+    /// `:` theme toggle: flip dark↔light, rebuild with current overrides.
+    pub fn toggle_theme(&mut self) {
+        let next = if self.palette.is_light() {
+            "dark"
+        } else {
+            "light"
+        };
+        self.palette = crate::ui::theme::Palette::build(next, &self.palette_overrides);
+        self.notice = Some(format!("主题: {next}"));
+    }
+
+    // ---------- REQ-007 V0.4 draft persistence (AC-007-22/ADR-010) ----------
+
+    /// Mark the draft registry dirty so the main loop flushes drafts.toml.
+    fn mark_drafts_dirty(&mut self) {
+        if self.drafts_enabled {
+            self.draft_dirty = true;
+        }
+    }
+
+    /// Take the dirty flag (main loop polls it each iteration and flushes).
+    pub fn take_draft_dirty(&mut self) -> bool {
+        let dirty = self.draft_dirty;
+        self.draft_dirty = false;
+        dirty
+    }
+
+    /// Snapshot the registry into the on-disk DraftStore table.
+    pub fn draft_store_snapshot(&self) -> crate::model::DraftStore {
+        let mut store = crate::model::DraftStore::default();
+        for sid in self.drafts.session_ids() {
+            if let Some(d) = self.drafts.get(&sid) {
+                store.set(&sid.0, &d.text);
+            }
+        }
+        store
+    }
+
+    /// Seed the in-memory registry from a persisted DraftStore (startup /
+    /// restore). Empty store → no-op (memory semantics unchanged).
+    pub fn seed_drafts_from_store(&mut self, store: crate::model::DraftStore) {
+        for (sid, text) in store.drafts {
+            if !text.is_empty() {
+                self.drafts.set(DraftState {
+                    text,
+                    cursor: 0,
+                    bound_session: SessionId(sid),
+                });
+            }
+        }
+    }
+
+    /// Clear all persisted + in-memory drafts (startup `[drafts].clear`).
+    pub fn clear_all_drafts(&mut self) {
+        self.drafts.clear_all();
+        self.draft_dirty = true;
+    }
+
+    // ---------- REQ-007 V0.4 `:edit` 外部编辑器（AC-007-25，prototype ✅） ----------
+
+    /// 解析 `:edit` 编辑器（D-52 三级选择链）：`$VISUAL` → `$EDITOR` →
+    /// config `[ui].editor`（`self.editor_fallback`，启动注入）；皆无 → None
+    /// （调用方给可读提示，不猜测启动外部编辑器）。
+    fn resolve_editor(&self) -> Option<String> {
+        std::env::var("VISUAL")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .or_else(|| {
+                std::env::var("EDITOR")
+                    .ok()
+                    .filter(|v| !v.trim().is_empty())
+            })
+            .or_else(|| self.editor_fallback.clone())
+    }
+
+    /// 起始 `:edit`：把当前 composer 草稿写入 state 目录临时文件并挂起主循环
+    /// （返回 Cmd::ExternalEdit，main 释放 raw mode → 前台 $EDITOR → 恢复）。
+    pub fn external_edit_begin(&mut self) -> Vec<Cmd> {
+        if !self.composer.visible {
+            self.notice = Some("先打开 composer（i）再用 :edit 编辑草稿".into());
+            return vec![];
+        }
+        let Some(sid) = self.composer.active_session.clone() else {
+            self.notice = Some("无活动 composer 会话".into());
+            return vec![];
+        };
+        let draft_text = self
+            .draft
+            .as_ref()
+            .map(|d| d.text.clone())
+            .unwrap_or_default();
+        let Some(editor) = self.resolve_editor() else {
+            self.notice = Some(
+                "未设置 $VISUAL/$EDITOR 且未配置 [ui].editor（export EDITOR=vim 或 config 设置）"
+                    .into(),
+            );
+            return vec![];
+        };
+        // 临时文件放 state 目录（~/.local/state/dshtui/，与主进程同文件系统；
+        // 编辑器子进程同一进程内可见——规避 /tmp 跨调用坑，TASK-002-pitfall）。
+        let base = crate::config::default_state_path();
+        let dir = base
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            self.notice = Some(format!("无法创建 state 目录: {e}"));
+            return vec![];
+        }
+        let tmp = dir.join(format!(
+            "edit-{}-{}.md",
+            sid.0,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0)
+        ));
+        // 临时草稿可能含敏感内容：权限 0600（ADR-010 同源语义；编辑器继承写入）。
+        let write_res: std::io::Result<()> = (|| {
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                opts.mode(0o600);
+            }
+            let mut f = opts.open(&tmp)?;
+            use std::io::Write as _;
+            f.write_all(draft_text.as_bytes())?;
+            Ok(())
+        })();
+        if let Err(e) = write_res {
+            self.notice = Some(format!("临时草稿写入失败: {e}"));
+            return vec![];
+        }
+        // 挂起模型（capture 原草稿供失败恢复）+ 退 composer 模态（编辑器占用屏）。
+        if !self.external_edit.suspend(
+            &draft_text,
+            tmp.to_string_lossy().into_owned(),
+            Some(editor.clone()),
+        ) {
+            self.notice = Some("已有 :edit 在运行".into());
+            return vec![];
+        }
+        self.mode = Mode::Normal;
+        self.composer.visible = false;
+        self.composer.active_session = None;
+        vec![Cmd::ExternalEdit {
+            tmp_path: tmp,
+            editor,
+        }]
+    }
+
+    // ---------- REQ-007 V0.4 subagent 目录（AC-007-07~10；FR-007-01） ----------
+
+    /// `:subagents`：以活动会话为父打开目录并拉取直属 children。
+    pub fn open_subagents(&mut self) -> Vec<Cmd> {
+        let Some(sid) = self.active_session.clone() else {
+            self.notice = Some("请先用 f/o 打开会话再查看子代理".into());
+            return vec![];
+        };
+        self.subagents.open(&sid.0);
+        self.mode = Mode::Subagent;
+        self.fetch_subagent_list(sid.0.clone())
+    }
+
+    /// AC-007-01：打开选中 child 会话——以 child id 为活动会话 + follow 走
+    /// subagent address（main 依据 pending_subagent_open 消费）。
+    fn open_subagent_child(&mut self) -> Vec<Cmd> {
+        let Some(id) = self.subagents.selected_id() else {
+            return vec![];
+        };
+        // 立即父会话：目录根层 = panel parent_session_id；更深层 = 展开的
+        // 直属父 node（`subagents/list` 只列直属——孙代必须以其直属父为
+        // parentSessionId，AC-007-01 嵌套）。
+        let Some(parent) = self.subagents.immediate_parent_of(&id) else {
+            return vec![];
+        };
+        let child = SessionId(id.clone());
+        // 关闭面板 + 走 open_session（返回 OpenFollow/OpenControl）。
+        self.subagents.close();
+        self.mode = Mode::Normal;
+        let mut cmds = self.open_session(child);
+        // 把 OpenFollow 换成 OpenFollowSubagent（child 日志经 subagent
+        // address follow；control 对子代理不适用）。
+        self.pending_subagent_open = Some((parent.clone(), id.clone()));
+        // 记录 child→parent（发送路由用；普通会话打开会清除该 child 条目）。
+        self.subagent_parents.insert(id.clone(), parent.clone());
+        cmds.retain(|c| !matches!(c, Cmd::OpenControl { .. }));
+        for c in &mut cmds {
+            if let Cmd::OpenFollow {
+                session_id,
+                max_messages,
+            } = c
+            {
+                let sid = session_id.0.clone();
+                *c = Cmd::OpenFollowSubagent {
+                    parent_id: parent.clone(),
+                    child_id: sid,
+                    max_messages: *max_messages,
+                };
+            }
+        }
+        cmds
+    }
+
+    /// 当前活动会话是否为已打开的 subagent child（发送路由 AC-007-01）。
+    pub fn active_subagent_parent(&self) -> Option<(String, String)> {
+        let sid = self.active_session.as_ref()?.0.clone();
+        let parent = self.subagent_parents.get(&sid)?.clone();
+        Some((parent, sid))
+    }
+
+    /// 拉取 `subagents/list(parent_id)`（generation 单飞）。
+    fn fetch_subagent_list(&mut self, parent_id: String) -> Vec<Cmd> {
+        self.subagents.loading = true;
+        self.subagents.last_error_code = None;
+        let gen = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        vec![Cmd::FetchSubagentList {
+            parent_id,
+            generation: gen,
+        }]
+    }
+
+    /// 子代理目录命令分流（j/k 移动、Enter 展开/折叠、x 中断二次确认、
+    /// Esc/q 关闭）。
+    fn handle_subagent_command(&mut self, cmd: crate::input::Command) -> Vec<Cmd> {
+        use crate::input::Command as C;
+        if self.subagents.interrupt_target.is_some() {
+            // 中断二次确认态：Enter 确认、其它键取消。
+            match cmd {
+                C::PickerConfirm => {
+                    let (child, parent) = {
+                        let child = self.subagents.interrupt_target.clone().unwrap();
+                        let parent = self.subagents.parent_session_id.clone().unwrap_or_default();
+                        (child, parent)
+                    };
+                    self.subagents.interrupt_target = None;
+                    self.subagents.last_error_code = None;
+                    return vec![Cmd::SubagentInterrupt {
+                        child_id: child,
+                        parent_id: parent,
+                    }];
+                }
+                C::ClosePicker | C::PickerDown | C::PickerUp => {
+                    self.subagents.interrupt_target = None;
+                    return vec![];
+                }
+                _ => return vec![],
+            }
+        }
+        match cmd {
+            C::PickerDown => {
+                let rows = self.subagents.flatten().len();
+                if rows > 0 {
+                    self.subagents.selected = (self.subagents.selected + 1).min(rows - 1);
+                }
+                vec![]
+            }
+            C::PickerUp => {
+                self.subagents.selected = self.subagents.selected.saturating_sub(1);
+                vec![]
+            }
+            C::PickerConfirm => {
+                let Some(id) = self.subagents.selected_id() else {
+                    return vec![];
+                };
+                // 展开/折叠（has_children）→ 需要时拉取。
+                match self.subagents.toggle_expand(&id) {
+                    Some((true, target)) => self.fetch_subagent_list(target),
+                    _ => vec![],
+                }
+            }
+            C::SubagentInterrupt => {
+                let Some(id) = self.subagents.selected_id() else {
+                    return vec![];
+                };
+                // 仅可中断 continuable/running child（非根/非诊断）。
+                self.subagents.interrupt_target = Some(id);
+                self.notice = Some("中断所选子代理？Enter 确认 / 其它键取消".into());
+                vec![]
+            }
+            C::OpenSelected => self.open_subagent_child(),
+            C::ClosePicker | C::Quit => {
+                self.subagents.close();
+                self.mode = Mode::Normal;
+                vec![]
+            }
+            _ => vec![],
+        }
+    }
+
+    /// 列表回执（generation 校验：过期丢弃）。
+    pub fn subagents_listed(
+        &mut self,
+        parent_id: String,
+        catalog: crate::api::types::SubagentCatalog,
+    ) {
+        self.subagents.set_catalog(&parent_id, catalog);
+    }
+
+    pub fn subagents_list_failed(&mut self, _parent_id: String, error: &ClientError) {
+        self.subagents.loading = false;
+        self.subagents.last_error_code = Some(error.code());
+    }
+
+    /// 中断回执：成功/失败均清目标；失败展示 error.code（权限不自动重试）。
+    pub fn subagents_interrupt_done(&mut self, child_id: String, error: Option<&ClientError>) {
+        if let Some(e) = error {
+            self.subagents.last_error_code = Some(e.code());
+            self.notice = Some(format!("中断子代理 {child_id} 失败: {e}"));
+        } else {
+            // AC-007-09：成功后运行态停止——本地镜像 activity 置 inactive
+            // （官方无逐行状态投影，本地展示以回执为准；下次 list 以官方为准）。
+            self.subagents.set_activity(&child_id, "inactive");
+            self.subagents.last_error_code = None;
+            self.notice = Some(format!("已请求中断子代理 {child_id}"));
+        }
+    }
+
+    // ---------- REQ-007 V0.4 goal 面板（AC-007-11/12/14；FR-007-02 half） ----------
+
+    /// `:goal`：打开面板并读取当前活动会话 goal 投影（单例）。
+    pub fn open_goal_panel(&mut self) -> Vec<Cmd> {
+        if self.active_session.is_none() {
+            self.notice = Some("请先用 f/o 打开会话再查看 goal".into());
+            return vec![];
+        }
+        self.goals.open();
+        self.goal_input = false;
+        self.mode = Mode::Goal;
+        if self.active_window().is_none() {
+            self.goals.set_goal(None, false);
+        } else {
+            self.refresh_goal_from_projection();
+        }
+        vec![]
+    }
+
+    /// 从活动窗口 projections 读取 `goal` 投影刷新面板（ADR-008 只读，
+    /// 缺字段/Null → 空态）。
+    pub fn refresh_goal_from_projection(&mut self) {
+        // 无窗口时不做刷新（保留当前 state：stale 需等真实投影回 fresh，
+        // 空态在 open_goal_panel 已设置）。
+        let Some(window) = self.active_window() else {
+            return;
+        };
+        let snap = crate::model::ProjectionSnapshot::new(window.projections().clone());
+        match snap.goal() {
+            Some(gv) => {
+                // STALE 恢复语义：仅在投影 revision 前进过 `sent_revision`
+                // 后才解除 stale 门禁（否则重读同一缓存投影会陷入
+                // STALE→重读→STALE 循环——GOAL_STALE_REVISION 对账要求
+                // revision 单调前进，ADR-008 只读官方投影）。
+                let stale_still = self.goals.stale_revision
+                    && self
+                        .goals
+                        .sent_revision
+                        .is_some_and(|sent| gv.revision <= sent);
+                self.goals.set_goal(Some(gv), stale_still);
+            }
+            None => self.goals.set_goal(None, false),
+        }
+    }
+
+    /// goal 面板命令分流。
+    fn handle_goal_command(&mut self, cmd: crate::input::Command) -> Vec<Cmd> {
+        use crate::input::Command as C;
+        // 输入子阶段（create/edit objective）。
+        if self.goal_input {
+            match cmd {
+                C::PickerInput(t) => {
+                    self.goals.create_objective.push_str(&t);
+                    vec![]
+                }
+                C::PickerBackspace => {
+                    self.goals.create_objective.pop();
+                    vec![]
+                }
+                C::PickerConfirm => {
+                    let objective = std::mem::take(&mut self.goals.create_objective);
+                    self.goal_input = false;
+                    if objective.trim().is_empty() {
+                        self.notice = Some("goal objective 不能为空".into());
+                        return vec![];
+                    }
+                    let op = if self.goals.goal.is_none() {
+                        GoalMutation::Create {
+                            objective,
+                            max_goal_rounds: None,
+                        }
+                    } else {
+                        GoalMutation::Edit { objective }
+                    };
+                    self.send_goal_op(op)
+                }
+                C::ClosePicker | C::Quit => {
+                    self.goal_input = false;
+                    self.goals.create_objective.clear();
+                    vec![]
+                }
+                _ => vec![],
+            }
+        } else {
+            match cmd {
+                // 模态化确认（AC-007-12）：clear 二次确认提示期间，任何动作键
+                // （除 Enter 确认 / Esc 关闭）都取消确认且不发 op——防止
+                // 确认提示态下误触其它 goal 操作。
+                C::GoalCreate
+                | C::GoalEdit
+                | C::GoalPause
+                | C::GoalResume
+                | C::GoalComplete
+                | C::GoalClear
+                    if self.goals.confirm_pending.is_some() =>
+                {
+                    self.goals.cancel_confirm();
+                    self.notice = Some("已取消 clear".into());
+                    vec![]
+                }
+                C::GoalCreate => {
+                    if self.goals.goal.is_some() {
+                        self.notice = Some("已有 goal（单例）；先 clear 再重建".into());
+                        return vec![];
+                    }
+                    self.goal_input = true;
+                    self.goals.create_objective.clear();
+                    vec![]
+                }
+                C::GoalEdit => {
+                    if self.goals.goal.is_none() {
+                        return vec![];
+                    }
+                    let obj = self
+                        .goals
+                        .goal
+                        .as_ref()
+                        .map(|g| g.objective.clone())
+                        .unwrap_or_default();
+                    self.goals.create_objective = obj;
+                    self.goal_input = true;
+                    vec![]
+                }
+                C::GoalPause => self.send_goal_op(GoalMutation::Pause),
+                C::GoalResume => self.send_goal_op(GoalMutation::Resume),
+                C::GoalComplete => self.send_goal_op(GoalMutation::Complete),
+                C::GoalClear => {
+                    // clear 二次确认（ConfirmDanger 先例）。
+                    if self.goals.goal.is_none() {
+                        return vec![];
+                    }
+                    self.goals.request_confirm(crate::model::GoalOpKind::Clear);
+                    self.notice = Some("clear 当前 goal？Enter 确认 / 其它键取消".into());
+                    vec![]
+                }
+                C::PickerConfirm => {
+                    // clear 确认态。
+                    if self.goals.confirm_pending == Some(crate::model::GoalOpKind::Clear) {
+                        return self.send_goal_op(GoalMutation::Clear);
+                    }
+                    vec![]
+                }
+                C::ClosePicker | C::Quit => {
+                    self.goals.close();
+                    self.mode = Mode::Normal;
+                    vec![]
+                }
+                _ => vec![],
+            }
+        }
+    }
+
+    /// 发起 goal 写操作：CAS revision=当前投影；单飞拒绝；stale 拒绝重读。
+    fn send_goal_op(&mut self, op: GoalMutation) -> Vec<Cmd> {
+        let kind = op.op_kind();
+        if kind != crate::model::GoalOpKind::Create && self.goals.goal.is_none() {
+            return vec![];
+        }
+        // Create 走空态（goal None）。
+        if !self.goals.begin_op(kind) {
+            self.notice = Some("goal 操作在途或 revision stale——先重读投影".into());
+            return vec![];
+        }
+        let request_id = crate::api::types::mint_request_id();
+        vec![Cmd::GoalOp { request_id, op }]
+    }
+
+    /// goal 写操作成功回执（requestId 匹配才 apply）。
+    pub fn goal_op_done(
+        &mut self,
+        request_id: &str,
+        updated: Option<crate::api::types::GoalSnapshot>,
+        cleared: bool,
+    ) {
+        if !self.goal_inflight_matches(request_id) {
+            return;
+        }
+        if cleared {
+            self.goals.settle_op(None);
+            self.notice = Some("goal 已 clear".into());
+            return;
+        }
+        if let Some(snap) = updated {
+            // 回执可能带回更新后快照（宽容）；随后投影帧也会刷新。
+            self.goals.settle_op(Some(crate::model::GoalView {
+                id: snap.id,
+                revision: snap.revision,
+                objective: snap.objective,
+                phase: snap.phase,
+                blocked_reason: snap.blocked_reason,
+                max_goal_rounds: snap.max_goal_rounds,
+                ..Default::default()
+            }));
+            self.notice = Some(format!("goal {}", snap.phase.map(|_| "更新").unwrap_or("")));
+        } else {
+            self.goals.settle_op(None);
+            self.refresh_goal_from_projection();
+        }
+    }
+
+    fn goal_inflight_matches(&self, _request_id: &str) -> bool {
+        // goal 单例串行：begin_op 保证 ≤1 在途，任一在途回执即当前 op
+        // （无列表并发，requestId 槽冗余）。
+        self.goals.inflight.is_some()
+    }
+
+    /// goal 写操作失败：GOAL_STALE_REVISION → stale 重读；其它 error.code
+    /// 展示，权限不自动重试。
+    pub fn goal_op_failed(&mut self, request_id: &str, op: &GoalMutation, error: &ClientError) {
+        if !self.goal_inflight_matches(request_id) {
+            return;
+        }
+        let stale = error.code().contains("STALE") || error.code().contains("CONFLICT");
+        self.goals.fail_op(error.code(), stale);
+        if stale {
+            self.notice = Some("goal revision 过期——已重读投影，可重试".into());
+            self.refresh_goal_from_projection();
+        } else {
+            self.notice = Some(format!("goal {} 失败: {error}", op.op_kind().as_str()));
+        }
+    }
+
+    // ---------- REQ-007 V0.4 jobs 只读（AC-007-13） ----------
+
+    pub fn open_jobs_panel(&mut self) -> Vec<Cmd> {
+        self.jobs.open();
+        self.mode = Mode::Jobs;
+        vec![]
+    }
+
+    fn handle_jobs_command(&mut self, cmd: crate::input::Command) -> Vec<Cmd> {
+        use crate::input::Command as C;
+        match cmd {
+            C::PickerDown => {
+                self.jobs.move_selection(1);
+                vec![]
+            }
+            C::PickerUp => {
+                self.jobs.move_selection(-1);
+                vec![]
+            }
+            C::ClosePicker | C::Quit => {
+                self.jobs.close();
+                self.mode = Mode::Normal;
+                vec![]
+            }
+            _ => vec![],
+        }
+    }
+
+    /// 从 control 帧更新 jobs 镜像（全量替换语义：baseline.jobs / `jobs`
+    /// 替换帧；空数组清镜像——不伪造数字，ADR-008）。
+    pub fn jobs_control_item(&mut self, session_id: &SessionId, item: &ControlItem) {
+        match item {
+            ControlItem::Baseline { jobs, .. } => {
+                let jobs = crate::api::session::parse_jobs(jobs);
+                if !jobs.is_empty() {
+                    self.jobs.replace(jobs);
+                } else if self.jobs.visible {
+                    // baseline 无 jobs（未运行）→ 面板仍显示空态。
+                    self.jobs.replace(Vec::new());
+                }
+                let _ = session_id;
+            }
+            ControlItem::Jobs { jobs } => {
+                self.jobs.replace(crate::api::session::parse_jobs(jobs));
+            }
+            _ => {}
+        }
+    }
+
+    // ---------- REQ-007 V0.4 settings + skills（AC-007-15~19） ----------
+
+    /// 白名单可编辑 key 集（镜像 web UI；描述树只读展示其余标量）。
+    pub const SETTINGS_WHITELIST: [&'static str; 7] = [
+        "locale.preference",
+        "ui-theme.preference",
+        "ui-theme.fontSize",
+        "ui-chat.transcriptView",
+        "ui-conversation.busyEnter",
+        "agent-presets.default",
+        "permission.defaultPreset",
+    ];
+
+    /// 风险 key（属可改集但改动影响权限/安全默认 → 提交前二次确认，
+    /// AC-007-16）。`permission.defaultPreset` 控制后续工具调用的默认审批
+    /// 预设，误改会改变权限行为。
+    pub const SETTINGS_RISK_KEYS: [&'static str; 1] = ["permission.defaultPreset"];
+
+    pub fn is_settings_risk_key(key: &str) -> bool {
+        Self::SETTINGS_RISK_KEYS.contains(&key)
+    }
+
+    pub fn open_settings_panel(&mut self) -> Vec<Cmd> {
+        self.settings.open();
+        self.mode = Mode::Settings;
+        vec![Cmd::FetchSettingsDescribe]
+    }
+
+    pub fn settings_described(&mut self, value: crate::api::types::SettingsDescribeValue) {
+        let mut rows = Vec::new();
+        for ns in &value.namespaces {
+            let user = ns.user.as_ref();
+            rows.extend(crate::model::flatten_namespace_rows(
+                &ns.ns,
+                &ns.value,
+                user,
+                &ns.secrets,
+                ns.revision,
+                &Self::SETTINGS_WHITELIST,
+            ));
+        }
+        self.settings.set_rows(rows, value.writable);
+    }
+
+    pub fn settings_describe_failed(&mut self, error: &ClientError) {
+        self.settings.loading = false;
+        self.settings.last_error_code = Some(error.code());
+    }
+
+    pub fn settings_updated(
+        &mut self,
+        _ns: &str,
+        _view: &crate::api::types::SettingsNamespaceView,
+    ) {
+        self.settings.edit_key = None;
+        self.settings.edit_buffer.clear();
+        self.notice = Some("settings 已更新（expectedRevision CAS）".into());
+        // 重新 describe 拉新 revision（视图刷新）。
+        self.settings.loading = true;
+    }
+
+    pub fn settings_update_failed(&mut self, _ns: &str, error: &ClientError) {
+        self.settings.last_error_code = Some(error.code());
+        self.notice = Some(format!("settings 更新失败: {error}"));
+        // CAS 冲突：清编辑态要求重拉 describe（不自动重试）。
+        if error.code().contains("CONFLICT") || error.code().contains("STALE") {
+            self.settings.edit_key = None;
+        }
+    }
+
+    /// settings 面板命令分流：编辑子阶段（Enter 提交/字符/Backspace/Esc）；
+    /// 列表态 j/k 移动、Enter 进编辑、Esc/q 关闭。
+    fn handle_settings_command(&mut self, cmd: crate::input::Command) -> Vec<Cmd> {
+        use crate::input::Command as C;
+        if self.settings.edit_key.is_some() {
+            match cmd {
+                C::PickerInput(t) => {
+                    self.settings.edit_buffer.push_str(&t);
+                    vec![]
+                }
+                C::PickerBackspace => {
+                    self.settings.edit_buffer.pop();
+                    vec![]
+                }
+                C::PickerConfirm => {
+                    let (ns, key, value, rev) = {
+                        let row = self
+                            .settings
+                            .rows
+                            .iter()
+                            .find(|r| Some(r.key.as_str()) == self.settings.edit_key.as_deref())
+                            .cloned();
+                        let Some(row) = row else {
+                            return vec![];
+                        };
+                        let mut parts = row.key.splitn(2, '.');
+                        let ns = parts.next().unwrap_or("").to_string();
+                        let key = parts.next().unwrap_or("").to_string();
+                        // 按原值类型回灌编辑文本（bool/number/string，AC-007-16）。
+                        let value = row
+                            .original
+                            .as_ref()
+                            .map(|orig| crate::model::coerce_edit(orig, &self.settings.edit_buffer))
+                            .unwrap_or_else(|| {
+                                serde_json::Value::String(self.settings.edit_buffer.clone())
+                            });
+                        (ns, key, value, row.revision)
+                    };
+                    self.settings.edit_key = None;
+                    self.settings.edit_buffer.clear();
+                    vec![Cmd::SettingsUpdate {
+                        ns,
+                        key,
+                        value,
+                        revision: rev,
+                    }]
+                }
+                C::ClosePicker | C::Quit => {
+                    self.settings.edit_key = None;
+                    self.settings.edit_buffer.clear();
+                    vec![]
+                }
+                _ => vec![],
+            }
+        } else {
+            match cmd {
+                // 风险确认态（模态，AC-007-16）：Enter 确认进编辑；Esc 或
+                // 其它动作键取消确认。
+                C::PickerDown | C::PickerUp if self.settings.risk_confirm.is_some() => {
+                    self.settings.risk_confirm = None;
+                    self.notice = Some("已取消风险 key 编辑".into());
+                    vec![]
+                }
+                C::PickerDown => {
+                    self.settings.move_selection(1);
+                    vec![]
+                }
+                C::PickerUp => {
+                    self.settings.move_selection(-1);
+                    vec![]
+                }
+                C::PickerConfirm => {
+                    // 风险确认态：Enter 二次确认 → 进编辑。
+                    if let Some(key) = self.settings.risk_confirm.clone() {
+                        self.settings.risk_confirm = None;
+                        if let Some(row) = self.settings.rows.iter().find(|r| r.key == key) {
+                            self.settings.edit_key = Some(row.key.clone());
+                            self.settings.edit_buffer = row.value_display.clone();
+                        }
+                        return vec![];
+                    }
+                    let Some(row) = self.settings.rows.get(self.settings.selected).cloned() else {
+                        return vec![];
+                    };
+                    if !self.settings.writable || row.secret {
+                        self.notice = Some("该 key 只读展示（白名单外/secret 不可编辑）".into());
+                        return vec![];
+                    }
+                    // AC-007-16：风险 key（如 permission.defaultPreset）先二次
+                    // 确认再进编辑（Enter 确认 / 其它键取消）。
+                    if Self::is_settings_risk_key(&row.key) {
+                        self.settings.risk_confirm = Some(row.key.clone());
+                        self.notice = Some(format!(
+                            "{} 是风险 key（影响权限默认）——Enter 继续编辑 / Esc 取消",
+                            row.key
+                        ));
+                        return vec![];
+                    }
+                    self.settings.edit_key = Some(row.key);
+                    self.settings.edit_buffer = row.value_display.clone();
+                    vec![]
+                }
+                C::ClosePicker | C::Quit => {
+                    if self.settings.risk_confirm.is_some() {
+                        // 取消风险确认。
+                        self.settings.risk_confirm = None;
+                        return vec![];
+                    }
+                    self.settings.close();
+                    self.mode = Mode::Normal;
+                    vec![]
+                }
+                _ => {
+                    // 风险确认态：除 Enter/Esc 外的动作键 = 取消确认（模态）。
+                    if self.settings.risk_confirm.is_some() {
+                        self.settings.risk_confirm = None;
+                        self.notice = Some("已取消风险 key 编辑".into());
+                    }
+                    vec![]
+                }
+            }
+        }
+    }
+
+    pub fn open_skills_panel(&mut self) -> Vec<Cmd> {
+        self.skills.open();
+        self.mode = Mode::Skills;
+        vec![Cmd::FetchSkillsList]
+    }
+
+    pub fn skills_listed(&mut self, value: crate::api::types::SkillListValue) {
+        self.skills.set_items(value.skills);
+    }
+
+    pub fn skills_list_failed(&mut self, error: &ClientError) {
+        self.skills.loading = false;
+        self.skills.last_error_code = Some(error.code());
+    }
+
+    /// skills 面板命令分流：j/k 移动、y 复制引用、Esc/q 关闭。
+    fn handle_skills_command(&mut self, cmd: crate::input::Command) -> Vec<Cmd> {
+        use crate::input::Command as C;
+        match cmd {
+            C::PickerDown => {
+                self.skills.move_selection(1);
+                vec![]
+            }
+            C::PickerUp => {
+                self.skills.move_selection(-1);
+                vec![]
+            }
+            C::YankContext => {
+                if let Some(ref_text) = self.skills.copy_ref() {
+                    self.notice = Some(format!("已复制 {ref_text}（执行走 / 斜杠入口）"));
+                    vec![Cmd::CopyToClipboard { text: ref_text }]
+                } else {
+                    vec![]
+                }
+            }
+            C::ClosePicker | C::Quit => {
+                self.skills.close();
+                self.mode = Mode::Normal;
+                vec![]
+            }
+            _ => vec![],
+        }
+    }
+
+    // ---------- REQ-007 V0.4 会话导出（AC-007-17；官方 HTTP 路由） ----------
+
+    pub fn open_export_panel(&mut self) -> Vec<Cmd> {
+        let Some(sid) = self.active_session.clone() else {
+            self.notice = Some("请先用 f/o 打开会话再导出".into());
+            return vec![];
+        };
+        let default = format!("dshtui-export-{}.zip", sid.0);
+        self.export.open(&sid.0, &default);
+        self.mode = Mode::Export;
+        vec![]
+    }
+
+    fn handle_export_command(&mut self, cmd: crate::input::Command) -> Vec<Cmd> {
+        use crate::input::Command as C;
+        match cmd {
+            C::PickerInput(t) => {
+                if self.export.phase == crate::model::export::ExportPhase::PickingPath {
+                    self.export.path.push_str(&t);
+                }
+                vec![]
+            }
+            C::PickerBackspace => {
+                if self.export.phase == crate::model::export::ExportPhase::PickingPath {
+                    self.export.path.pop();
+                }
+                vec![]
+            }
+            C::PickerConfirm => {
+                if !self.export.begin_download() {
+                    self.notice = Some("路径为空或在途".into());
+                    return vec![];
+                }
+                let Some(sid) = self.export.session_id.clone() else {
+                    return vec![];
+                };
+                let path = std::path::PathBuf::from(self.export.path.clone());
+                vec![Cmd::ExportSession {
+                    session_id: sid,
+                    path,
+                }]
+            }
+            C::ClosePicker | C::Quit => {
+                if self.export.phase == crate::model::export::ExportPhase::Downloading
+                    || self.export.phase == crate::model::export::ExportPhase::Rebuilding
+                {
+                    // 请求取消：置位令牌（background 任务每 chunk/每页检查并
+                    // 清理临时文件 → ExportCancelled 回执后才收面板）。
+                    self.export_cancel
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    self.export.cancelled = true;
+                    self.notice = Some("正在取消导出…".into());
+                    return vec![];
+                }
+                self.export.close();
+                self.mode = Mode::Normal;
+                vec![]
+            }
+            _ => vec![],
+        }
+    }
+
+    pub fn export_done(&mut self, bytes: u64, path: &std::path::Path) {
+        self.export.mark_progress(bytes);
+        self.export.finish();
+        self.notice = Some(format!("导出完成: {}（{} 字节）", path.display(), bytes));
+    }
+
+    pub fn export_progress(&mut self, bytes: u64) {
+        self.export.mark_progress(bytes);
+    }
+
+    /// 用户取消导出：background 任务已清理临时文件 → 状态机安全回 Idle
+    /// （AC-007-17 取消不留半成品；幂等可重试）。Rebuilding 阶段复用同回执。
+    pub fn export_cancelled(&mut self) {
+        self.export_cancel
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        self.export.close();
+        self.mode = Mode::Normal;
+        self.notice = Some("导出已取消（临时文件已清理）".into());
+    }
+
+    /// D-46：导出失败分类分流（返回可执行 Cmd，如 page 重建兜底）。
+    ///
+    /// - 401/403（HttpStatus）或权限类 Remote → Failed 展示 error.code、
+    ///   不降级不自动重试；
+    /// - 404/5xx/transport（官方路由不可用）→ 自动转 Rebuilding 并 emit
+    ///   `Cmd::ExportRebuild`（仅当状态机在 Downloading/Failed 可进入时）；
+    /// - 其它 → Failed。
+    pub fn export_failed(&mut self, error: &ClientError) -> Vec<Cmd> {
+        self.export_cancel
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        let code = error.code();
+        let class = error.class();
+        let is_permission = class == crate::api::envelope::ErrorClass::PermissionDenied
+            || error.http_status().is_some_and(|s| s == 401 || s == 403);
+        // 官方路由不可用（404/5xx/transport 而非权限）→ 可走 page 重建兜底。
+        let route_unavailable = error.http_status().is_some_and(|s| s == 404 || s >= 500)
+            || class == crate::api::envelope::ErrorClass::Retryable;
+        if is_permission || !route_unavailable {
+            self.export.fail(code.clone());
+            self.notice = Some(format!("导出失败: {error}"));
+            if is_permission {
+                tracing::error!(error = %error, "导出权限不足");
+            }
+            return vec![];
+        }
+        // 404/5xx/transport：自动转 Rebuilding（D-46 硬性契约；页面只读提示）。
+        if self.export.begin_rebuild() {
+            let Some(sid) = self.export.session_id.clone() else {
+                self.export.fail(code.clone());
+                return vec![];
+            };
+            let path = std::path::PathBuf::from(self.export.path.clone());
+            let address = self.export_address(&sid);
+            let through_seq = self.session_latest_seq(&sid);
+            self.notice = Some("官方导出路由不可用，改用本地重建（session/page）…".into());
+            vec![Cmd::ExportRebuild {
+                session_id: sid,
+                path,
+                address,
+                through_seq,
+            }]
+        } else {
+            self.export.fail(code.clone());
+            self.notice = Some(format!("导出失败: {error}"));
+            vec![]
+        }
+    }
+
+    /// D-46：export 目标会话的 page address（子代理 child 用 subagent
+    /// address——与打开会话一致）。
+    fn export_address(&self, session_id: &str) -> crate::api::types::SessionAddress {
+        match self.subagent_parents.get(session_id) {
+            Some(parent) => {
+                crate::api::types::SessionAddress::subagent(parent, session_id, "continuable")
+            }
+            None => crate::api::types::SessionAddress::session(session_id),
+        }
+    }
+
+    /// D-46：目标会话「最新 seq」（page through_seq 锚点）：优先 follow
+    /// 游标（SessionLogOffset），其次窗口尾 seq；都没有 = 空/未加载 → None
+    /// （重建只写 header，防通过 seq 误伤）。
+    fn session_latest_seq(&self, session_id: &str) -> Option<SessionSeq> {
+        let w = self.sessions.get(session_id)?;
+        w.cursor().map(|c| SessionSeq(c.0)).or_else(|| w.tail_seq())
+    }
+
+    /// D-46：重建进度（已收集 records 数）。
+    pub fn export_rebuild_progress(&mut self, records: u64) {
+        self.export.mark_rebuild_progress(records);
+    }
+
+    /// D-46：重建完成。
+    pub fn export_rebuild_done(&mut self, path: &std::path::Path) {
+        self.export_cancel
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        self.export.finish();
+        self.notice = Some(format!(
+            "导出完成（本地重建）: {}（{} 条 records）",
+            path.display(),
+            self.export.records_collected
+        ));
+    }
+
+    /// D-46：重建失败 → Failed（不再次触发兜底，防循环）；权限不自动重试。
+    pub fn export_rebuild_failed(&mut self, error: &ClientError) {
+        self.export_cancel
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        let code = error.code();
+        self.export.fail(code);
+        self.notice = Some(format!("导出重建失败: {error}"));
+        if error.class() == crate::api::envelope::ErrorClass::PermissionDenied {
+            tracing::error!(error = %error, "导出重建权限不足");
+        }
+    }
+
+    // ---------- REQ-007 V0.4 消息动作（AC-007-27/28） ----------
+
+    /// Normal 模式 `m`：以 cursor_block 为锚打开动作菜单。
+    pub fn open_message_actions(&mut self) -> Vec<Cmd> {
+        let Some(sid) = self.active_session.clone() else {
+            self.notice = Some("无活动会话".into());
+            return vec![];
+        };
+        let Some(window) = self.active_window() else {
+            return vec![];
+        };
+        let blocks = window.block_snapshot();
+        let Some(block) = blocks.get(self.cursor_block) else {
+            return vec![];
+        };
+        let seq = block.seq().0;
+        let running = self.active_running();
+        // 是否为「静止轮次末条 user」：cursor 块是 user 且其后无 user。
+        let is_last_user = match block {
+            crate::model::Block::UserMessage { .. } => blocks[self.cursor_block + 1..]
+                .iter()
+                .all(|b| !matches!(b, crate::model::Block::UserMessage { .. })),
+            _ => false,
+        };
+        let (kind, user_text, message_id) = match block {
+            crate::model::Block::UserMessage { content, .. } => {
+                (MsgTargetKind::User, Some(content.clone()), None)
+            }
+            crate::model::Block::AssistantMessage { message_id, .. } => {
+                (MsgTargetKind::Assistant, None, message_id.clone())
+            }
+            _ => {
+                self.notice = Some("该消息行不支持动作（仅 user/assistant 消息）".into());
+                return vec![];
+            }
+        };
+        self.message_action.open_menu(seq);
+        self.msg_action_target = Some(MessageActionTarget {
+            session_id: sid,
+            seq,
+            kind,
+            user_text,
+            message_id,
+            running,
+            is_last_user,
+        });
+        self.mode = Mode::MessageAction;
+        vec![]
+    }
+
+    /// 菜单可用动作（据目标块 + wire 语义）：assistant → feedback±；
+    /// user → retry（重发）+ branch（仅静止轮次末条）。
+    fn msg_available_actions(&self) -> Vec<crate::model::MessageActionKind> {
+        use crate::model::MessageActionKind as K;
+        let Some(t) = &self.msg_action_target else {
+            return vec![];
+        };
+        match t.kind {
+            MsgTargetKind::Assistant => {
+                if t.message_id.is_some() {
+                    vec![K::FeedbackPositive, K::FeedbackNegative]
+                } else {
+                    vec![]
+                }
+            }
+            MsgTargetKind::User => {
+                let mut v = vec![K::Retry];
+                if t.is_last_user && !t.running {
+                    v.push(K::Branch);
+                }
+                v
+            }
+        }
+    }
+
+    fn handle_message_action_command(&mut self, cmd: crate::input::Command) -> Vec<Cmd> {
+        use crate::input::Command as C;
+        match cmd {
+            C::PickerDown | C::PickerUp => {
+                if self.message_action.confirm_running {
+                    // 二次确认态锁定动作，忽略光标移动。
+                    return vec![];
+                }
+                let n = self.msg_available_actions().len();
+                if n == 0 {
+                    return vec![];
+                }
+                if cmd == C::PickerDown {
+                    self.message_action.menu_cursor =
+                        (self.message_action.menu_cursor + 1).min(n - 1);
+                } else {
+                    self.message_action.menu_cursor =
+                        self.message_action.menu_cursor.saturating_sub(1);
+                }
+                vec![]
+            }
+            C::PickerConfirm => {
+                let Some(action) = self
+                    .msg_available_actions()
+                    .get(self.message_action.menu_cursor)
+                    .copied()
+                else {
+                    return vec![];
+                };
+                let Some(target) = self.msg_action_target.clone() else {
+                    return vec![];
+                };
+                // 二次确认态：Enter = 确认执行之前选中的动作（AC-007-28）。
+                if self.message_action.confirm_running {
+                    if self.message_action.confirm(action) {
+                        return self.execute_message_action(action, &target);
+                    }
+                    return vec![];
+                }
+                // 单飞：running 目标先置二次确认；静态直接执行。
+                if !self.message_action.begin(action, target.running) {
+                    return vec![];
+                }
+                if self.message_action.confirm_running {
+                    self.notice = Some("该轮正在运行——Enter 确认执行 / 其它键取消".into());
+                    return vec![];
+                }
+                self.execute_message_action(action, &target)
+            }
+            C::ClosePicker | C::Quit => {
+                if self.message_action.confirm_running {
+                    self.message_action.fail("cancelled".into());
+                }
+                self.message_action.settle();
+                self.msg_action_target = None;
+                self.mode = Mode::Normal;
+                vec![]
+            }
+            _ => vec![],
+        }
+    }
+
+    fn execute_message_action(
+        &mut self,
+        action: crate::model::MessageActionKind,
+        target: &MessageActionTarget,
+    ) -> Vec<Cmd> {
+        match action {
+            crate::model::MessageActionKind::Branch => {
+                self.message_action.clear_pending_rating();
+                self.message_action.settle();
+                self.msg_action_target = None;
+                self.mode = Mode::Normal;
+                vec![Cmd::ForkAtSeq {
+                    session_id: target.session_id.0.clone(),
+                    at_seq: target.seq,
+                }]
+            }
+            crate::model::MessageActionKind::Retry => {
+                self.message_action.clear_pending_rating();
+                let Some(text) = target.user_text.clone() else {
+                    self.message_action.fail("no-user-text".into());
+                    return vec![];
+                };
+                if text.trim().is_empty() {
+                    self.message_action.fail("empty".into());
+                    return vec![];
+                }
+                self.message_action.settle();
+                self.msg_action_target = None;
+                self.mode = Mode::Normal;
+                // 乐观回显 + 重发 prompt（新 requestId，wire 校正：retry=重发）。
+                let request_id = SessionRequestId(crate::api::types::mint_request_id());
+                let sid = target.session_id.clone();
+                self.sessions
+                    .touch(&sid.0, self.window_cap)
+                    .echo(request_id.clone(), &text);
+                self.notice = Some("已重发该消息（retry）".into());
+                let request = PromptRequest {
+                    request_id,
+                    session_id: sid.clone(),
+                    mode: PromptMode::Queue,
+                    content: vec![PromptContentPart::Text { text }],
+                    client_time_zone: None,
+                };
+                vec![Cmd::SendPrompt {
+                    session_id: sid,
+                    request,
+                }]
+            }
+            kind @ (crate::model::MessageActionKind::FeedbackPositive
+            | crate::model::MessageActionKind::FeedbackNegative) => {
+                let Some(mid) = target.message_id.clone() else {
+                    self.message_action.fail("no-message-id".into());
+                    return vec![];
+                };
+                self.message_action.settle();
+                self.msg_action_target = None;
+                self.mode = Mode::Normal;
+                let rating = if kind == crate::model::MessageActionKind::FeedbackPositive {
+                    "positive"
+                } else {
+                    "negative"
+                };
+                // D-50：提交前登记在途 rating（回执分类用；菜单已 settle）。
+                self.message_action.set_pending_rating(rating.to_string());
+                vec![Cmd::FeedbackPut {
+                    session_id: target.session_id.0.clone(),
+                    message_id: mid,
+                    rating: rating.to_string(),
+                    note: None,
+                }]
+            }
+        }
+    }
+
+    // ---- 回执 ----
+    pub fn message_branch_done(&mut self, session_id: String) -> Vec<Cmd> {
+        self.notice = Some(format!("已创建分支会话 {session_id}"));
+        self.list_loaded = false;
+        let mut cmds = vec![Cmd::LoadSessionList { cursor: None }];
+        cmds.extend(self.open_session(SessionId(session_id)));
+        cmds
+    }
+
+    pub fn message_action_failed(
+        &mut self,
+        op: crate::model::MessageActionKind,
+        error: &ClientError,
+    ) {
+        self.message_action.fail(error.code());
+        self.notice = Some(format!("{} 失败: {error}", op.as_str()));
+    }
+
+    pub fn feedback_put_done(&mut self) {
+        self.message_action.clear_pending_rating();
+        if self.message_action.feedback_marked.is_some() {
+            // D-50：本地标记的补交成功 → 清除标记（端点恢复）。
+            self.message_action.clear_feedback_local();
+            self.notice = Some("feedback 已提交（补交成功，本地标记清除）".into());
+        } else {
+            self.notice = Some("feedback 已提交".into());
+        }
+    }
+
+    /// D-50：feedback 提交失败分类——权限（401/403）→ 展示 error.code 不自动
+    /// 重试；端点不可用（transport/5xx/404）→ 本地降级标记（仅内存、不提交、
+    /// 不崩不重试）；其它业务错误 → 展示。
+    pub fn feedback_put_failed(&mut self, error: &ClientError) {
+        use crate::api::envelope::ErrorClass as EC;
+        let rating = self.message_action.pending_rating.take();
+        let class = error.class();
+        let endpoint_unavailable =
+            class == EC::Retryable || error.http_status().is_some_and(|s| s == 404 || s >= 500);
+        if class == EC::PermissionDenied {
+            self.message_action.fail(error.code());
+            self.notice = Some(format!("feedback 提交失败（无权限，不自动重试）: {error}"));
+            tracing::error!(error = %error, "feedback 权限不足");
+            return;
+        }
+        if endpoint_unavailable {
+            if let Some(rating) = rating {
+                self.message_action.mark_feedback_local(rating);
+            }
+            self.notice =
+                Some("feedback 端点不可用——已本地记录（未提交），恢复后可经官方 web 补交".into());
+            tracing::warn!(error = %error, "feedback 端点不可用，本地降级标记");
+            return;
+        }
+        self.message_action.fail(error.code());
+        self.notice = Some(format!("feedback 提交失败: {error}"));
+    }
+
+    // ---------- REQ-007 V0.4 @ 提及（AC-007-23；model/mention + api/references） ----------
+
+    /// `@` 词边界判定：@ 前是空或空白（不在路径/单词中间）。
+    fn mention_boundary(draft: &str) -> bool {
+        draft
+            .chars()
+            .last()
+            .map(|c| c.is_whitespace())
+            .unwrap_or(true)
+    }
+
+    /// INSERT 输入 '@' → 激活提及（仅当词边界）。返回激活伴随的拉取命令
+    /// （空 = 未激活）。
+    pub fn maybe_activate_mention(&mut self) -> Vec<Cmd> {
+        if self.mention.active {
+            return vec![];
+        }
+        let boundary = self
+            .draft
+            .as_ref()
+            .map(|d| Self::mention_boundary(&d.text))
+            .unwrap_or(true);
+        if !boundary {
+            return vec![];
+        }
+        self.mention.activate();
+        self.mode = Mode::Mention;
+        self.request_mention_fetch()
+    }
+
+    /// 提及模态命令分流（模式接管：字符进 query、j/k 移动、Enter 回填、
+    /// Esc/q 关闭、Backspace）。
+    fn handle_mention_command(&mut self, cmd: crate::input::Command) -> Option<Vec<Cmd>> {
+        use crate::input::Command as C;
+        match cmd {
+            C::PickerInput(text) => {
+                let q = format!("{}{}", self.mention.query, text);
+                self.mention.set_query(q);
+                Some(self.request_mention_fetch())
+            }
+            C::PickerBackspace => {
+                self.mention.query.pop();
+                Some(self.request_mention_fetch())
+            }
+            C::PickerDown => {
+                self.mention.move_selection(1);
+                Some(vec![])
+            }
+            C::PickerUp => {
+                self.mention.move_selection(-1);
+                Some(vec![])
+            }
+            C::PickerConfirm => {
+                let candidate: Option<crate::model::MentionCandidate> = {
+                    let rows = self.mention.filtered();
+                    rows.get(self.mention.selected).map(|c| (*c).clone())
+                };
+                let Some(candidate) = candidate else {
+                    self.mention.deactivate();
+                    self.mode = Mode::Insert;
+                    return Some(vec![]);
+                };
+                self.mention.deactivate();
+                self.mode = Mode::Insert;
+                if let Some(d) = self.draft.as_mut() {
+                    if !d.text.is_empty() && !d.text.ends_with(' ') && !d.text.ends_with('@') {
+                        d.text.push(' ');
+                    }
+                    d.text.push_str(&candidate.insert);
+                    if !d.text.ends_with(' ') {
+                        d.text.push(' ');
+                    }
+                    d.cursor = d.text.chars().count();
+                }
+                self.notice = Some(format!("@ 已插入: {}", candidate.insert));
+                Some(vec![])
+            }
+            C::ClosePicker => {
+                self.mention.deactivate();
+                self.mode = Mode::Insert;
+                Some(vec![])
+            }
+            // 其它命令：关闭提及落回 INSERT，交由主 match 继续（返回 None）。
+            _ => None,
+        }
+    }
+
+    /// 请求两源候选（generation 单飞；active_session 为 agentId）。
+    fn request_mention_fetch(&mut self) -> Vec<Cmd> {
+        let Some(sid) = self.composer.active_session.clone() else {
+            return vec![];
+        };
+        let query = self.mention.query.clone();
+        self.mention.mark_loading();
+        let gen = self.mention.generation;
+        vec![Cmd::FetchMentionCandidates {
+            generation: gen,
+            agent_id: sid.0.clone(),
+            query,
+        }]
+    }
+
+    /// 两源结果回填（stale 丢弃）。
+    pub fn mention_candidates(
+        &mut self,
+        generation: u64,
+        files: Vec<crate::api::types::FileReferenceCandidate>,
+        sessions: Vec<crate::api::types::SessionReferenceMentionCandidate>,
+    ) {
+        self.mention.set_candidates(generation, files, sessions);
+    }
+
+    pub fn mention_candidates_failed(&mut self, generation: u64, error: &ClientError) {
+        if generation == self.mention.generation {
+            self.mention.fail(error.code());
+        }
+    }
+
+    /// 编辑器退出回执：成功 → 回填 composer 并恢复 INSERT；失败 → 保留原草稿
+    /// 安全回 composer（可读错误）。
+    pub fn external_edit_done(
+        &mut self,
+        ok: bool,
+        tmp_path: &std::path::Path,
+        text: &str,
+        message: &str,
+    ) {
+        let _ = std::fs::remove_file(tmp_path); // 会话内清理临时文件
+        let sid = self
+            .draft
+            .as_ref()
+            .map(|d| d.bound_session.clone())
+            .or_else(|| self.composer.active_session.clone());
+        if ok {
+            self.external_edit.settle();
+            self.draft = Some(DraftState {
+                text: text.to_string(),
+                cursor: text.chars().count(),
+                bound_session: sid.unwrap_or_else(|| SessionId(String::new())),
+            });
+            self.mode = Mode::Insert;
+            self.composer.visible = true;
+            self.composer.active_session = self.draft.as_ref().map(|d| d.bound_session.clone());
+            self.notice = Some("外部编辑器内容已回填 composer".into());
+        } else {
+            self.external_edit.fail(message.to_string());
+            // 保留原草稿（suspended_text 为空则新空草稿），恢复 INSERT。
+            let restored = self.external_edit.suspended_text.clone();
+            if let Some(sid) = sid {
+                self.draft = Some(DraftState {
+                    text: restored,
+                    cursor: 0,
+                    bound_session: sid,
+                });
+                self.mode = Mode::Insert;
+                self.composer.visible = true;
+                self.composer.active_session = self.draft.as_ref().map(|d| d.bound_session.clone());
+            }
+            self.last_error = Some(format!(":edit 失败: {message}"));
         }
     }
 
@@ -1364,6 +3261,16 @@ impl AppState {
                 // 无 TUI 切换入口 D-037）。逐快照刷新：最新投影为准。
                 if let Some(p) = projections.as_ref() {
                     self.approval.policy_display = crate::api::approval::policy_hint(p);
+                }
+                // REQ-007：goal 投影逐快照刷新（面板打开时实时；ADR-008
+                // 只读官方 goal）。
+                if self.mode == Mode::Goal
+                    && self
+                        .active_session
+                        .as_ref()
+                        .is_some_and(|s| s == &session_id)
+                {
+                    self.refresh_goal_from_projection();
                 }
                 if running {
                     self.running_sessions.insert(session_id.clone());
@@ -1496,6 +3403,9 @@ impl AppState {
                 // The success receipt only ends this command's state; the
                 // pending echo is retired solely by durable follow events
                 // (official source of truth, AC-002-06).
+                // D-49：发送成功 → 弃在途草稿登记（注册表已在 submit 清空，
+                // 无需再清；失败才恢复）。
+                self.pending_prompt_texts.remove(&session_id.0);
                 tracing::debug!(%session_id, %request_id, "session/prompt accepted");
                 vec![]
             }
@@ -1509,20 +3419,49 @@ impl AppState {
                 if let Some(w) = self.sessions.get_mut(&session_id.0) {
                     w.fail_echo(&request_id, &code, &message);
                 }
-                // AC-003-16: steer 不被接受（轮次已结束/agent 非运行）→ 状态条
-                // 提示 + 草稿保留（回显文本放回注册表），应用不崩溃。
-                if code == "session/steer-unavailable" {
-                    let echo_text = self
-                        .sessions
-                        .get(&session_id.0)
-                        .and_then(|w| w.echo_text(&request_id))
-                        .map(str::to_string);
-                    if let Some(text) = echo_text {
+                // D-49：任意失败都保留未发送草稿（draft 仅存未发送内容）——
+                // 把发送前登记全文回填注册表供手动重试（含图片路径行完整还原）；
+                // 成功路径（PromptAccepted）已清空。仅 composer 发送登记
+                // pending；retry 动作等非草稿发送无登记 → 不恢复。
+                // 防覆盖（spec review）：回执到达前用户已重开 composer 输入
+                // 了新内容（非空且与登记全文不同）→ 不覆盖用户的在途新稿。
+                let mut restored_full_draft = false;
+                if let Some(text) = self.pending_prompt_texts.remove(&session_id.0) {
+                    let composer_has_newer = self.composer.active_session.as_ref()
+                        == Some(&session_id)
+                        && self
+                            .draft
+                            .as_ref()
+                            .is_some_and(|d| !d.text.trim().is_empty() && d.text != text);
+                    if !text.trim().is_empty() && !composer_has_newer {
                         self.drafts.set(DraftState {
                             text,
                             cursor: 0,
                             bound_session: session_id.clone(),
                         });
+                        self.mark_drafts_dirty();
+                        restored_full_draft = true;
+                        tracing::debug!(%session_id, "发送失败，草稿已保留（D-49）");
+                    }
+                }
+                // AC-003-16: steer 不被接受（轮次已结束/agent 非运行）→ 状态条
+                // 提示 + 草稿保留（回显文本放回注册表），应用不崩溃。D-49 已
+                // 完整还原（含图片路径行）时不再用回显摘要覆盖（防丢图路径）。
+                if code == "session/steer-unavailable" {
+                    if !restored_full_draft {
+                        let echo_text = self
+                            .sessions
+                            .get(&session_id.0)
+                            .and_then(|w| w.echo_text(&request_id))
+                            .map(str::to_string);
+                        if let Some(text) = echo_text {
+                            self.drafts.set(DraftState {
+                                text,
+                                cursor: 0,
+                                bound_session: session_id.clone(),
+                            });
+                            self.mark_drafts_dirty();
+                        }
                     }
                     self.last_error = Some(
                         "steer 不可用（轮次已结束或 agent 未运行），草稿已保留，可改为排队发送"
@@ -1582,13 +3521,26 @@ impl AppState {
                 // After recovery trigger refollow only once (no repeated
                 // repair); REQ-003 重开 control 流（运行态/审批降级状态读取）。
                 match self.active_session.clone() {
-                    Some(sid) => vec![
-                        Cmd::OpenFollow {
-                            session_id: sid.clone(),
-                            max_messages: self.window_cap,
-                        },
-                        Cmd::OpenControl { session_id: sid },
-                    ],
+                    Some(sid) => {
+                        // AC-007-01：child 打开态重连保持 subagent address
+                        // （不退回普通 session follow、不订阅 control——
+                        // 与首次打开语义一致，避免 address 漂移）。
+                        if let Some((parent_id, child_id)) = self.active_subagent_parent() {
+                            vec![Cmd::OpenFollowSubagent {
+                                parent_id,
+                                child_id,
+                                max_messages: self.window_cap,
+                            }]
+                        } else {
+                            vec![
+                                Cmd::OpenFollow {
+                                    session_id: sid.clone(),
+                                    max_messages: self.window_cap,
+                                },
+                                Cmd::OpenControl { session_id: sid },
+                            ]
+                        }
+                    }
                     None => vec![Cmd::LoadSessionList { cursor: None }],
                 }
             }
@@ -1751,6 +3703,8 @@ impl AppState {
                 vec![]
             }
             AppEvent::ControlItem { session_id, item } => {
+                // REQ-007：jobs 镜像维护（AC-007-13；只读，无停止控制）。
+                self.jobs_control_item(&session_id, &item);
                 // 只消费官方 projection 的 running 事实（ADR-008）；其余
                 // queue/jobs 帧本版本不解释。
                 if let ControlItem::Baseline { projections, .. } = item {
@@ -2065,6 +4019,129 @@ impl AppState {
                 }
                 vec![]
             }
+            // ---------- REQ-007 V0.4 `:edit` 回执（AC-007-25） ----------
+            AppEvent::ExternalEditDone {
+                ok,
+                tmp_path,
+                text,
+                message,
+            } => {
+                self.external_edit_done(ok, &tmp_path, &text, &message);
+                vec![]
+            }
+            // ---------- REQ-007 V0.4 @ 提及回执（AC-007-23） ----------
+            AppEvent::MentionCandidates {
+                generation,
+                files,
+                sessions,
+            } => {
+                self.mention_candidates(generation, files, sessions);
+                vec![]
+            }
+            AppEvent::MentionCandidatesFailed { generation, error } => {
+                self.mention_candidates_failed(generation, &error);
+                vec![]
+            }
+            // ---------- REQ-007 V0.4 subagent 回执 ----------
+            AppEvent::SubagentListed {
+                parent_id, catalog, ..
+            } => {
+                self.subagents_listed(parent_id, catalog);
+                vec![]
+            }
+            AppEvent::SubagentListFailed {
+                parent_id, error, ..
+            } => {
+                self.subagents_list_failed(parent_id, &error);
+                vec![]
+            }
+            AppEvent::SubagentInterruptDone { child_id, error } => {
+                self.subagents_interrupt_done(child_id, error.as_ref());
+                vec![]
+            }
+            // ---------- REQ-007 V0.4 goal 回执 ----------
+            AppEvent::GoalOpDone {
+                request_id,
+                updated,
+                cleared,
+            } => {
+                self.goal_op_done(&request_id, updated, cleared);
+                vec![]
+            }
+            AppEvent::GoalOpFailed {
+                request_id,
+                op,
+                error,
+            } => {
+                self.goal_op_failed(&request_id, &op, &error);
+                vec![]
+            }
+            // ---------- REQ-007 V0.4 settings + skills 回执 ----------
+            AppEvent::SettingsDescribed { value } => {
+                self.settings_described(value);
+                vec![]
+            }
+            AppEvent::SettingsDescribeFailed { error } => {
+                self.settings_describe_failed(&error);
+                vec![]
+            }
+            AppEvent::SettingsUpdated { ns, view } => {
+                self.settings_updated(&ns, &view);
+                // 更新成功 → 重拉 describe 同步 revision。
+                vec![Cmd::FetchSettingsDescribe]
+            }
+            AppEvent::SettingsUpdateFailed { ns, error } => {
+                self.settings_update_failed(&ns, &error);
+                vec![]
+            }
+            AppEvent::SkillsListed { value } => {
+                self.skills_listed(value);
+                vec![]
+            }
+            AppEvent::SkillsListFailed { error } => {
+                self.skills_list_failed(&error);
+                vec![]
+            }
+            AppEvent::ExportDone { bytes, path } => {
+                self.export_done(bytes, &path);
+                vec![]
+            }
+            AppEvent::ExportProgress { bytes } => {
+                self.export_progress(bytes);
+                vec![]
+            }
+            AppEvent::ExportFailed { error } => self.export_failed(&error),
+            AppEvent::ExportCancelled => {
+                self.export_cancelled();
+                vec![]
+            }
+            // REQ-007 D-46：export page 重建兜底回执。
+            AppEvent::ExportRebuildProgress { records } => {
+                self.export_rebuild_progress(records);
+                vec![]
+            }
+            AppEvent::ExportRebuildDone { path } => {
+                self.export_rebuild_done(&path);
+                vec![]
+            }
+            AppEvent::ExportRebuildFailed { error } => {
+                self.export_rebuild_failed(&error);
+                vec![]
+            }
+            // ---------- REQ-007 V0.4 消息动作回执 ----------
+            AppEvent::MessageBranchDone { session_id } => self.message_branch_done(session_id),
+            AppEvent::MessageActionFailed { op, error } => {
+                self.message_action_failed(op, &error);
+                vec![]
+            }
+            AppEvent::FeedbackPutDone => {
+                self.feedback_put_done();
+                vec![]
+            }
+            AppEvent::FeedbackPutFailed { error } => {
+                self.feedback_put_failed(&error);
+                vec![]
+            }
         }
     }
 
@@ -2076,6 +4153,21 @@ impl AppState {
             .map(|w| w.block_snapshot())
             .unwrap_or_default();
         self.search_index.rebuild(&blocks);
+        // REQ-007 AC-007-29：本地窗口事件 → timeline 标记（无远端读取）。
+        if self.show_timeline {
+            use crate::model::timeline::TimelineMarkerKind as K;
+            let kinds: Vec<K> = blocks
+                .iter()
+                .filter_map(|b| match b {
+                    crate::model::Block::UserMessage { .. } => Some(K::User),
+                    crate::model::Block::AssistantMessage { .. } => Some(K::Assistant),
+                    crate::model::Block::ToolCall { .. }
+                    | crate::model::Block::ToolResult { .. } => Some(K::Tool),
+                    _ => None,
+                })
+                .collect();
+            self.timeline.rebuild(&kinds);
+        }
         if self.search.open {
             self.recompute_window_matches();
         }
@@ -2233,6 +4325,7 @@ impl AppState {
         self.composer.steer = false;
         if let Some(d) = self.draft.as_ref() {
             self.drafts.set(d.clone());
+            self.mark_drafts_dirty();
         }
     }
 
@@ -2282,6 +4375,9 @@ impl AppState {
     /// minted, the optimistic echo lands immediately, INSERT exits and
     /// exactly one `Cmd::SendPrompt` is produced; empty input (whitespace
     /// included) stays in INSERT and sends nothing (AC-002-02/03/13).
+    /// REQ-007 AC-007-24：整行本地图片路径（supported ext）→ 读取+base64 →
+    /// Image part（顺序 `[images..., text]`）；任何图片候选读取/超限失败 →
+    /// 保留草稿在 INSERT，可读提示，不自动重试。
     pub fn submit_input(&mut self, mode: PromptMode) -> Vec<Cmd> {
         if self.mode != Mode::Insert || !self.composer.visible {
             return vec![];
@@ -2289,37 +4385,156 @@ impl AppState {
         let Some(sid) = self.composer.active_session.clone() else {
             return vec![];
         };
-        let Some(d) = self.draft.as_mut() else {
-            return vec![];
+        let draft_text = {
+            let Some(d) = self.draft.as_mut() else {
+                return vec![];
+            };
+            if d.text.trim().is_empty() {
+                // Empty input: send nothing, stay in INSERT (AC-002-03).
+                return vec![];
+            }
+            d.text.clone()
         };
-        if d.text.trim().is_empty() {
-            // Empty input: send nothing, stay in INSERT (AC-002-03).
-            return vec![];
+        // ---------- AC-007-24：图片附件预检（失败保留草稿不发送） ----------
+        let image_lines = crate::model::image_attachment::image_path_lines(&draft_text);
+        if !image_lines.is_empty() {
+            let mut attachments: Vec<crate::model::ImageAttachment> = Vec::new();
+            for path in image_lines {
+                match read_image_attachment(path) {
+                    Ok(att) => attachments.push(att),
+                    Err(msg) => {
+                        self.notice = Some(msg);
+                        return vec![]; // 保留草稿在 INSERT
+                    }
+                }
+            }
+            // 官方 imageLimits 校验（投影缺省 → 无限制不强制）。
+            let limits = self.active_window().map(|w| {
+                crate::model::ProjectionSnapshot::new(w.projections().clone()).image_limits()
+            });
+            let state = crate::model::ImageAttachmentState {
+                pending: attachments.clone(),
+                inflight: false,
+                last_error_code: None,
+            };
+            let err = state.validate(
+                limits
+                    .as_ref()
+                    .and_then(|l| l.max_image_bytes.map(|v| v as usize)),
+                limits
+                    .as_ref()
+                    .and_then(|l| l.max_images_per_message.map(|v| v as usize)),
+                if limits.as_ref().is_some_and(|l| !l.media_types.is_empty()) {
+                    Some(&limits.as_ref().unwrap().media_types)
+                } else {
+                    None
+                },
+            );
+            if let Err(msg) = err {
+                self.notice = Some(msg);
+                return vec![]; // 保留草稿在 INSERT（不自动重试）
+            }
+            // D-51：本地软上限（config，数量 ≤10/单张 ≤20MiB 可配）叠加官方
+            // imageLimits 双校验——官方投影缺失时本地兜底生效。
+            if let Err(msg) =
+                state.validate_local_soft_limit(self.max_image_count, self.max_image_bytes)
+            {
+                self.notice = Some(msg);
+                return vec![]; // 保留草稿在 INSERT，可重选（AC-007-24）
+            }
+            self.pending_image_attachments = attachments;
         }
         // take-once + single command queue = minimal in-flight guard
         // (pattern 15 lesson: unconverged async signals need in-flight
         // dedup; AC-002-13 blocks double-Enter).
-        let text = std::mem::take(&mut d.text);
-        d.cursor = 0;
+        let text = {
+            let Some(d) = self.draft.as_mut() else {
+                return vec![];
+            };
+            d.cursor = 0;
+            std::mem::take(&mut d.text)
+        };
         self.mode = Mode::Normal;
         self.composer.visible = false;
         self.composer.steer = false;
         self.composer.active_session = None;
-        // 发送后清空该会话草稿（AC-003-11）+ 记入输入历史（AC-003-10）。
+        // D-49：发送在途前先登记原始草稿全文（供失败回填；成功即弃）。
+        self.pending_prompt_texts
+            .insert(sid.0.clone(), text.clone());
+        // 发送后清空该会话草稿（AC-003-11）+ 记入输入历史（AC-003-10）；
+        // 失败时由 PromptFailed 回填（D-49：成功才清、失败可重发不丢）。
         self.drafts.clear(&sid);
+        self.mark_drafts_dirty();
         self.history.push(&text);
         self.history.reset_nav();
         let request_id = SessionRequestId(crate::api::types::mint_request_id());
         // Optimistic echo: visible within one frame, occupies no seq
-        // (AC-002-02).
+        // (AC-002-02). 有图片时 echo 保留文本摘要（图片路径不展开）。
+        let echo_text = if self.pending_image_attachments.is_empty() {
+            text.clone()
+        } else {
+            let n = self.pending_image_attachments.len();
+            let base = text
+                .lines()
+                .filter(|l| {
+                    crate::model::image_attachment::image_path_lines(&text)
+                        .iter()
+                        .all(|p| l.trim() != *p)
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            if base.trim().is_empty() {
+                format!("[{} 张图片]", n)
+            } else {
+                format!("[{} 张图片] {}", n, base.trim())
+            }
+        };
         self.sessions
             .touch(&sid.0, self.window_cap)
-            .echo(request_id.clone(), &text);
+            .echo(request_id.clone(), &echo_text);
+        // content 顺序 `[image parts..., text]`（官方 web）。
+        let mut content: Vec<PromptContentPart> = Vec::new();
+        for att in std::mem::take(&mut self.pending_image_attachments) {
+            content.push(PromptContentPart::Image {
+                media_type: att.media_type.0,
+                data: att.data_base64,
+                name: std::path::Path::new(&att.path)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned()),
+            });
+        }
+        let text_part = text
+            .lines()
+            .filter(|l| {
+                crate::model::image_attachment::image_path_lines(&text)
+                    .iter()
+                    .all(|p| l.trim() != *p)
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !text_part.trim().is_empty() {
+            content.push(PromptContentPart::Text { text: text_part });
+        }
+        if content.is_empty() {
+            // 全部行都是图片但读取为空不应发生（前面已校验）；兜底纯文本。
+            content.push(PromptContentPart::Text { text });
+        }
+        // REQ-007 AC-007-01/10：child 打开态发送 → 父→子 subagents/prompt
+        // （agent 作用域 childSessionId；父→子消息以普通消息块可见）。普通
+        // 会话仍走 session/prompt。
+        if let Some((parent_id, child_id)) = self.active_subagent_parent() {
+            return vec![Cmd::SendSubagentPrompt {
+                parent_id,
+                child_id,
+                request_id: request_id.0.clone(),
+                content,
+            }];
+        }
         let request = PromptRequest {
             request_id: request_id.clone(),
             session_id: sid.clone(),
             mode,
-            content: vec![PromptContentPart::Text { text }],
+            content,
             client_time_zone: None,
         };
         vec![Cmd::SendPrompt {
@@ -2421,6 +4636,12 @@ impl AppState {
         let Some(block) = self.focused_image_block() else {
             return vec![];
         };
+        self.open_image_block(block)
+    }
+
+    /// 打开指定图片块（聚焦图片 / 同消息 pager 共用）：组 pager 由当前窗口
+    /// 图片 run 计算（AC-007-06）。
+    fn open_image_block(&mut self, block: crate::model::ImageBlockRef) -> Vec<Cmd> {
         if self.mode == Mode::ImageView {
             // AC-004-08：不叠加第二个 ImageView。
             return vec![];
@@ -2437,6 +4658,26 @@ impl AppState {
         let Some(session_id) = self.active_session.clone() else {
             return vec![];
         };
+        // REQ-007：同消息组 pager（连续 Image 块 run；单图 = total 1）。
+        // 以 attachment_id 定位 run（同 seq 多图兄弟块可区分，AC-007-30）。
+        let (pager_total, pager_index) = self
+            .active_window()
+            .and_then(|w| {
+                crate::model::image::image_run_by_attachment(&w.block_snapshot(), &att_id.0)
+                    .or_else(|| crate::model::image::image_run_of(&w.block_snapshot(), block.seq))
+            })
+            .map(|(_start, total, index)| (total, index))
+            .unwrap_or((1, 0));
+        let open_view = |this: &mut Self| {
+            this.image_view.open_view(
+                block.seq,
+                att_id.clone(),
+                block.name.clone(),
+                block.dims.clone(),
+            );
+            this.image_view.set_pager(pager_total, pager_index);
+            this.mode = Mode::ImageView;
+        };
         match self.image_cache.acquire(&att_id) {
             crate::cache::image_cache::Acquire::Cached(entry) => {
                 if !self.kitty_capable {
@@ -2447,13 +4688,7 @@ impl AppState {
                     }];
                 }
                 self.image_cache.pin(&att_id);
-                self.image_view.open_view(
-                    block.seq,
-                    att_id.clone(),
-                    block.name.clone(),
-                    block.dims.clone(),
-                );
-                self.mode = Mode::ImageView;
+                open_view(self);
                 vec![Cmd::RenderCachedImage {
                     session_id,
                     attachment_id: att_id,
@@ -2477,13 +4712,7 @@ impl AppState {
                     }];
                 }
                 self.image_cache.pin(&att_id);
-                self.image_view.open_view(
-                    block.seq,
-                    att_id.clone(),
-                    block.name.clone(),
-                    block.dims.clone(),
-                );
-                self.mode = Mode::ImageView;
+                open_view(self);
                 vec![Cmd::FetchAttachment {
                     session_id,
                     attachment_id: att_id,
@@ -2492,6 +4721,123 @@ impl AppState {
                 }]
             }
         }
+    }
+
+    /// REQ-007 AC-007-06：同消息多图 pager 步进（`[`/`]`，ImageView 内）。
+    /// 关旧图（unpin + close）→ 定位同 run 内相邻 seq → 重开（复用既有
+    /// 缓存/拉取单飞管线）。
+    fn image_view_pager_step(&mut self, delta: i8) -> Vec<Cmd> {
+        if self.mode != Mode::ImageView {
+            return vec![];
+        }
+        let Some(cur_seq) = self.image_view.block_seq else {
+            return vec![];
+        };
+        let Some(window) = self.active_window() else {
+            return vec![];
+        };
+        let blocks = window.block_snapshot();
+        // 当前 view 记录 attachment_id：用附件定位 run（同 seq 多图可区分）。
+        let Some(cur_att) = self.image_view.attachment_id.clone() else {
+            return vec![];
+        };
+        let Some((start, total, index)) =
+            crate::model::image::image_run_by_attachment(&blocks, &cur_att.0)
+                .or_else(|| crate::model::image::image_run_of(&blocks, cur_seq))
+        else {
+            return vec![];
+        };
+        let next = index as isize + delta as isize;
+        if next < 0 || next as usize >= total {
+            return vec![]; // 组边界停留
+        }
+        let target_seq = blocks[start + next as usize].seq();
+        let Some(sibling) = blocks
+            .get(start + next as usize)
+            .and_then(crate::model::image::image_block_of)
+        else {
+            return vec![];
+        };
+        // 关旧图并推进 pager 状态到新块（open 会重算 pager）。同步单帧内
+        // 完成，先退 Normal 再走 open_image_block（其 ImageView 防叠加守卫
+        // 会误拦 pager 重开）。
+        if let Some(old) = self.image_view.attachment_id.clone() {
+            self.image_cache.unpin(&old);
+        }
+        self.image_view.close();
+        self.mode = Mode::Normal;
+        let cmds = self.open_image_block(sibling);
+        let _ = target_seq;
+        cmds
+    }
+
+    /// REQ-007 D-45 zoom（`+`/`-`/`0`）：更新 zoom 状态并触发同缓存 temp_file
+    /// 重编码（Cmd::RenderImageViewZoom → AttachmentReady 回流 image_frame）。
+    /// 仅在 ImageView 渲染完成态有意义；在途单飞（连按取最新 scale——完成
+    /// 回执时若 zoom 又变则再发一轮）。
+    fn image_view_zoom(&mut self, direction: i8) -> Vec<Cmd> {
+        if self.mode != Mode::ImageView || !self.image_view.open {
+            return vec![];
+        }
+        match direction {
+            d if d > 0 => self.image_view.zoom_in(),
+            d if d < 0 => self.image_view.zoom_out(),
+            _ => self.image_view.zoom_reset(),
+        }
+        if self.image_view.phase != crate::model::ImageViewPhase::Rendered {
+            // Loading/Failed 无帧可重编码：状态已更新。Loading 期在途编码是
+            // 打开路径 zoom=1.0 的帧——登记在途编码 zoom=1.0，帧到达时
+            // finish 发现 zoom 已变会补发重编码（否则标题 125% 但画面仍是
+            // 1.0，直到再按一次键才纠正；D-45 spec review 修复）。Failed
+            // 无在途帧，不登记（不会到达）。
+            if self.image_view.phase == crate::model::ImageViewPhase::Loading
+                && !self.image_view.zoom_inflight
+            {
+                self.image_view.zoom_encoded = Some(1.0);
+                self.image_view.zoom_inflight = true;
+            }
+            return vec![];
+        }
+        let Some(att_id) = self.image_view.attachment_id.clone() else {
+            return vec![];
+        };
+        let Some(session_id) = self.active_session.clone() else {
+            return vec![];
+        };
+        let Some(block_seq) = self.image_view.block_seq else {
+            return vec![];
+        };
+        if !self.image_view.begin_zoom_encode() {
+            // 在途单飞：zoom 状态已更新；完成回执时发现 zoom 变了会再发。
+            return vec![];
+        }
+        // 源 = 缓存条目 temp_file + media_type；未入缓存（预算外/超限）用
+        // view_temp_path + image_meta（该图已渲染完成，临时文件必在）。
+        let entry = self.image_cache.get(&att_id);
+        let (temp_file, media_type) = match entry {
+            Some(e) => (e.temp_file, e.media_type),
+            None => {
+                let Some(path) = self.view_temp_path.clone() else {
+                    self.image_view.cancel_zoom_encode();
+                    self.last_error = Some("图片临时文件不可用，无法缩放".into());
+                    return vec![];
+                };
+                let mt = self
+                    .image_meta
+                    .get(&att_id)
+                    .map(|m| m.media_type.clone())
+                    .unwrap_or_else(|| crate::api::types::MediaType("image/png".into()));
+                (path, mt)
+            }
+        };
+        vec![Cmd::RenderImageViewZoom {
+            session_id,
+            attachment_id: att_id,
+            block_seq,
+            temp_file,
+            media_type,
+            zoom: self.image_view.zoom,
+        }]
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2538,8 +4884,10 @@ impl AppState {
             return vec![];
         }
         self.image_errors.remove(&attachment_id);
-        if cached {
+        if cached && self.image_cache.get(&attachment_id).is_some() {
             // The cache entry already owns the file; do not re-account it.
+            // （仅缓存确有条目时清 view_temp_path——zoom 对「预算外/未入缓存」
+            // 图片重编码时源文件在 view_temp_path，不能清掉。）
             self.view_temp_path = None;
         }
         if for_viewer || !self.kitty_capable {
@@ -2561,6 +4909,20 @@ impl AppState {
             None => {
                 self.image_view
                     .mark_failed("encode/failed".into(), "kitty 帧缺失".into());
+            }
+        }
+        // REQ-007 D-45：zoom 重编码回流完成——期间 zoom 又变了（连按取最新）
+        // → 再发一轮重编码（复用缓存 temp_file）。
+        if let Some(encoded) = self.image_view.finish_zoom_encode() {
+            if (self.image_view.zoom - encoded).abs() > f32::EPSILON {
+                return vec![Cmd::RenderImageViewZoom {
+                    session_id,
+                    attachment_id,
+                    block_seq,
+                    temp_file: entry.temp_file,
+                    media_type: entry.media_type,
+                    zoom: self.image_view.zoom,
+                }];
             }
         }
         vec![]
@@ -2647,6 +5009,54 @@ impl AppState {
                 return cmds;
             }
         }
+        // REQ-007：@ 提及模态命令分流（AC-007-23；字符/导航/确认/关闭）。
+        // 返回 None = 提及已关闭且命令应交由既有 mode 路径继续处理。
+        if self.mode == Mode::Mention {
+            if let Some(cmds) = self.handle_mention_command(cmd.clone()) {
+                return cmds;
+            }
+            self.mode = Mode::Insert; // 落回 INSERT 后再走主 match
+        }
+        // REQ-007：subagent 目录模态命令分流（AC-007-07~10）。
+        if self.mode == Mode::Subagent {
+            return self.handle_subagent_command(cmd);
+        }
+        // REQ-007：goal 面板命令分流（AC-007-11/12/14）。
+        if self.mode == Mode::Goal {
+            return self.handle_goal_command(cmd);
+        }
+        // REQ-007：jobs 只读面板（AC-007-13）。
+        if self.mode == Mode::Jobs {
+            return self.handle_jobs_command(cmd);
+        }
+        // REQ-007：消息动作菜单（AC-007-27/28）。
+        if self.mode == Mode::MessageAction {
+            return self.handle_message_action_command(cmd);
+        }
+        // REQ-007：settings / skills（AC-007-15~19）。
+        if self.mode == Mode::Settings {
+            return self.handle_settings_command(cmd);
+        }
+        if self.mode == Mode::Skills {
+            return self.handle_skills_command(cmd);
+        }
+        // REQ-007：export（AC-007-17）。
+        if self.mode == Mode::Export {
+            return self.handle_export_command(cmd);
+        }
+        // REQ-007 AC-007-31：SEARCH 编辑态空 query 时 ↑/↓ = 历史回忆（非空时
+        // 箭头保持既有 'k'/'j' 输入语义）。
+        if self.mode == Mode::Search && !self.search.results_locked {
+            use crate::input::Command as C2;
+            // ↑ 回忆：空 query（起始）或正处于回忆游标（连续回看）。
+            let recalling = self.search.recall_cursor.is_some();
+            if matches!(cmd, C2::PickerUp) && (self.search.query.trim().is_empty() || recalling) {
+                return self.search_recall_older();
+            }
+            if recalling && matches!(cmd, C2::PickerDown) {
+                return self.search_recall_newer();
+            }
+        }
         match cmd {
             C::MoveDown
             | C::MoveUp
@@ -2698,6 +5108,34 @@ impl AppState {
                 } else {
                     self.scroll(cmd)
                 }
+            }
+            C::ImageViewPager { delta } => {
+                // 仅 ImageView 模态有意义（pager 步进）。
+                self.image_view_pager_step(delta)
+            }
+            C::ImageViewZoomIn => self.image_view_zoom(1),
+            C::ImageViewZoomOut => self.image_view_zoom(-1),
+            C::ImageViewZoomReset => self.image_view_zoom(0),
+            C::SubagentInterrupt => {
+                // 仅 subagent 模态上下文有意义（已在 handle_subagent_command
+                // 分流）；此处兜底 no-op。
+                vec![]
+            }
+            C::GoalCreate
+            | C::GoalEdit
+            | C::GoalPause
+            | C::GoalResume
+            | C::GoalComplete
+            | C::GoalClear => {
+                // 仅 goal 模态有意义（已分流）；兜底 no-op。
+                vec![]
+            }
+            C::OpenMessageActions => {
+                // Normal 模式焦点消息行打开动作菜单（其它模态 no-op）。
+                if self.mode == Mode::Normal {
+                    return self.open_message_actions();
+                }
+                vec![]
             }
             C::OpenPicker => {
                 self.mode = Mode::Picker;
@@ -2772,6 +5210,20 @@ impl AppState {
                     }
                     vec![]
                 }
+                // REQ-007：@ 提及 Esc 已在 handle_mention_command 拦截
+                // （此 arm 不可达，保穷尽性）。
+                Mode::Mention => vec![],
+                // REQ-007：subagent Esc 已在 handle_subagent_command 拦截。
+                Mode::Subagent => vec![],
+                // REQ-007：goal Esc 已在 handle_goal_command 拦截。
+                Mode::Goal => vec![],
+                // REQ-007：jobs Esc 已在 handle_jobs_command 拦截。
+                Mode::Jobs => vec![],
+                // REQ-007：settings/skills/export/message-action Esc 已分流。
+                Mode::Settings => vec![],
+                Mode::Skills => vec![],
+                Mode::Export => vec![],
+                Mode::MessageAction => vec![],
             },
             C::PickerDown => {
                 if self.approval.list_open && self.mode == Mode::Approval {
@@ -2828,7 +5280,17 @@ impl AppState {
             }
             C::PickerInput(text) => {
                 if self.mode == Mode::Insert {
-                    self.composer_input(&text)
+                    // REQ-007：`@` 词边界触发提及候选（AC-007-23）。
+                    if text == "@" {
+                        let activation = self.maybe_activate_mention();
+                        if !activation.is_empty() {
+                            activation
+                        } else {
+                            self.composer_input(&text)
+                        }
+                    } else {
+                        self.composer_input(&text)
+                    }
                 } else if self.mode == Mode::Search {
                     self.search_input(&text)
                 } else if self.mode == Mode::ModelCatalog {
@@ -3569,11 +6031,55 @@ impl AppState {
     }
 
     fn close_search(&mut self) {
+        // REQ-007 AC-007-31：非空 query 记入搜索历史（模型去重 + FIFO 50）。
+        if !self.search.query.trim().is_empty() {
+            self.query_history.push(self.search.query.trim());
+        }
+        self.search.recall_cursor = None;
         self.mode = Mode::Normal;
         self.search.open = false;
         self.search.history_generation = self.search.history_generation.wrapping_add(1);
         self.search.history_loading = false;
         self.search.results_locked = false;
+    }
+
+    /// AC-007-31：↑ 回忆更早的最近查询（仅空 query 编辑态）。
+    fn search_recall_older(&mut self) -> Vec<Cmd> {
+        let rec: Vec<String> = self.query_history.recent().map(String::from).collect();
+        if rec.is_empty() {
+            return vec![];
+        }
+        // 起始或顶部：取最近一条；已在游标：往更早走。
+        let cur = self.search.recall_cursor;
+        let next = cur.map(|c| c + 1).unwrap_or(0);
+        if next >= rec.len() {
+            return vec![]; // 已到最旧（顶部停留）
+        }
+        self.search.recall_cursor = Some(next);
+        self.search.query = rec[next].clone();
+        self.recompute_window_matches();
+        self.search.history_error = None;
+        vec![]
+    }
+
+    /// AC-007-31：↓ 回到更新的查询（越过最新则清空回手动输入）。
+    fn search_recall_newer(&mut self) -> Vec<Cmd> {
+        let Some(cur) = self.search.recall_cursor else {
+            return vec![];
+        };
+        if cur == 0 {
+            self.search.recall_cursor = None;
+            self.search.query.clear();
+            self.search.window_matches.clear();
+            return vec![];
+        }
+        let rec: Vec<String> = self.query_history.recent().map(String::from).collect();
+        if let Some(q) = rec.get(cur - 1) {
+            self.search.recall_cursor = Some(cur - 1);
+            self.search.query = q.clone();
+            self.recompute_window_matches();
+        }
+        vec![]
     }
 
     // ---------- REQ-006 Sidebar 行光标与视图态（FR-006-02，D-034） ----------
@@ -3916,6 +6422,24 @@ impl AppState {
                             self.help_open = true;
                             vec![]
                         }
+                        PaletteAction::ToggleTheme => {
+                            // 立即重绘（palette 重建），并持久化 config.toml。
+                            self.toggle_theme();
+                            vec![Cmd::SaveUiTheme {
+                                theme: self.palette.theme.clone(),
+                                palette: self.palette_overrides.clone(),
+                            }]
+                        }
+                        PaletteAction::EditWithEditor => {
+                            // 面板已关闭；返回 :edit 起始 Cmd（若在 INSERT）。
+                            self.external_edit_begin()
+                        }
+                        PaletteAction::OpenSubagents => self.open_subagents(),
+                        PaletteAction::OpenGoal => self.open_goal_panel(),
+                        PaletteAction::OpenJobs => self.open_jobs_panel(),
+                        PaletteAction::OpenSettings => self.open_settings_panel(),
+                        PaletteAction::OpenSkills => self.open_skills_panel(),
+                        PaletteAction::OpenExport => self.open_export_panel(),
                         PaletteAction::ForkSession
                         | PaletteAction::RenameSession
                         | PaletteAction::ArchiveSession
@@ -4604,6 +7128,7 @@ impl AppState {
         // 会话切换：把编辑中的草稿存入注册表（D-20 跨会话保留，仅内存）。
         if let Some(d) = self.draft.take() {
             self.drafts.set(d);
+            self.mark_drafts_dirty();
         }
         if let Some(old_id) = self.image_view.attachment_id.clone() {
             self.image_cache.unpin(&old_id);
@@ -4685,6 +7210,10 @@ impl AppState {
 mod tests {
     use super::*;
     use crate::input::Command as C;
+
+    /// 串行化 `:edit` 相关测试的 env 读写（$VISUAL/$EDITOR/XDG_STATE_HOME）：
+    /// 多个测试共享同一把锁，防并行 env 竞争导致 flaky（D-52 并行实测教训）。
+    static EDITOR_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn snapshot(sid: &str, running: bool) -> AppEvent {
         AppEvent::FollowSnapshot {
@@ -5153,14 +7682,35 @@ mod tests {
             s.last_error.as_deref().unwrap_or("").contains("发送失败"),
             "状态条错误提示"
         );
-        // 恢复路径：失败后重新输入可再次手动发送（新 requestId、新回显）。
-        let cmds2 = submit_flow(&mut s, "s1", "retry");
+        // D-49 恢复路径：失败后草稿回填注册表 → 再开 composer 看到原稿；
+        // 改输入重发 = 新 requestId、新回显，且不重复旧内容。
+        s.handle_command(C::InsertMode);
+        assert_eq!(
+            s.drafts.get(&session_id).map(|d| d.text.as_str()),
+            Some("bad"),
+            "D-49：失败草稿保留可重发"
+        );
+        s.draft.as_mut().unwrap().text = "retry".into();
+        s.draft.as_mut().unwrap().cursor = "retry".chars().count();
+        let cmds2 = s.handle_command(C::SubmitInput);
         assert_eq!(cmds2.len(), 1, "恢复后可再次手动发送");
-        let request_id2 = match &cmds2[0] {
-            Cmd::SendPrompt { request, .. } => request.request_id.clone(),
-            _ => panic!(),
+        let Cmd::SendPrompt { request, .. } = &cmds2[0] else {
+            panic!()
         };
+        let request_id2 = request.request_id.clone();
         assert_ne!(request_id2, request_id, "新请求使用新 requestId");
+        let crate::api::types::PromptContentPart::Text { text } = &request.content[0] else {
+            panic!("重发为纯文本")
+        };
+        assert_eq!(text, "retry", "重发内容为用户改写后的新文本，无旧稿拼接");
+        s.handle(AppEvent::PromptAccepted {
+            session_id: session_id.clone(),
+            request_id: request_id2,
+        });
+        assert!(
+            s.drafts.get(&session_id).is_none(),
+            "重发成功后草稿清空（draft 仅存未发送内容）"
+        );
     }
 
     #[test]
@@ -5197,6 +7747,70 @@ mod tests {
     }
 
     #[test]
+    fn draft_restored_on_failure_cleared_on_success_d049() {
+        // 网络类失败 → 原始草稿全文回填注册表，可重发不丢；成功
+        // （PromptAccepted）→ 清空。恢复路径不被旧失败状态污染。
+        let mut s = AppState::default();
+        let cmds = submit_flow(&mut s, "s1", "看图说话");
+        assert_eq!(cmds.len(), 1);
+        let (session_id, request_id) = match &cmds[0] {
+            Cmd::SendPrompt {
+                session_id,
+                request,
+            } => (session_id.clone(), request.request_id.clone()),
+            _ => panic!(),
+        };
+        // 发送瞬间注册表清空（回执前不留旧稿），但全文登记在途。
+        assert!(s.drafts.get(&session_id).is_none());
+        assert_eq!(
+            s.pending_prompt_texts
+                .get(&session_id.0)
+                .map(String::as_str),
+            Some("看图说话"),
+            "在途全文已登记（D-49）"
+        );
+        s.handle(AppEvent::PromptFailed {
+            session_id: session_id.clone(),
+            request_id: request_id.clone(),
+            error: ClientError::Transport("网络断开".into()),
+        });
+        // D-49：任意失败恢复草稿（可手动重发不丢）。
+        assert_eq!(
+            s.drafts.get(&session_id).map(|d| d.text.as_str()),
+            Some("看图说话"),
+            "失败后全文恢复"
+        );
+        assert!(s.pending_prompt_texts.is_empty(), "回执后清在途登记");
+        assert!(
+            s.last_error.as_deref().unwrap_or("").contains("网络"),
+            "网络类错误可读提示"
+        );
+        // 恢复路径：再开 composer 直接看到原稿；改写重发 → 成功清空。
+        s.handle_command(C::InsertMode);
+        assert_eq!(s.draft.as_ref().map(|d| d.text.as_str()), Some("看图说话"));
+        s.draft.as_mut().unwrap().text = "重说一遍".into();
+        let cmds2 = s.handle_command(C::SubmitInput);
+        let (_, rid2) = match &cmds2[0] {
+            Cmd::SendPrompt {
+                session_id,
+                request,
+            } => (session_id.clone(), request.request_id.clone()),
+            _ => panic!(),
+        };
+        assert_ne!(rid2, request_id, "重发使用新 requestId");
+        assert!(s.drafts.get(&session_id).is_none(), "重发提交清空注册表");
+        s.handle(AppEvent::PromptAccepted {
+            session_id: session_id.clone(),
+            request_id: rid2,
+        });
+        assert!(s.pending_prompt_texts.is_empty(), "成功即弃在途登记");
+        assert!(
+            s.drafts.get(&session_id).is_none(),
+            "成功清空：draft 仅存未发送内容（D-49）"
+        );
+    }
+
+    #[test]
     fn blank_or_unowned_session_can_send_ac002_11() {
         // 空白/未归属会话发送：目标 = 当前活动会话，发送路径不依赖归属/
         // workspace 元数据（首个 turn 正常入队，状态以官方投影为准）。
@@ -5217,6 +7831,46 @@ mod tests {
         assert_eq!(w.pending().count(), 1, "本地立即回显");
         assert_eq!(w.pending().next().unwrap().text, "首个 turn");
         assert_eq!(w.len(), 0, "空白会话无历史");
+    }
+
+    #[test]
+    fn draft_failure_does_not_overwrite_newer_composer_input_d49() {
+        // D-49（spec review）：失败回执到达前用户已重开 composer 输入了新
+        // 内容（非空、不同于旧稿）→ 恢复逻辑不覆盖在途新稿。
+        let mut s = AppState::default();
+        let cmds = submit_flow(&mut s, "s1", "旧稿");
+        let (session_id, request_id) = match &cmds[0] {
+            Cmd::SendPrompt {
+                session_id,
+                request,
+            } => (session_id.clone(), request.request_id.clone()),
+            _ => panic!(),
+        };
+        // 失败回执到达前：用户重开 composer 输入了新内容（尚未发送）。
+        s.handle_command(C::InsertMode);
+        s.handle_command(C::PickerInput("用户在失败前输入的新稿".into()));
+        s.handle(AppEvent::PromptFailed {
+            session_id: session_id.clone(),
+            request_id,
+            error: ClientError::Transport("网络断开".into()),
+        });
+        // 在途 composer 新稿不被旧稿覆盖。
+        assert_eq!(
+            s.draft.as_ref().map(|d| d.text.as_str()),
+            Some("用户在失败前输入的新稿"),
+            "在途新稿不被恢复的旧稿覆盖"
+        );
+        // 注册表：失败回执不把旧稿塞回（避免下次 i 打开把新稿顶掉）。
+        assert!(
+            s.drafts.get(&session_id).is_none(),
+            "回执前已有新稿 → 不向注册表恢复旧稿"
+        );
+        // 恢复路径：用户仍可正常发送新稿。
+        let cmds2 = s.handle_command(C::SubmitInput);
+        assert!(
+            cmds2.iter().any(|c| matches!(c, Cmd::SendPrompt { .. })),
+            "新稿可正常发送"
+        );
     }
 
     #[test]
@@ -5732,6 +8386,42 @@ mod tests {
         );
         s.handle_command(C::InsertMode);
         assert_eq!(s.draft.as_ref().map(|d| d.text.as_str()), Some("steer-me"));
+    }
+
+    #[test]
+    fn steer_unavailable_keeps_full_draft_with_image_paths_d49() {
+        // D-49：composer 发送含图片路径行 → steer-unavailable 失败时恢复
+        // **完整原稿**（含图片路径），不被回显摘要（[N 张图片]）覆盖。
+        let (_dir, file) = temp_img("steer", b"abc");
+        let mut s = AppState::default();
+        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle(snapshot("s1", true));
+        s.handle_command(C::InsertMode);
+        let full = format!("{}\n看图", file.to_string_lossy());
+        s.handle_command(C::PickerInput(full.clone()));
+        let cmds = s.handle_command(C::SubmitInput);
+        let (sid, rid) = match &cmds[0] {
+            Cmd::SendPrompt {
+                session_id,
+                request,
+            } => (session_id.clone(), request.request_id.clone()),
+            _ => panic!(),
+        };
+        s.handle(AppEvent::PromptFailed {
+            session_id: sid.clone(),
+            request_id: rid,
+            error: ClientError::Remote {
+                code: "session/steer-unavailable".into(),
+                message: "轮次已结束".into(),
+                class: ErrorClass::UserFacing,
+            },
+        });
+        assert_eq!(
+            s.drafts.get(&sid).map(|d| d.text.as_str()),
+            Some(full.as_str()),
+            "完整原稿（含图片路径行）保留，不被回显摘要覆盖"
+        );
+        let _ = std::fs::remove_dir_all(&_dir);
     }
 
     #[test]
@@ -6771,7 +9461,18 @@ mod tests {
     fn palette_v04_and_local_actions() {
         let mut s = AppState::default();
         s.handle_command(C::OpenCommandPalette);
-        // V0.4 占位：Enter 不执行，仅提示，面板保持。
+        // settings 已是真实动作（V0.4 占位仅剩 keymap/export）。
+        let has_settings = s.command_palette.filtered().iter().any(|i| {
+            matches!(
+                i,
+                CommandPaletteItem::Local {
+                    label: "settings",
+                    ..
+                }
+            )
+        });
+        assert!(has_settings, "settings 已转真实入口");
+        // 仍为 V0.4 占位项（keymap）：Enter 不执行，仅提示，面板保持。
         let idx = s
             .command_palette
             .filtered()
@@ -6780,7 +9481,7 @@ mod tests {
                 matches!(
                     i,
                     CommandPaletteItem::V04 {
-                        label: "settings",
+                        label: "keymap",
                         ..
                     }
                 )
@@ -7087,5 +9788,2439 @@ mod tests {
         assert!(cmds
             .iter()
             .any(|c| matches!(c, Cmd::LoadSessionList { .. })));
+    }
+
+    // ---------- REQ-007 V0.4: theme（AC-007-20） ----------
+
+    #[test]
+    fn palette_config_applies_overrides_and_reports_warnings() {
+        let mut s = AppState::default();
+        let mut over = std::collections::BTreeMap::new();
+        over.insert("accent".to_string(), "#ff0000".to_string());
+        over.insert("error".to_string(), "nope".to_string());
+        over.insert("bad_role".to_string(), "#000000".to_string());
+        let warnings = s.apply_palette_config("dark", &over);
+        assert!(
+            warnings.iter().any(|w| w.contains("nope")),
+            "warnings={warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("bad_role")),
+            "warnings={warnings:?}"
+        );
+        assert_eq!(
+            s.palette.color(crate::ui::theme::Role::Accent),
+            ratatui::style::Color::Rgb(255, 0, 0)
+        );
+        // 非法值回退默认色（不崩）。
+        assert_eq!(
+            s.palette.color(crate::ui::theme::Role::Error),
+            crate::ui::theme::dark_builtin(crate::ui::theme::Role::Error)
+        );
+    }
+
+    #[test]
+    fn palette_default_is_dark_and_apply_light_flips() {
+        let s = AppState::default();
+        assert!(!s.palette.is_light());
+        let mut s = AppState::default();
+        let _ = s.apply_palette_config("light", &std::collections::BTreeMap::new());
+        assert!(s.palette.is_light());
+        assert_eq!(
+            s.palette.color(crate::ui::theme::Role::Accent),
+            crate::ui::theme::light_builtin(crate::ui::theme::Role::Accent)
+        );
+    }
+
+    #[test]
+    fn toggle_theme_flips_and_emits_save_cmd() {
+        let mut s = AppState::default();
+        // 打开命令面板选中 theme 本地动作并 Enter。
+        s.handle_command(C::OpenCommandPalette);
+        s.command_palette.query = "theme".into();
+        let idx = s
+            .command_palette
+            .filtered()
+            .iter()
+            .position(|i| matches!(i, CommandPaletteItem::Local { label: "theme", .. }))
+            .expect("theme 是本地动作（非 V04 占位）");
+        s.command_palette.selection = idx;
+        let cmds = s.handle_command(C::PickerConfirm);
+        assert!(s.palette.is_light(), "dark→light 翻转");
+        assert!(
+            cmds.iter().any(|c| matches!(c, Cmd::SaveUiTheme { .. })),
+            "主题切换发出持久化命令"
+        );
+        assert_eq!(s.mode, Mode::Normal, "面板关闭");
+        // 再次切换回到 dark。
+        s.handle_command(C::OpenCommandPalette);
+        s.command_palette.query = "theme".into();
+        let idx = s
+            .command_palette
+            .filtered()
+            .iter()
+            .position(|i| matches!(i, CommandPaletteItem::Local { label: "theme", .. }))
+            .unwrap();
+        s.command_palette.selection = idx;
+        let _ = s.handle_command(C::PickerConfirm);
+        assert!(!s.palette.is_light(), "来回切换");
+    }
+
+    // ---------- REQ-007 V0.4: draft persistence (AC-007-22/ADR-010) ----------
+
+    #[test]
+    fn draft_dirty_flags_and_snapshot_round_trip_ac007_22() {
+        let mut s = AppState {
+            drafts_enabled: true,
+            ..Default::default()
+        };
+        // 存草稿 → dirty。
+        s.drafts.set(DraftState {
+            text: "草稿A".into(),
+            cursor: 3,
+            bound_session: SessionId("s1".into()),
+        });
+        s.mark_drafts_dirty();
+        assert!(s.take_draft_dirty(), "变更后 dirty 置位");
+        assert!(!s.take_draft_dirty(), "取出即清");
+
+        // snapshot 到 store（session 键控）。
+        let store = s.draft_store_snapshot();
+        assert_eq!(store.get("s1"), Some("草稿A"));
+        assert!(store.get("s2").is_none());
+
+        // 空文本不落盘、store 往返 toml。
+        s.drafts.set(DraftState {
+            text: String::new(),
+            cursor: 0,
+            bound_session: SessionId("s1".into()),
+        });
+        let toml = s.draft_store_snapshot().to_toml().unwrap();
+        assert!(crate::model::DraftStore::from_toml(&toml)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn disabled_drafts_never_dirty_ac007_22() {
+        let mut s = AppState {
+            drafts_enabled: false,
+            ..Default::default()
+        };
+        s.mark_drafts_dirty();
+        assert!(!s.take_draft_dirty(), "disabled 不落盘（纯内存退化）");
+    }
+
+    #[test]
+    fn seed_and_clear_all_drafts_ac007_22() {
+        let mut store = crate::model::DraftStore::default();
+        store.set("s1", "草稿一");
+        store.set("s2", "草稿二");
+        let mut s = AppState::default();
+        s.seed_drafts_from_store(store);
+        assert!(s.drafts.get(&SessionId("s1".into())).is_some(), "启动恢复");
+        assert!(s.drafts.get(&SessionId("s2".into())).is_some());
+        // clear：内存全清 + dirty。
+        s.clear_all_drafts();
+        assert!(s.drafts.is_empty());
+        assert!(s.take_draft_dirty());
+    }
+
+    #[test]
+    fn draft_registry_clear_all_and_session_ids() {
+        let mut reg = crate::model::DraftRegistry::new(20);
+        reg.set(DraftState {
+            text: "a".into(),
+            cursor: 0,
+            bound_session: SessionId("s1".into()),
+        });
+        reg.set(DraftState {
+            text: "b".into(),
+            cursor: 0,
+            bound_session: SessionId("s2".into()),
+        });
+        assert_eq!(reg.session_ids().len(), 2);
+        reg.clear_all();
+        assert!(reg.is_empty());
+    }
+
+    // ---------- REQ-007 V0.4 `:edit`（AC-007-25） ----------
+
+    #[test]
+    fn external_edit_begin_requires_open_composer_ac007_25() {
+        let mut s = AppState::default();
+        // 未打开 composer → 提示不发命令。
+        let cmds = s.external_edit_begin();
+        assert!(cmds.is_empty());
+        assert!(s.notice.as_deref().unwrap_or("").contains("composer"));
+    }
+
+    #[test]
+    fn external_edit_begin_writes_tmp_and_emits_cmd_ac007_25() {
+        // 隔离 $EDITOR（共享 EDITOR_ENV_LOCK 防并行 env 竞争）。
+        let _guard = EDITOR_ENV_LOCK.lock().unwrap();
+        let prev = std::env::var("EDITOR").ok();
+        let prev_visual = std::env::var("VISUAL").ok();
+        std::env::remove_var("VISUAL");
+        std::env::set_var("EDITOR", "/bin/true");
+        let mut s = AppState::default();
+        let sid = SessionId("sess-e".into());
+        s.composer.visible = true;
+        s.composer.active_session = Some(sid.clone());
+        s.draft = Some(DraftState {
+            text: "正在编辑的草稿".into(),
+            cursor: 3,
+            bound_session: sid.clone(),
+        });
+        let cmds = s.external_edit_begin();
+        let cmd = cmds
+            .iter()
+            .find(|c| matches!(c, Cmd::ExternalEdit { .. }))
+            .expect("发出 ExternalEdit");
+        let (tmp, editor) = match cmd {
+            Cmd::ExternalEdit { tmp_path, editor } => (tmp_path.clone(), editor.clone()),
+            _ => unreachable!(),
+        };
+        assert_eq!(editor, "/bin/true");
+        assert_eq!(
+            std::fs::read_to_string(&tmp).unwrap(),
+            "正在编辑的草稿",
+            "草稿写入临时文件"
+        );
+        assert_eq!(
+            s.external_edit.phase,
+            crate::model::external_edit::ExternalEditPhase::Editing
+        );
+        assert_eq!(s.mode, Mode::Normal, "编辑期间退 composer 模态");
+        let _ = std::fs::remove_file(&tmp);
+        match prev {
+            Some(v) => std::env::set_var("EDITOR", v),
+            None => std::env::remove_var("EDITOR"),
+        }
+        match prev_visual {
+            Some(v) => std::env::set_var("VISUAL", v),
+            None => std::env::remove_var("VISUAL"),
+        }
+    }
+
+    /// 构建一个 `:edit` 就绪的 AppState（struct update 字面量，无
+    /// Default 后字段赋值——规避 clippy field_reassign_with_default）。
+    fn edit_state(editor_fallback: Option<String>, sid: &SessionId) -> AppState {
+        AppState {
+            editor_fallback,
+            mode: Mode::Insert,
+            composer: ComposerState {
+                visible: true,
+                active_session: Some(sid.clone()),
+                steer: false,
+            },
+            draft: Some(DraftState {
+                text: "草稿".into(),
+                cursor: 0,
+                bound_session: sid.clone(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn external_edit_editor_chain_visual_editor_config_d52() {
+        // D-52：`$VISUAL` → `$EDITOR` → config `[ui].editor` 三级链；
+        // 前级存在覆盖后级；全缺 → 可读提示不发命令。
+        let _guard = EDITOR_ENV_LOCK.lock().unwrap();
+        let prev_editor = std::env::var("EDITOR").ok();
+        let prev_visual = std::env::var("VISUAL").ok();
+        let prev_xdg = std::env::var("XDG_STATE_HOME").ok();
+        let state_dir =
+            std::env::temp_dir().join(format!("dshtui-edit-chain-{}", std::process::id()));
+        std::env::set_var("XDG_STATE_HOME", &state_dir);
+        let sid = SessionId("sess-e2".into());
+        // ① env 全缺 → config fallback。
+        std::env::remove_var("EDITOR");
+        std::env::remove_var("VISUAL");
+        let mut s = edit_state(Some("/bin/true".into()), &sid);
+        let cmds = s.external_edit_begin();
+        let Cmd::ExternalEdit { tmp_path, editor } = cmds
+            .iter()
+            .find(|c| matches!(c, Cmd::ExternalEdit { .. }))
+            .unwrap()
+        else {
+            panic!("config fallback 编辑器应生效，{cmds:?}")
+        };
+        assert_eq!(editor, "/bin/true", "config [ui].editor 生效");
+        let _ = std::fs::remove_file(tmp_path);
+        // ② $EDITOR 存在 → 覆盖 config。
+        std::env::set_var("EDITOR", "/bin/echo");
+        let mut s = edit_state(Some("/bin/true".into()), &sid);
+        let cmds = s.external_edit_begin();
+        let Cmd::ExternalEdit { tmp_path, editor } = cmds
+            .iter()
+            .find(|c| matches!(c, Cmd::ExternalEdit { .. }))
+            .unwrap()
+        else {
+            panic!("$EDITOR 应覆盖 config，{cmds:?}")
+        };
+        assert_eq!(editor, "/bin/echo", "$EDITOR 优先于 config");
+        let _ = std::fs::remove_file(tmp_path);
+        // ③ $VISUAL 存在 → 覆盖 $EDITOR。
+        std::env::set_var("VISUAL", "/bin/cat");
+        std::env::remove_var("EDITOR");
+        let mut s = edit_state(Some("/bin/true".into()), &sid);
+        let cmds = s.external_edit_begin();
+        let Cmd::ExternalEdit { tmp_path, editor } = cmds
+            .iter()
+            .find(|c| matches!(c, Cmd::ExternalEdit { .. }))
+            .unwrap()
+        else {
+            panic!("$VISUAL 应生效，{cmds:?}")
+        };
+        assert_eq!(editor, "/bin/cat", "$VISUAL 最优先");
+        let _ = std::fs::remove_file(tmp_path);
+        // ④ 全缺（含 config None）→ 可读提示，不发命令。
+        std::env::remove_var("VISUAL");
+        std::env::remove_var("EDITOR");
+        let mut s = edit_state(None, &sid);
+        let cmds = s.external_edit_begin();
+        assert!(cmds.is_empty(), "无编辑器不发命令");
+        let notice = s.notice.as_deref().unwrap_or("");
+        assert!(notice.contains("EDITOR"), "提示选择链, {notice}");
+        assert!(notice.contains("[ui].editor"), "提示 config, {notice}");
+        // 清理：env + state 临时目录。
+        let _ = std::fs::remove_dir_all(&state_dir);
+        match prev_editor {
+            Some(v) => std::env::set_var("EDITOR", v),
+            None => std::env::remove_var("EDITOR"),
+        }
+        match prev_visual {
+            Some(v) => std::env::set_var("VISUAL", v),
+            None => std::env::remove_var("VISUAL"),
+        }
+        match prev_xdg {
+            Some(v) => std::env::set_var("XDG_STATE_HOME", v),
+            None => std::env::remove_var("XDG_STATE_HOME"),
+        }
+    }
+
+    #[test]
+    fn external_edit_done_success_refills_composer_ac007_25() {
+        let dir = std::env::temp_dir().join(format!("dshtui-edit-done-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = dir.join("draft.md");
+        let mut s = AppState::default();
+        let sid = SessionId("sess-e".into());
+        s.composer.visible = false;
+        s.draft = Some(DraftState {
+            text: "old".into(),
+            cursor: 0,
+            bound_session: sid.clone(),
+        });
+        // 模拟 main：suspend + editor 写回 + ExternalEditDone。
+        s.external_edit
+            .suspend("old", tmp.to_string_lossy().into_owned(), Some("x".into()));
+        std::fs::write(&tmp, "EDITED-CONTENT").unwrap();
+        s.external_edit_done(true, &tmp, "EDITED-CONTENT", "");
+        assert_eq!(
+            s.draft.as_ref().map(|d| d.text.as_str()),
+            Some("EDITED-CONTENT"),
+            "成功回填 composer"
+        );
+        assert_eq!(s.mode, Mode::Insert);
+        assert!(s.composer.visible);
+        assert!(!tmp.exists(), "临时文件会话内清理");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn external_edit_done_failure_keeps_original_draft_ac007_25() {
+        let dir = std::env::temp_dir().join(format!("dshtui-edit-fail-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = dir.join("draft.md");
+        let mut s = AppState::default();
+        let sid = SessionId("sess-f".into());
+        s.composer.visible = false;
+        s.draft = Some(DraftState {
+            text: "原草稿".into(),
+            cursor: 0,
+            bound_session: sid.clone(),
+        });
+        s.external_edit.suspend(
+            "原草稿",
+            tmp.to_string_lossy().into_owned(),
+            Some("bad-editor".into()),
+        );
+        s.external_edit_done(false, &tmp, "", "编辑器 bad-editor 异常退出（exit 3）");
+        assert_eq!(
+            s.draft.as_ref().map(|d| d.text.as_str()),
+            Some("原草稿"),
+            "失败保留原草稿（恢复路径不污染）"
+        );
+        assert!(s.last_error.as_deref().unwrap_or("").contains(":edit 失败"));
+        assert_eq!(s.mode, Mode::Insert);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---------- REQ-007 V0.4 @ 提及（AC-007-23） ----------
+
+    #[test]
+    fn mention_activated_on_at_in_insert_ac007_23() {
+        let mut s = AppState::default();
+        let sid = SessionId("sess-m".into());
+        s.mode = Mode::Insert;
+        s.composer.visible = true;
+        s.composer.active_session = Some(sid.clone());
+        s.draft = Some(DraftState {
+            text: "去 ".into(),
+            cursor: 3,
+            bound_session: sid.clone(),
+        });
+        // @ 词边界 → 进入 Mention 并发拉取命令。
+        let cmds = s.handle_command(crate::input::Command::PickerInput("@".into()));
+        assert_eq!(s.mode, Mode::Mention, "进入提及模态");
+        assert!(s.mention.active);
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, Cmd::FetchMentionCandidates { .. })),
+            "激活即拉候选"
+        );
+        // 非词边界（@ 在单词中间）不触发。
+        s.mention.deactivate();
+        s.mode = Mode::Insert;
+        s.draft.as_mut().unwrap().text = "foo@".into();
+        s.handle_command(crate::input::Command::PickerInput("@".into()));
+        assert_eq!(s.mode, Mode::Insert, "非词边界 @ 是普通字符");
+    }
+
+    #[test]
+    fn mention_query_navigate_confirm_and_close_ac007_23() {
+        let mut s = AppState::default();
+        let sid = SessionId("sess-m".into());
+        s.mode = Mode::Insert;
+        s.composer.visible = true;
+        s.composer.active_session = Some(sid.clone());
+        s.draft = Some(DraftState {
+            text: "去 ".into(),
+            cursor: 3,
+            bound_session: sid.clone(),
+        });
+        s.handle_command(crate::input::Command::PickerInput("@".into()));
+        assert_eq!(s.mode, Mode::Mention);
+        // 字符进 query。
+        s.handle_command(crate::input::Command::PickerInput("s".into()));
+        assert_eq!(s.mention.query, "s");
+        // 候选回填（file + session 两源）。
+        s.mention.set_candidates(
+            s.mention.generation,
+            vec![crate::api::types::FileReferenceCandidate {
+                path: "src/api/mod.rs".into(),
+                kind: "file".into(),
+            }],
+            vec![crate::api::types::SessionReferenceMentionCandidate {
+                session_id: "s1".into(),
+                label: "部署".into(),
+                cwd: None,
+                same_workspace: true,
+                created_at: None,
+                mention: "@[部署](dsh-session:s1)".into(),
+            }],
+        );
+        assert_eq!(s.mention.filtered().len(), 2);
+        // j 移动 + Enter 回填第一候选（文件）——排序 file 在前。
+        s.handle_command(crate::input::Command::PickerDown);
+        s.handle_command(crate::input::Command::PickerUp);
+        let cmds = s.handle_command(crate::input::Command::PickerConfirm);
+        assert_eq!(s.mode, Mode::Insert, "确认回 INSERT");
+        assert!(!s.mention.active);
+        assert!(
+            s.draft
+                .as_ref()
+                .map(|d| d.text.as_str())
+                .unwrap_or("")
+                .contains("src/api/mod.rs"),
+            "文件候选回填 composer"
+        );
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn mention_esc_closes_back_to_insert_ac007_23() {
+        let mut s = AppState::default();
+        let sid = SessionId("sess-m".into());
+        s.mode = Mode::Insert;
+        s.composer.visible = true;
+        s.composer.active_session = Some(sid.clone());
+        s.draft = Some(DraftState {
+            text: "".into(),
+            cursor: 0,
+            bound_session: sid.clone(),
+        });
+        s.handle_command(crate::input::Command::PickerInput("@".into()));
+        assert_eq!(s.mode, Mode::Mention);
+        s.handle_command(crate::input::Command::ClosePicker);
+        assert_eq!(s.mode, Mode::Insert);
+        assert!(!s.mention.active);
+        assert!(s.composer.visible, "composer 保留");
+    }
+
+    #[test]
+    fn mention_fetch_failure_degrades_not_crash_ac007_23() {
+        let mut s = AppState::default();
+        let sid = SessionId("sess-m".into());
+        s.mode = Mode::Insert;
+        s.composer.visible = true;
+        s.composer.active_session = Some(sid.clone());
+        s.draft = Some(DraftState {
+            text: "".into(),
+            cursor: 0,
+            bound_session: sid.clone(),
+        });
+        s.handle_command(crate::input::Command::PickerInput("@".into()));
+        let gen = s.mention.generation;
+        let _ = s.handle(AppEvent::MentionCandidatesFailed {
+            generation: gen,
+            error: ClientError::Transport("断网".into()),
+        });
+        assert!(!s.mention.loading, "失败停 loading");
+        assert_eq!(s.mention.last_error_code.as_deref(), Some("transport"));
+        assert_eq!(s.mode, Mode::Mention, "失败不崩，可 Esc 手动输入");
+    }
+
+    // ---------- REQ-007 V0.4 图片附件发送（AC-007-24） ----------
+
+    fn temp_img(tag: &str, content: &[u8]) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("dshtui-img-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("photo.png");
+        std::fs::write(&file, content).unwrap();
+        (dir, file)
+    }
+
+    #[test]
+    fn submit_with_image_path_line_emits_image_part_ac007_24() {
+        use base64::Engine as _;
+        let (_dir, file) = temp_img("ok", b"\x89PNG-not-real-but-ok");
+        let path = file.to_string_lossy().into_owned();
+        let mut s = AppState::default();
+        let sid = SessionId("sess-i".into());
+        s.mode = Mode::Insert;
+        s.composer.visible = true;
+        s.composer.active_session = Some(sid.clone());
+        s.draft = Some(DraftState {
+            text: format!("看这张图\n{path}"),
+            cursor: 0,
+            bound_session: sid.clone(),
+        });
+        let cmds = s.submit_input(PromptMode::Queue);
+        let cmd = cmds
+            .iter()
+            .find(|c| matches!(c, Cmd::SendPrompt { .. }))
+            .expect("发出发送");
+        let (sid2, request) = match cmd {
+            Cmd::SendPrompt {
+                session_id,
+                request,
+            } => (session_id, request),
+            _ => unreachable!(),
+        };
+        assert_eq!(sid2, &sid);
+        // content 顺序 [image..., text]。
+        assert!(
+            matches!(&request.content[0], PromptContentPart::Image { .. }),
+            "首部为 Image part"
+        );
+        let text_len = request
+            .content
+            .iter()
+            .filter(|p| matches!(p, PromptContentPart::Text { .. }))
+            .count();
+        assert_eq!(text_len, 1, "文本部分保留（不含图片行）");
+        match &request.content[0] {
+            PromptContentPart::Image {
+                media_type, data, ..
+            } => {
+                assert_eq!(media_type, "image/png");
+                let decoded = base64::engine::general_purpose::STANDARD
+                    .decode(data)
+                    .unwrap();
+                assert_eq!(decoded, b"\x89PNG-not-real-but-ok");
+            }
+            _ => unreachable!(),
+        }
+        assert!(s.pending_image_attachments.is_empty(), "发送后清空在途");
+        let _ = std::fs::remove_dir_all(&_dir);
+    }
+
+    #[test]
+    fn submit_image_read_failure_keeps_draft_in_insert_ac007_24() {
+        let mut s = AppState::default();
+        let sid = SessionId("sess-i".into());
+        s.mode = Mode::Insert;
+        s.composer.visible = true;
+        s.composer.active_session = Some(sid.clone());
+        s.draft = Some(DraftState {
+            text: "/nonexistent/nope.png".into(),
+            cursor: 0,
+            bound_session: sid.clone(),
+        });
+        let cmds = s.submit_input(PromptMode::Queue);
+        assert!(cmds.is_empty(), "失败不发命令");
+        assert_eq!(s.mode, Mode::Insert, "保留 INSERT");
+        assert!(s.composer.visible, "composer 保留");
+        assert_eq!(
+            s.draft.as_ref().map(|d| d.text.as_str()),
+            Some("/nonexistent/nope.png")
+        );
+        assert!(s.notice.as_deref().unwrap_or("").contains("图片读取失败"));
+        // 恢复路径：修正为有效图片后能正常发送（不被旧失败污染）。
+        let (_dir, file) = temp_img("rec", b"abc");
+        s.draft.as_mut().unwrap().text = file.to_string_lossy().into_owned();
+        s.notice = None;
+        let cmds = s.submit_input(PromptMode::Queue);
+        assert!(
+            cmds.iter().any(|c| matches!(c, Cmd::SendPrompt { .. })),
+            "恢复后可发送"
+        );
+        let _ = std::fs::remove_dir_all(&_dir);
+    }
+
+    #[test]
+    fn submit_image_over_limit_blocks_with_notice_ac007_24() {
+        let (_dir, file) = temp_img("big", b"1234567890");
+        let path = file.to_string_lossy().into_owned();
+        let mut s = AppState::default();
+        let sid = SessionId("sess-i".into());
+        s.active_session = Some(sid.clone());
+        s.mode = Mode::Insert;
+        s.composer.visible = true;
+        s.composer.active_session = Some(sid.clone());
+        s.draft = Some(DraftState {
+            text: path.clone(),
+            cursor: 0,
+            bound_session: sid.clone(),
+        });
+        // 造 imageLimits 投影：单张 ≤5 字节 → 超限。
+        let window = s.sessions.touch(&sid.0, 50);
+        let _ = window.apply(Incoming::Snapshot {
+            cursor: None,
+            records: vec![],
+            has_more: false,
+            projections: Some(serde_json::json!({
+                "imageLimits": {"maxImageBytes": 5, "maxImagesPerMessage": 1,
+                                "mediaTypes": ["image/png"]}
+            })),
+        });
+        let cmds = s.submit_input(PromptMode::Queue);
+        assert!(cmds.is_empty(), "超限不发");
+        assert_eq!(s.mode, Mode::Insert);
+        assert!(
+            s.notice.as_deref().unwrap_or("").contains("上限"),
+            "notice={:?}",
+            s.notice
+        );
+        let _ = std::fs::remove_dir_all(&_dir);
+    }
+
+    #[test]
+    fn submit_local_soft_limit_blocks_when_projection_absent_d51() {
+        // D-51：无官方 imageLimits 投影（本地兜底）——数量软上限拦截。
+        let (_dir1, f1) = temp_img("cnt1", b"aaa");
+        let (_dir2, f2) = temp_img("cnt2", b"bbb");
+        let sid = SessionId("sess-i".into());
+        let mut s = AppState {
+            max_image_count: 1, // 本地上限 1 张
+            mode: Mode::Insert,
+            composer: ComposerState {
+                visible: true,
+                active_session: Some(sid.clone()),
+                steer: false,
+            },
+            draft: Some(DraftState {
+                text: format!("{}\n{}", f1.to_string_lossy(), f2.to_string_lossy()),
+                cursor: 0,
+                bound_session: sid.clone(),
+            }),
+            ..Default::default()
+        };
+        let cmds = s.submit_input(PromptMode::Queue);
+        assert!(cmds.is_empty(), "数量超本地软上限不发");
+        assert_eq!(s.mode, Mode::Insert, "保留 INSERT 可重选");
+        let notice = s.notice.as_deref().unwrap_or("");
+        assert!(notice.contains("本地上限"), "notice={notice}");
+        assert!(notice.contains("1"), "提示上限数量, {notice}");
+        // 恢复路径：降到上限内（1 张）可正常发送。
+        s.draft.as_mut().unwrap().text = f1.to_string_lossy().into_owned();
+        s.notice = None;
+        let cmds = s.submit_input(PromptMode::Queue);
+        assert!(
+            cmds.iter().any(|c| matches!(c, Cmd::SendPrompt { .. })),
+            "减到 1 张可发送"
+        );
+        let _ = std::fs::remove_dir_all(&_dir1);
+        let _ = std::fs::remove_dir_all(&_dir2);
+    }
+
+    #[test]
+    fn submit_local_soft_limit_per_image_bytes_blocks_d51() {
+        // D-51：单张字节软上限拦截（本地兜底，per-image 语义）。
+        let (_dir, file) = temp_img("byte", b"1234567890"); // 10 字节
+        let sid = SessionId("sess-i".into());
+        let mut s = AppState {
+            max_image_bytes: 5, // 本地上限 5 字节
+            mode: Mode::Insert,
+            composer: ComposerState {
+                visible: true,
+                active_session: Some(sid.clone()),
+                steer: false,
+            },
+            draft: Some(DraftState {
+                text: file.to_string_lossy().into_owned(),
+                cursor: 0,
+                bound_session: sid.clone(),
+            }),
+            ..Default::default()
+        };
+        let cmds = s.submit_input(PromptMode::Queue);
+        assert!(cmds.is_empty(), "单张超本地上限不发");
+        let notice = s.notice.as_deref().unwrap_or("");
+        assert!(notice.contains("本地上限"), "notice={notice}");
+        assert!(notice.contains("单张"), "per-image 提示, {notice}");
+        // 恢复路径：放宽上限后同文件可发送（重建 state 规避字段赋值 lint）。
+        s.max_image_bytes = 100;
+        s.notice = None;
+        let cmds = s.submit_input(PromptMode::Queue);
+        assert!(
+            cmds.iter().any(|c| matches!(c, Cmd::SendPrompt { .. })),
+            "放宽上限后可发送"
+        );
+        let _ = std::fs::remove_dir_all(&_dir);
+    }
+
+    // ---------- REQ-007 V0.4 subagent 目录（AC-007-07~10） ----------
+
+    #[test]
+    fn subagents_open_fetch_and_expand_ac007() {
+        let mut s = AppState {
+            active_session: Some(SessionId("p1".into())),
+            ..Default::default()
+        };
+        // 打开面板 → fetch 父目录。
+        let _ = s.handle_command(crate::input::Command::OpenCommandPalette);
+        s.command_palette.query = "subagents".into();
+        let idx = s
+            .command_palette
+            .filtered()
+            .iter()
+            .position(|i| {
+                matches!(
+                    i,
+                    CommandPaletteItem::Local {
+                        label: "subagents",
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        s.command_palette.selection = idx;
+        let cmds = s.handle_command(crate::input::Command::PickerConfirm);
+        assert_eq!(s.mode, Mode::Subagent, "进入 subagent 模态");
+        assert!(s.subagents.visible);
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, Cmd::FetchSubagentList { .. })),
+            "打开即拉取"
+        );
+        // 拉取回执。
+        let gen = 1;
+        let _ = s.handle(AppEvent::SubagentListed {
+            parent_id: "p1".into(),
+            generation: gen,
+            catalog: crate::api::types::SubagentCatalog {
+                entries: vec![crate::api::types::SubagentListEntry::Child {
+                    id: "c1".into(),
+                    activity: "running".into(),
+                    has_children: true,
+                    mode: Some("continuable".into()),
+                    label: None,
+                }],
+                parent_available: true,
+            },
+        });
+        assert!(!s.subagents.loading);
+        assert_eq!(s.subagents.roots.len(), 1);
+        // Enter 展开 has_children → fetch 子。
+        s.subagents.selected = 0;
+        let cmds = s.handle_command(crate::input::Command::PickerConfirm);
+        assert!(cmds
+            .iter()
+            .any(|c| matches!(c, Cmd::FetchSubagentList { parent_id, .. } if parent_id == "c1")));
+    }
+
+    #[test]
+    fn subagents_interrupt_requires_confirm_and_emits_cmd_ac007_09() {
+        let mut s = AppState {
+            active_session: Some(SessionId("p1".into())),
+            ..Default::default()
+        };
+        s.subagents.open("p1");
+        s.mode = Mode::Subagent;
+        s.subagents.set_catalog(
+            "p1",
+            crate::api::types::SubagentCatalog {
+                entries: vec![crate::api::types::SubagentListEntry::Child {
+                    id: "c1".into(),
+                    activity: "running".into(),
+                    has_children: false,
+                    mode: Some("continuable".into()),
+                    label: None,
+                }],
+                parent_available: true,
+            },
+        );
+        // x → 二次确认态（不发命令）。
+        let cmds = s.handle_command(crate::input::Command::SubagentInterrupt);
+        assert!(cmds.is_empty(), "确认前不发");
+        assert_eq!(s.subagents.interrupt_target.as_deref(), Some("c1"));
+        // Esc 取消。
+        let _ = s.handle_command(crate::input::Command::ClosePicker);
+        assert!(s.subagents.interrupt_target.is_none());
+        // 再 x + Enter 确认 → 发 interrupt。
+        let _ = s.handle_command(crate::input::Command::SubagentInterrupt);
+        let cmds = s.handle_command(crate::input::Command::PickerConfirm);
+        assert!(
+            cmds.iter().any(
+                |c| matches!(c, Cmd::SubagentInterrupt { child_id, parent_id }
+                if child_id == "c1" && parent_id == "p1")
+            ),
+            "确认后发位置参数 interrupt"
+        );
+    }
+
+    #[test]
+    fn subagents_interrupt_failure_surfaces_error_code_ac007_09() {
+        let mut s = AppState {
+            active_session: Some(SessionId("p1".into())),
+            ..Default::default()
+        };
+        let _ = s.handle(AppEvent::SubagentInterruptDone {
+            child_id: "c1".into(),
+            error: Some(ClientError::Remote {
+                code: "PERMISSION_DENIED".into(),
+                message: "无权限".into(),
+                class: ErrorClass::PermissionDenied,
+            }),
+        });
+        assert_eq!(
+            s.subagents.last_error_code.as_deref(),
+            Some("PERMISSION_DENIED")
+        );
+        assert!(!s.subagents.interrupt_target.is_some());
+        // 恢复路径：成功回执清错误 + 该行 activity 置 inactive（AC-007-09 刷新）。
+        s.subagents.open("p1");
+        s.subagents.set_catalog(
+            "p1",
+            crate::api::types::SubagentCatalog {
+                entries: vec![crate::api::types::SubagentListEntry::Child {
+                    id: "c1".into(),
+                    activity: "running".into(),
+                    has_children: false,
+                    mode: Some("continuable".into()),
+                    label: None,
+                }],
+                parent_available: true,
+            },
+        );
+        let _ = s.handle(AppEvent::SubagentInterruptDone {
+            child_id: "c1".into(),
+            error: None,
+        });
+        assert_eq!(s.subagents.last_error_code, None);
+        assert_eq!(
+            s.subagents
+                .flatten()
+                .first()
+                .map(|r| r.node.activity.as_str()),
+            Some("inactive"),
+            "中断成功后该行运行态停止"
+        );
+    }
+
+    #[test]
+    fn subagent_child_open_uses_subagent_address_follow_ac007_01() {
+        let mut s = AppState {
+            active_session: Some(SessionId("p1".into())),
+            ..Default::default()
+        };
+        s.subagents.open("p1");
+        s.mode = Mode::Subagent;
+        s.subagents.set_catalog(
+            "p1",
+            crate::api::types::SubagentCatalog {
+                entries: vec![crate::api::types::SubagentListEntry::Child {
+                    id: "c1".into(),
+                    activity: "running".into(),
+                    has_children: false,
+                    mode: Some("continuable".into()),
+                    label: None,
+                }],
+                parent_available: true,
+            },
+        );
+        s.subagents.selected = 0;
+        let cmds = s.handle_command(crate::input::Command::OpenSelected);
+        assert_eq!(s.mode, Mode::Normal, "关闭面板");
+        assert!(!s.subagents.visible);
+        assert_eq!(s.active_session.as_ref().map(|s| s.0.as_str()), Some("c1"));
+        assert_eq!(
+            s.pending_subagent_open
+                .as_ref()
+                .map(|(p, c)| (p.as_str(), c.as_str())),
+            Some(("p1", "c1"))
+        );
+        assert!(
+            cmds.iter().any(
+                |c| matches!(c, Cmd::OpenFollowSubagent { parent_id, child_id, .. }
+                if parent_id == "p1" && child_id == "c1")
+            ),
+            "follow 走 subagent address"
+        );
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Cmd::OpenControl { .. })),
+            "子代理不订阅 control"
+        );
+    }
+
+    #[test]
+    fn subagent_grandchild_open_uses_direct_parent_ac007_01() {
+        // 嵌套子代理（孙代）：目录 p1 → 展开 c1 → 选中 gc1 打开。follow 的
+        // parentSessionId 必须是直属父 c1（`subagents/list` 只列直属），
+        // 不是 panel 根 p1——AC-007-01 嵌套语义。
+        let mut s = AppState {
+            active_session: Some(SessionId("p1".into())),
+            ..Default::default()
+        };
+        s.subagents.open("p1");
+        s.mode = Mode::Subagent;
+        s.subagents.set_catalog(
+            "p1",
+            crate::api::types::SubagentCatalog {
+                entries: vec![crate::api::types::SubagentListEntry::Child {
+                    id: "c1".into(),
+                    activity: "running".into(),
+                    has_children: true,
+                    mode: Some("continuable".into()),
+                    label: None,
+                }],
+                parent_available: true,
+            },
+        );
+        // 展开 c1 → 拉回直属 gc1。
+        let (need, id) = s.subagents.toggle_expand("c1").unwrap();
+        assert!(need && id == "c1");
+        s.subagents.set_catalog(
+            "c1",
+            crate::api::types::SubagentCatalog {
+                entries: vec![crate::api::types::SubagentListEntry::Child {
+                    id: "gc1".into(),
+                    activity: "inactive".into(),
+                    has_children: false,
+                    mode: Some("continuable".into()),
+                    label: None,
+                }],
+                parent_available: true,
+            },
+        );
+        // 选中 gc1（flatten 第 2 行）。
+        s.subagents.selected = 1;
+        let cmds = s.handle_command(crate::input::Command::OpenSelected);
+        assert_eq!(s.mode, Mode::Normal);
+        assert_eq!(s.active_session.as_ref().map(|s| s.0.as_str()), Some("gc1"));
+        assert!(
+            cmds.iter().any(
+                |c| matches!(c, Cmd::OpenFollowSubagent { parent_id, child_id, .. }
+                if parent_id == "c1" && child_id == "gc1")
+            ),
+            "孙代 follow 以直属父 c1 为 parentSessionId, cmds={cmds:?}"
+        );
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Cmd::OpenControl { .. })),
+            "孙代也不订阅 control"
+        );
+    }
+
+    #[test]
+    fn subagents_list_failed_shows_code_panel_open_ac007_08() {
+        let mut s = AppState {
+            active_session: Some(SessionId("p1".into())),
+            ..Default::default()
+        };
+        s.subagents.open("p1");
+        s.mode = Mode::Subagent;
+        let _ = s.handle(AppEvent::SubagentListFailed {
+            parent_id: "p1".into(),
+            generation: 1,
+            error: ClientError::Remote {
+                code: "gateway/agent-busy".into(),
+                message: "忙".into(),
+                class: ErrorClass::UserFacing,
+            },
+        });
+        assert!(!s.subagents.loading);
+        assert_eq!(
+            s.subagents.last_error_code.as_deref(),
+            Some("gateway/agent-busy")
+        );
+        assert_eq!(s.mode, Mode::Subagent, "失败面板保持可重试/Esc");
+    }
+
+    // ---------- REQ-007 V0.4 goal 面板（AC-007-11/12/14） ----------
+
+    #[test]
+    fn goal_open_shows_projection_and_empty_state_ac007_11() {
+        let mut s = AppState::default();
+        let sid = SessionId("sess-g".into());
+        s.active_session = Some(sid.clone());
+        // 会话有 goal 投影。
+        let w = s.sessions.touch(&sid.0, 50);
+        let _ = w.apply(Incoming::Snapshot {
+            cursor: None,
+            records: vec![],
+            has_more: false,
+            projections: Some(serde_json::json!({
+                "goal": {"goal": {"id": "g1", "revision": 2, "objective": "交付",
+                                  "phase": "active"}, "roundsStarted": 1}
+            })),
+        });
+        let _ = s.handle_command(crate::input::Command::OpenCommandPalette);
+        s.command_palette.query = "goal".into();
+        let idx = s
+            .command_palette
+            .filtered()
+            .iter()
+            .position(|i| matches!(i, CommandPaletteItem::Local { label: "goal", .. }))
+            .expect("goal 入口");
+        s.command_palette.selection = idx;
+        let _cmds = s.handle_command(crate::input::Command::PickerConfirm);
+        assert_eq!(s.mode, Mode::Goal, "进入 goal 模态");
+        assert!(s.goals.visible);
+        assert_eq!(
+            s.goals.goal.as_ref().map(|g| g.objective.as_str()),
+            Some("交付")
+        );
+        assert_eq!(s.goals.goal.as_ref().map(|g| g.revision), Some(2));
+    }
+
+    #[test]
+    fn goal_pause_sends_cas_op_and_stale_failure_recovers_ac007_12_14() {
+        let mut s = AppState::default();
+        let sid = SessionId("sess-g".into());
+        s.active_session = Some(sid.clone());
+        s.goals.open();
+        s.goals.set_goal(
+            Some(crate::model::GoalView {
+                id: "g1".into(),
+                revision: 4,
+                objective: "交付".into(),
+                phase: Some(crate::api::types::GoalPhase::Active),
+                ..Default::default()
+            }),
+            false,
+        );
+        s.mode = Mode::Goal;
+        // p → pause CAS。
+        let cmds = s.handle_command(crate::input::Command::GoalPause);
+        assert!(
+            cmds.iter().any(|c| matches!(c, Cmd::GoalOp { .. })),
+            "发 pause"
+        );
+        assert_eq!(s.goals.inflight, Some(crate::model::GoalOpKind::Pause));
+        // GOAL_STALE_REVISION 失败 → stale 置位 + 重读提示。
+        let _ = s.handle(AppEvent::GoalOpFailed {
+            request_id: "x".into(),
+            op: GoalMutation::Pause,
+            error: ClientError::Remote {
+                code: "GOAL_STALE_REVISION".into(),
+                message: "stale".into(),
+                class: ErrorClass::UserFacing,
+            },
+        });
+        assert!(s.goals.stale_revision);
+        assert!(s.goals.inflight.is_none());
+        // 恢复：重读投影后（revision 6）再 resume 成功。
+        s.goals.set_goal(
+            Some(crate::model::GoalView {
+                id: "g1".into(),
+                revision: 6,
+                objective: "交付".into(),
+                phase: Some(crate::api::types::GoalPhase::Active),
+                ..Default::default()
+            }),
+            false,
+        );
+        let cmds = s.handle_command(crate::input::Command::GoalResume);
+        assert!(
+            cmds.iter().any(|c| matches!(c, Cmd::GoalOp { .. })),
+            "stale 恢复后可重试"
+        );
+    }
+
+    #[test]
+    fn goal_stale_clears_only_when_projection_revision_advances_ac007_12_14() {
+        // 走真实投影刷新路径：STALE 失败后重读同一 revision 的缓存投影
+        // 不得解除 stale（否则陷入 STALE→重读→STALE 循环）；revision 前进
+        // 才放行（GOAL_STALE_REVISION 对账）。
+        let mut s = AppState::default();
+        let sid = SessionId("sess-g".into());
+        s.active_session = Some(sid.clone());
+        let w = s.sessions.touch(&sid.0, 50);
+        let proj = |rev: u64| {
+            Some(serde_json::json!({
+                "goal": {"goal": {"id": "g1", "revision": rev, "objective": "交付",
+                                  "phase": "active"}, "roundsStarted": 1}
+            }))
+        };
+        let _ = w.apply(Incoming::Snapshot {
+            cursor: None,
+            records: vec![],
+            has_more: false,
+            projections: proj(4),
+        });
+        s.goals.open();
+        s.mode = Mode::Goal;
+        s.refresh_goal_from_projection();
+        assert_eq!(s.goals.goal.as_ref().map(|g| g.revision), Some(4));
+        // 发起 pause（CAS revision=4）。
+        let cmds = s.handle_command(crate::input::Command::GoalPause);
+        assert!(cmds.iter().any(|c| matches!(c, Cmd::GoalOp { .. })));
+        // STALE 失败（对端 revision 已 6）→ stale 置位 + 重读。
+        let _ = s.handle(AppEvent::GoalOpFailed {
+            request_id: "x".into(),
+            op: GoalMutation::Pause,
+            error: ClientError::Remote {
+                code: "GOAL_STALE_REVISION".into(),
+                message: "stale".into(),
+                class: ErrorClass::UserFacing,
+            },
+        });
+        assert!(s.goals.stale_revision);
+        // 重读同一缓存投影（revision 仍 4 ≤ sent 4）→ stale 保持，禁再发。
+        s.refresh_goal_from_projection();
+        assert!(
+            s.goals.stale_revision,
+            "同一 revision 重读不得解除 stale（防循环）"
+        );
+        let cmds = s.handle_command(crate::input::Command::GoalResume);
+        assert!(cmds.is_empty(), "stale 未解除时 resume 拒绝");
+        // 对端投影前进到 6（follow 帧真实更新）→ 重读解除 stale → resume 放行。
+        let w = s.sessions.touch(&sid.0, 50);
+        let _ = w.apply(Incoming::Snapshot {
+            cursor: None,
+            records: vec![],
+            has_more: false,
+            projections: proj(6),
+        });
+        s.refresh_goal_from_projection();
+        assert!(!s.goals.stale_revision, "revision 前进后解除 stale");
+        let cmds = s.handle_command(crate::input::Command::GoalResume);
+        assert!(
+            cmds.iter().any(|c| matches!(c, Cmd::GoalOp { .. })),
+            "stale 解除后 resume 放行"
+        );
+    }
+
+    #[test]
+    fn goal_clear_double_confirm_and_create_input_ac007_14() {
+        let mut s = AppState::default();
+        let sid = SessionId("sess-g".into());
+        s.active_session = Some(sid.clone());
+        s.goals.open();
+        s.goals.set_goal(
+            Some(crate::model::GoalView {
+                id: "g1".into(),
+                revision: 2,
+                objective: "交付".into(),
+                phase: Some(crate::api::types::GoalPhase::Paused),
+                ..Default::default()
+            }),
+            false,
+        );
+        s.mode = Mode::Goal;
+        // d → confirm（不发）；Enter 确认 → 发 clear。
+        let cmds = s.handle_command(crate::input::Command::GoalClear);
+        assert!(cmds.is_empty(), "确认前不发");
+        // 确认提示态：其它动作键（p）取消确认、不发任何 op（AC-007-12 模态）。
+        let cancel_cmds = s.handle_command(crate::input::Command::GoalPause);
+        assert!(cancel_cmds.is_empty(), "确认态动作键不发 op");
+        assert_eq!(s.goals.confirm_pending, None, "动作键取消确认");
+        // 再次 d + Enter → 发 clear（确认路径未破坏）。
+        let _ = s.handle_command(crate::input::Command::GoalClear);
+        let confirm_cmds = s.handle_command(crate::input::Command::PickerConfirm);
+        assert!(confirm_cmds.iter().any(|c| matches!(
+            c,
+            Cmd::GoalOp {
+                op: GoalMutation::Clear,
+                ..
+            }
+        )));
+        // clear 成功回执 → 单例清空。
+        let _ = s.handle(AppEvent::GoalOpDone {
+            request_id: "x".into(),
+            updated: None,
+            cleared: true,
+        });
+        assert!(s.goals.goal.is_none());
+        // 空态 create：c → input，字符 + Enter → 发 Create。
+        let _ = s.handle_command(crate::input::Command::GoalCreate);
+        assert!(s.goal_input);
+        let _ = s.handle_command(crate::input::Command::PickerInput("新目标".into()));
+        let cmds = s.handle_command(crate::input::Command::PickerConfirm);
+        assert!(
+            cmds.iter().any(|c| matches!(c, Cmd::GoalOp { op: GoalMutation::Create { objective, .. }, .. } if objective == "新目标")),
+            "create 发目标文本"
+        );
+    }
+
+    #[test]
+    fn goal_edit_prefills_objective_and_emits_edit_mutation_ac007_11() {
+        let mut s = AppState::default();
+        let sid = SessionId("sess-g".into());
+        s.active_session = Some(sid.clone());
+        s.goals.open();
+        s.goals.set_goal(
+            Some(crate::model::GoalView {
+                id: "g1".into(),
+                revision: 2,
+                objective: "旧目标".into(),
+                phase: Some(crate::api::types::GoalPhase::Active),
+                max_goal_rounds: Some(5),
+                ..Default::default()
+            }),
+            false,
+        );
+        s.mode = Mode::Goal;
+        // e → 输入子阶段，预填当前 objective。
+        let _cmds = s.handle_command(crate::input::Command::GoalEdit);
+        assert!(s.goal_input, "edit 进输入子阶段");
+        assert_eq!(s.goals.create_objective, "旧目标", "预填当前 objective");
+        // 追加修改后 Enter → 发 Edit mutation（保留原 maxGoalRounds 在 main 组装）。
+        let _ = s.handle_command(crate::input::Command::PickerBackspace);
+        let _ = s.handle_command(crate::input::Command::PickerBackspace);
+        let _ = s.handle_command(crate::input::Command::PickerInput("新".into()));
+        let cmds = s.handle_command(crate::input::Command::PickerConfirm);
+        assert!(
+            cmds.iter().any(|c| matches!(c, Cmd::GoalOp { op: GoalMutation::Edit { objective }, .. } if objective == "旧新")),
+            "edit 发目标文本"
+        );
+        assert!(!s.goal_input, "提交后退出输入子阶段");
+    }
+
+    // ---------- REQ-007 V0.4 jobs 只读（AC-007-13） ----------
+
+    #[test]
+    fn jobs_control_frames_maintain_readonly_mirror_ac007_13() {
+        let mut s = AppState::default();
+        let sid = SessionId("sess-j".into());
+        // baseline.jobs per-session 数组。
+        let item = ControlItem::Baseline {
+            queues: serde_json::json!([]),
+            jobs: serde_json::json!({"sess-j": [
+                {"id": "j1", "kind": "tool/call", "label": "跑测试",
+                 "status": "running", "startedAt": 1}
+            ]}),
+            projections: serde_json::json!({"running": true}),
+            raw: serde_json::json!({}),
+        };
+        let _ = s.handle(AppEvent::ControlItem {
+            session_id: sid.clone(),
+            item,
+        });
+        assert_eq!(s.jobs.jobs.len(), 1);
+        assert_eq!(s.jobs.active_count(), 1);
+        // jobs 替换帧：全量替换。
+        let item = ControlItem::Jobs {
+            jobs: serde_json::json!([
+                {"id": "j2", "kind": "k", "label": "lint", "status": "completed"}
+            ]),
+        };
+        let _ = s.handle(AppEvent::ControlItem {
+            session_id: sid.clone(),
+            item,
+        });
+        assert_eq!(s.jobs.jobs.len(), 1, "全量替换");
+        assert_eq!(s.jobs.jobs[0].id, "j2");
+        // 空数组清镜像（不伪造数字）。
+        let item = ControlItem::Jobs {
+            jobs: serde_json::json!([]),
+        };
+        let _ = s.handle(AppEvent::ControlItem {
+            session_id: sid.clone(),
+            item,
+        });
+        assert!(s.jobs.jobs.is_empty());
+    }
+
+    #[test]
+    fn jobs_panel_open_move_close_ac007_13() {
+        let mut s = AppState::default();
+        let _ = s.handle_command(crate::input::Command::OpenCommandPalette);
+        s.command_palette.query = "jobs".into();
+        let idx = s
+            .command_palette
+            .filtered()
+            .iter()
+            .position(|i| matches!(i, CommandPaletteItem::Local { label: "jobs", .. }))
+            .unwrap();
+        s.command_palette.selection = idx;
+        let _cmds = s.handle_command(crate::input::Command::PickerConfirm);
+        assert_eq!(s.mode, Mode::Jobs);
+        assert!(s.jobs.visible);
+        // 无停止键：Esc 关闭回 Normal。
+        let _ = s.handle_command(crate::input::Command::ClosePicker);
+        assert_eq!(s.mode, Mode::Normal);
+        assert!(!s.jobs.visible);
+    }
+
+    #[test]
+    fn jobs_replacement_frame_full_swap_and_status_chip_data_ac007_13() {
+        use crate::api::types::{SessionJob, SessionJobStatus};
+        let mut s = AppState::default();
+        s.jobs.replace(vec![
+            SessionJob {
+                id: "j1".into(),
+                kind: "k".into(),
+                label: "a".into(),
+                status: Some(SessionJobStatus::Running),
+                ..Default::default()
+            },
+            SessionJob {
+                id: "j2".into(),
+                kind: "k".into(),
+                label: "b".into(),
+                status: Some(SessionJobStatus::Stopping),
+                ..Default::default()
+            },
+            SessionJob {
+                id: "j3".into(),
+                kind: "k".into(),
+                label: "c".into(),
+                status: Some(SessionJobStatus::Killed),
+                ..Default::default()
+            },
+        ]);
+        assert_eq!(s.jobs.active_count(), 2, "running+stopping 计入");
+    }
+
+    // ---------- REQ-007 V0.4 settings + skills（AC-007-15~19） ----------
+
+    #[test]
+    fn settings_describe_flattens_whitelist_and_edit_cas_ac007_15_16() {
+        let mut s = AppState::default();
+        s.open_settings_panel();
+        assert_eq!(s.mode, Mode::Settings);
+        // describe 回执：白名单行。
+        let _ = s.handle(AppEvent::SettingsDescribed {
+            value: crate::api::types::SettingsDescribeValue {
+                writable: true,
+                has_document: true,
+                namespaces: vec![crate::api::types::SettingsNamespaceView {
+                    ns: "locale".into(),
+                    schema: serde_json::json!({}),
+                    value: serde_json::json!({"preference": "zh-CN"}),
+                    base: None,
+                    user: Some(serde_json::json!({"preference": "zh-CN"})),
+                    applies: "live".into(),
+                    secrets: vec![],
+                    revision: 7,
+                }],
+            },
+        });
+        assert!(!s.settings.loading);
+        assert_eq!(s.settings.rows.len(), 1, "白名单 locale.preference");
+        assert_eq!(s.settings.rows[0].value_display, "zh-CN");
+        assert!(s.settings.rows[0].user_set);
+        // Enter 编辑 → 输入 → Enter 提交 CAS。
+        let _ = s.handle_command(crate::input::Command::PickerConfirm);
+        assert!(s.settings.edit_key.is_some());
+        let _ = s.handle_command(crate::input::Command::PickerBackspace);
+        let _ = s.handle_command(crate::input::Command::PickerBackspace);
+        let _ = s.handle_command(crate::input::Command::PickerBackspace);
+        let _ = s.handle_command(crate::input::Command::PickerBackspace);
+        let _ = s.handle_command(crate::input::Command::PickerBackspace);
+        let _ = s.handle_command(crate::input::Command::PickerInput("en-US".into()));
+        let cmds = s.handle_command(crate::input::Command::PickerConfirm);
+        assert!(
+            cmds.iter().any(
+                |c| matches!(c, Cmd::SettingsUpdate { ns, key, revision, .. }
+                if ns == "locale" && key == "preference" && *revision == 7)
+            ),
+            "CAS revision 上送"
+        );
+        // 失败（stale/conflict）→ 错误显示 + 清编辑态。
+        let _ = s.handle(AppEvent::SettingsUpdateFailed {
+            ns: "locale".into(),
+            error: ClientError::Remote {
+                code: "SETTINGS_STALE_REVISION".into(),
+                message: "stale".into(),
+                class: ErrorClass::UserFacing,
+            },
+        });
+        assert_eq!(
+            s.settings.last_error_code.as_deref(),
+            Some("SETTINGS_STALE_REVISION")
+        );
+        assert!(s.settings.edit_key.is_none());
+    }
+
+    #[test]
+    fn settings_whitelist_only_and_secret_guard_ac007_16() {
+        // flatten_namespace_rows 只产出白名单 key（模块已测）；面板 Enter 在
+        // secret/只读行拒绝编辑。
+        let mut s = AppState::default();
+        s.settings.open();
+        s.settings.set_rows(
+            vec![crate::model::SettingsRow {
+                key: "credentials.token".into(),
+                namespace: "credentials".into(),
+                value_display: "••• (set)".into(),
+                original: Some(serde_json::Value::String("set".into())),
+                user_set: true,
+                secret: true,
+                revision: 1,
+            }],
+            true,
+        );
+        s.mode = Mode::Settings;
+        let _ = s.handle_command(crate::input::Command::PickerConfirm);
+        assert!(s.settings.edit_key.is_none(), "secret 行拒绝编辑");
+        assert!(s.notice.as_deref().unwrap_or("").contains("只读"));
+    }
+
+    #[test]
+    fn settings_risk_key_requires_second_confirm_ac007_16() {
+        let mut s = AppState::default();
+        s.settings.open();
+        // permission.defaultPreset 是可改白名单但属风险 key。
+        let row = crate::model::SettingsRow {
+            key: "permission.defaultPreset".into(),
+            namespace: "permission".into(),
+            value_display: "ask".into(),
+            original: Some(serde_json::Value::String("ask".into())),
+            user_set: false,
+            secret: false,
+            revision: 3,
+        };
+        s.settings.set_rows(vec![row], true);
+        s.mode = Mode::Settings;
+        // 第一次 Enter → 风险确认态（不进编辑、不发更新）。
+        let cmds = s.handle_command(crate::input::Command::PickerConfirm);
+        assert!(cmds.is_empty(), "确认前不发更新");
+        assert_eq!(
+            s.settings.risk_confirm.as_deref(),
+            Some("permission.defaultPreset"),
+            "进入风险确认态"
+        );
+        assert!(s.settings.edit_key.is_none());
+        // 其它键取消确认。
+        let _ = s.handle_command(crate::input::Command::PickerDown);
+        assert!(s.settings.risk_confirm.is_none(), "其它键取消");
+        // 再次 Enter ×2 → 进编辑。
+        let _ = s.handle_command(crate::input::Command::PickerConfirm);
+        let _ = s.handle_command(crate::input::Command::PickerConfirm);
+        assert!(s.settings.risk_confirm.is_none());
+        assert_eq!(
+            s.settings.edit_key.as_deref(),
+            Some("permission.defaultPreset"),
+            "二次确认后进编辑"
+        );
+        // 编辑提交 → SettingsUpdate（带 CAS revision）。
+        s.settings.edit_buffer = "ask".into();
+        let cmds = s.handle_command(crate::input::Command::PickerConfirm);
+        assert!(
+            cmds.iter().any(|c| matches!(
+                c,
+                Cmd::SettingsUpdate { ns, key, revision, .. }
+                    if ns == "permission" && key == "defaultPreset" && *revision == 3
+            )),
+            "提交更新"
+        );
+    }
+
+    #[test]
+    fn skills_open_list_copy_ref_and_close_ac007_18() {
+        let mut s = AppState::default();
+        let sid = SessionId("sess-sk".into());
+        s.active_session = Some(sid.clone());
+        s.open_skills_panel();
+        assert_eq!(s.mode, Mode::Skills);
+        let _ = s.handle(AppEvent::SkillsListed {
+            value: crate::api::types::SkillListValue {
+                skills: vec![crate::api::types::SkillEntry {
+                    name: "bash".into(),
+                    description: "执行 shell".into(),
+                    when_to_use: None,
+                    model_invocable: true,
+                }],
+            },
+        });
+        assert_eq!(s.skills.items.len(), 1);
+        // y 复制引用 → CopyToClipboard。
+        let cmds = s.handle_command(crate::input::Command::YankContext);
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, Cmd::CopyToClipboard { text } if text == "/bash")),
+            "复制 /name"
+        );
+        // 失败 → error.code，面板保持。
+        let _ = s.handle(AppEvent::SkillsListFailed {
+            error: ClientError::Remote {
+                code: "PERMISSION_DENIED".into(),
+                message: "no".into(),
+                class: ErrorClass::PermissionDenied,
+            },
+        });
+        assert_eq!(
+            s.skills.last_error_code.as_deref(),
+            Some("PERMISSION_DENIED")
+        );
+        // 关闭。
+        let _ = s.handle_command(crate::input::Command::ClosePicker);
+        assert_eq!(s.mode, Mode::Normal);
+    }
+
+    // ---------- REQ-007 V0.4 会话导出（AC-007-17） ----------
+
+    #[test]
+    fn export_open_edit_path_and_start_download_ac007_17() {
+        let mut s = AppState {
+            active_session: Some(SessionId("sess-x".into())),
+            ..Default::default()
+        };
+        let _ = s.handle_command(crate::input::Command::OpenCommandPalette);
+        s.command_palette.query = "export".into();
+        let idx = s
+            .command_palette
+            .filtered()
+            .iter()
+            .position(|i| {
+                matches!(
+                    i,
+                    CommandPaletteItem::Local {
+                        label: "export",
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        s.command_palette.selection = idx;
+        let _cmds = s.handle_command(crate::input::Command::PickerConfirm);
+        assert_eq!(s.mode, Mode::Export);
+        assert!(s.export.visible);
+        // 路径编辑：清默认 + 输入。
+        for _ in 0..s.export.path.len() {
+            let _ = s.handle_command(crate::input::Command::PickerBackspace);
+        }
+        for c in "/tmp/out.zip".chars() {
+            let _ = s.handle_command(crate::input::Command::PickerInput(c.to_string()));
+        }
+        assert_eq!(s.export.path, "/tmp/out.zip");
+        // Enter → 开始下载发命令。
+        let cmds = s.handle_command(crate::input::Command::PickerConfirm);
+        assert!(cmds
+            .iter()
+            .any(|c| matches!(c, Cmd::ExportSession { session_id, path }
+            if session_id == "sess-x" && path.to_string_lossy() == "/tmp/out.zip")));
+        // 成功回执。
+        let _ = s.handle(AppEvent::ExportDone {
+            bytes: 1234,
+            path: std::path::PathBuf::from("/tmp/out.zip"),
+        });
+        assert!(s.export.phase == crate::model::export::ExportPhase::Done);
+    }
+
+    #[test]
+    fn export_failure_surfaces_code_and_can_retry_ac007_17() {
+        let mut s = AppState {
+            active_session: Some(SessionId("sess-x".into())),
+            ..Default::default()
+        };
+        s.export.open("sess-x", "out.zip");
+        s.mode = Mode::Export;
+        assert!(s.export.begin_download());
+        let _ = s.handle(AppEvent::ExportFailed {
+            error: ClientError::Remote {
+                code: "PERMISSION_DENIED".into(),
+                message: "no".into(),
+                class: ErrorClass::PermissionDenied,
+            },
+        });
+        assert!(s.export.phase == crate::model::export::ExportPhase::Failed);
+        assert_eq!(
+            s.export.last_error_code.as_deref(),
+            Some("PERMISSION_DENIED")
+        );
+        // 恢复路径：重开重试可再下载。
+        assert!(s.export.begin_download(), "失败后可重试（幂等）");
+    }
+
+    #[test]
+    fn export_close_during_download_marks_cancel_ac007_17() {
+        let mut s = AppState::default();
+        s.export.open("sess-x", "out.zip");
+        s.mode = Mode::Export;
+        assert!(s.export.begin_download());
+        // Esc → 请求取消（置位令牌，面板保持直到 background 任务回执清理）。
+        let _ = s.handle_command(crate::input::Command::ClosePicker);
+        assert!(
+            s.notice.as_deref().unwrap_or("").contains("正在取消"),
+            "取消请求提示, notice={:?}",
+            s.notice
+        );
+        assert!(
+            s.export_cancel.load(std::sync::atomic::Ordering::Relaxed),
+            "取消令牌置位"
+        );
+        assert!(s.export.cancelled);
+        // 面板仍在（等待 ExportCancelled）。
+        assert_eq!(s.mode, Mode::Export);
+        assert!(s.export.visible);
+        // background 任务清理完成 → ExportCancelled 回执收面板。
+        let _ = s.handle(AppEvent::ExportCancelled);
+        assert_eq!(s.mode, Mode::Normal);
+        assert!(!s.export.visible);
+        assert!(s.notice.as_deref().unwrap_or("").contains("已取消"));
+        assert!(
+            !s.export_cancel.load(std::sync::atomic::Ordering::Relaxed),
+            "取消后令牌复位"
+        );
+    }
+
+    // ---------- REQ-007 V0.4 搜索历史（AC-007-31） ----------
+
+    #[test]
+    fn export_404_triggers_page_rebuild_fallback_ac007_17() {
+        // D-46：官方导出路由 404 → export_failed 自动转 Rebuilding 并 emit
+        // Cmd::ExportRebuild（with session latest seq）。
+        let mut s = AppState::default();
+        let sid = SessionId("sess-r".into());
+        s.active_session = Some(sid.clone());
+        // 会话窗口带 follow 游标（page through_seq 锚点）。
+        let w = s.sessions.touch(&sid.0, 50);
+        let _ = w.apply(crate::model::Incoming::Snapshot {
+            cursor: Some(crate::api::types::SessionLogOffset(12)),
+            records: vec![],
+            has_more: false,
+            projections: None,
+        });
+        s.export.open("sess-r", "out.zip");
+        s.mode = Mode::Export;
+        assert!(s.export.begin_download());
+        let cmds = s.handle(AppEvent::ExportFailed {
+            error: ClientError::HttpStatus {
+                status: 404,
+                url: "http://x/api/session.export".into(),
+            },
+        });
+        assert!(
+            s.export.phase == crate::model::export::ExportPhase::Rebuilding,
+            "404 → 转 Rebuilding"
+        );
+        assert!(
+            cmds.iter().any(|c| matches!(
+                c,
+                Cmd::ExportRebuild {
+                    session_id,
+                    through_seq: Some(seq),
+                    ..
+                } if session_id == "sess-r" && seq.0 == 12
+            )),
+            "emit ExportRebuild with through_seq=12, cmds={cmds:?}"
+        );
+    }
+
+    #[test]
+    fn export_403_and_remote_permission_never_fall_back_ac007_17() {
+        // D-46：401/403/权限 Remote → Failed 展示 code，不降级不自动重试。
+        let mut s = AppState {
+            active_session: Some(SessionId("sess-p".into())),
+            ..Default::default()
+        };
+        s.export.open("sess-p", "out.zip");
+        s.mode = Mode::Export;
+        assert!(s.export.begin_download());
+        let cmds = s.handle(AppEvent::ExportFailed {
+            error: ClientError::HttpStatus {
+                status: 403,
+                url: "http://x/api/session.export".into(),
+            },
+        });
+        assert!(cmds.is_empty(), "403 不降级, cmds={cmds:?}");
+        assert!(s.export.phase == crate::model::export::ExportPhase::Failed);
+        assert_eq!(s.export.last_error_code.as_deref(), Some("http-403"));
+        // 恢复路径：修正后重试可再下载。
+        assert!(s.export.begin_download());
+    }
+
+    #[test]
+    fn export_transport_error_triggers_rebuild_fallback_ac007_17() {
+        // D-46：transport（路由不可达）也走 page 重建兜底（可恢复路径）。
+        let mut s = AppState::default();
+        let sid = SessionId("sess-t".into());
+        s.active_session = Some(sid.clone());
+        let w = s.sessions.touch(&sid.0, 50);
+        let _ = w.apply(crate::model::Incoming::Snapshot {
+            cursor: Some(crate::api::types::SessionLogOffset(3)),
+            records: vec![],
+            has_more: false,
+            projections: None,
+        });
+        s.export.open("sess-t", "out.jsonl");
+        s.mode = Mode::Export;
+        assert!(s.export.begin_download());
+        let cmds = s.handle(AppEvent::ExportFailed {
+            error: ClientError::Transport("导出请求失败: 连接拒绝".into()),
+        });
+        assert!(s.export.phase == crate::model::export::ExportPhase::Rebuilding);
+        assert!(cmds.iter().any(|c| matches!(
+            c,
+            Cmd::ExportRebuild { session_id, .. } if session_id == "sess-t"
+        )));
+        // Rebuilding 中取消 → Esc 置取消令牌（后台清理 → ExportCancelled 收面板）。
+        let _ = s.handle_command(crate::input::Command::ClosePicker);
+        assert!(
+            s.export_cancel.load(std::sync::atomic::Ordering::Relaxed),
+            "Rebuilding 可取消"
+        );
+        let _ = s.handle(AppEvent::ExportCancelled);
+        assert_eq!(s.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn export_rebuild_progress_done_failed_round_trip_ac007_17() {
+        let mut s = AppState {
+            active_session: Some(SessionId("sess-d".into())),
+            ..Default::default()
+        };
+        s.export.open("sess-d", "out.jsonl");
+        assert!(s.export.begin_rebuild());
+        s.mode = Mode::Export;
+        let _ = s.handle(AppEvent::ExportRebuildProgress { records: 42 });
+        assert_eq!(s.export.records_collected, 42);
+        let _ = s.handle(AppEvent::ExportRebuildDone {
+            path: std::path::PathBuf::from("/tmp/out.jsonl"),
+        });
+        assert!(s.export.phase == crate::model::export::ExportPhase::Done);
+        assert!(
+            s.notice.as_deref().unwrap_or("").contains("本地重建"),
+            "完成提示含本地重建, notice={:?}",
+            s.notice
+        );
+        // 失败：不再触发二次兜底（防循环），Failed 可重试。
+        let mut s2 = AppState::default();
+        s2.export.open("sess-d", "out.jsonl");
+        s2.mode = Mode::Export;
+        assert!(s2.export.begin_rebuild());
+        let cmds2 = s2.handle(AppEvent::ExportRebuildFailed {
+            error: ClientError::Remote {
+                code: "PERMISSION_DENIED".into(),
+                message: "no".into(),
+                class: ErrorClass::PermissionDenied,
+            },
+        });
+        assert!(cmds2.is_empty());
+        assert!(s2.export.phase == crate::model::export::ExportPhase::Failed);
+        assert!(s2.export.begin_rebuild(), "重建失败后修正可重跑");
+    }
+
+    #[test]
+    fn search_history_records_on_close_and_recalls_ac007_31() {
+        let mut s = AppState::default();
+        // 模拟两轮搜索提交（关闭即记录）。
+        s.open_search();
+        s.search.query = "/c deploy".into();
+        s.recompute_window_matches();
+        s.close_search();
+        s.open_search();
+        s.search.query = "agent".into();
+        s.recompute_window_matches();
+        s.close_search();
+        assert_eq!(s.query_history.len(), 2);
+        // 空 query 编辑态 ↑ 回看最近（agent）→ 更早（/c deploy）。
+        s.open_search();
+        let cmds = s.handle_command(crate::input::Command::PickerUp);
+        assert!(cmds.is_empty());
+        assert_eq!(s.search.query, "agent");
+        let _ = s.handle_command(crate::input::Command::PickerUp);
+        assert_eq!(s.search.query, "/c deploy");
+        // ↓ 回新 → 再 ↓ 越界清空。
+        let _ = s.handle_command(crate::input::Command::PickerDown);
+        assert_eq!(s.search.query, "agent");
+        let _ = s.handle_command(crate::input::Command::PickerDown);
+        assert_eq!(s.search.query, "", "越过最新清空");
+        assert!(s.search.recall_cursor.is_none());
+        // 非空 query 时 ↑ 不回忆（保持输入语义）。
+        s.search.query = "deploy".into();
+        let _ = s.handle_command(crate::input::Command::PickerUp);
+        assert_eq!(s.search.query, "deployk", "非空 ↑ 保持既有 'k' 输入语义");
+    }
+
+    #[test]
+    fn search_history_empty_no_recall_and_unchanged_semantics() {
+        let mut s = AppState::default();
+        s.open_search();
+        let cmds = s.handle_command(crate::input::Command::PickerUp);
+        assert!(cmds.is_empty());
+        assert_eq!(s.search.query, "", "无历史不回忆");
+        s.close_search();
+    }
+
+    // ---------- REQ-007 V0.4 消息动作（AC-007-27/28） ----------
+
+    fn msg_app_with_blocks(
+        rows: Vec<(u64, &'static str, Option<&'static str>)>,
+    ) -> (AppState, SessionId) {
+        // rows: (seq, "user/message"|"assistant/message", content/message_id)
+        let mut s = AppState::default();
+        let sid = SessionId("sess-ma".into());
+        s.active_session = Some(sid.clone());
+        let w = s.sessions.touch(&sid.0, 50);
+        let mut records = Vec::new();
+        for (seq, typ, payload) in rows {
+            let data = if typ == "user/message" {
+                serde_json::json!({"content": payload.unwrap_or("hi")})
+            } else {
+                serde_json::json!({"id": payload.unwrap_or("m1")})
+            };
+            records.push(SessionHistoryRecord::Event {
+                event: SessionWireEvent {
+                    event_type: typ.into(),
+                    seq: Some(SessionSeq(seq)),
+                    time: None,
+                    request_id: None,
+                    ignorable: None,
+                    source_event_seqs: None,
+                    surface_op: None,
+                    data: Some(data),
+                },
+            });
+        }
+        let _ = w.apply(Incoming::Snapshot {
+            cursor: None,
+            records,
+            has_more: false,
+            projections: None,
+        });
+        (s, sid)
+    }
+
+    #[test]
+    fn message_action_user_open_retry_and_branch_ac007_27() {
+        // 末条 user（seq 3）+ assistant（seq 5）。
+        let (mut s, sid) = msg_app_with_blocks(vec![
+            (1, "user/message", Some("你好")),
+            (5, "assistant/message", Some("m5")),
+            (6, "user/message", Some("再来一次")),
+        ]);
+        // cursor 定位到末条 user（window 内块下标 2）。
+        s.cursor_block = 2;
+        let cmds = s.handle_command(crate::input::Command::OpenMessageActions);
+        assert!(cmds.is_empty());
+        assert_eq!(s.mode, Mode::MessageAction);
+        assert_eq!(s.message_action.menu_seq, Some(6));
+        // 动作 = [retry, branch]（末条静止 user）；默认 cursor 0 = retry。
+        // Enter → retry。
+        let cmds = s.handle_command(crate::input::Command::PickerConfirm);
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, Cmd::SendPrompt { session_id, .. } if session_id == &sid)),
+            "retry 重发 prompt"
+        );
+        assert_eq!(s.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn message_action_branch_at_last_user_ac007_27() {
+        let (mut s, sid) = msg_app_with_blocks(vec![
+            (1, "user/message", Some("你好")),
+            (5, "assistant/message", Some("m5")),
+            (6, "user/message", Some("再来一次")),
+        ]);
+        s.cursor_block = 2;
+        let _ = s.handle_command(crate::input::Command::OpenMessageActions);
+        // 移到 branch（index 1）并 Enter。
+        let _ = s.handle_command(crate::input::Command::PickerDown);
+        let cmds = s.handle_command(crate::input::Command::PickerConfirm);
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, Cmd::ForkAtSeq { session_id, at_seq }
+                if session_id == &sid.0 && *at_seq == 6)),
+            "branch fork atSeq=6"
+        );
+    }
+
+    #[test]
+    fn message_action_assistant_feedback_put_ac007_27() {
+        let (mut s, _sid) = msg_app_with_blocks(vec![
+            (1, "user/message", Some("你好")),
+            (5, "assistant/message", Some("m5")),
+        ]);
+        s.cursor_block = 1; // assistant
+        let _ = s.handle_command(crate::input::Command::OpenMessageActions);
+        assert_eq!(s.message_action.menu_seq, Some(5));
+        // actions = [feedback+, feedback-]; Enter → feedback+。
+        let cmds = s.handle_command(crate::input::Command::PickerConfirm);
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, Cmd::FeedbackPut { message_id, rating, .. }
+                if message_id == "m5" && rating == "positive")),
+            "feedback+ put m5"
+        );
+    }
+
+    // ---------- REQ-007 D-50：feedback 端点不可用本地降级 ----------
+
+    #[test]
+    fn feedback_endpoint_unavailable_marks_local_d50() {
+        let (mut s, _sid) = msg_app_with_blocks(vec![
+            (1, "user/message", Some("你好")),
+            (5, "assistant/message", Some("m5")),
+        ]);
+        s.cursor_block = 1; // assistant
+        let _ = s.handle_command(crate::input::Command::OpenMessageActions);
+        let cmds = s.handle_command(crate::input::Command::PickerConfirm);
+        assert!(cmds
+            .iter()
+            .any(|c| matches!(c, Cmd::FeedbackPut { rating, .. }
+            if rating == "positive")));
+        assert_eq!(
+            s.message_action.pending_rating.as_deref(),
+            Some("positive"),
+            "提交前登记在途 rating（D-50）"
+        );
+        // 端点不可用（网络类）→ 本地降级标记，不崩不重试。
+        s.handle(AppEvent::FeedbackPutFailed {
+            error: ClientError::Transport("连接失败".into()),
+        });
+        assert_eq!(
+            s.message_action.feedback_marked.as_deref(),
+            Some("positive"),
+            "本地标记 rating"
+        );
+        assert!(
+            s.message_action.pending_rating.is_none(),
+            "回执消费在途登记"
+        );
+        let notice = s.notice.as_deref().unwrap_or("");
+        assert!(notice.contains("本地记录"), "notice 提示本地记录, {notice}");
+        assert!(notice.contains("未提交"), "notice 提示未提交, {notice}");
+        // 标记不因重开菜单而丢失（持久到端点恢复/补交成功）。
+        s.cursor_block = 1;
+        let _ = s.handle_command(crate::input::Command::OpenMessageActions);
+        assert_eq!(
+            s.message_action.feedback_marked.as_deref(),
+            Some("positive")
+        );
+        // 恢复路径：端点恢复后再次动作成功（FeedbackPutDone）→ 清除标记。
+        let _ = s.handle_command(crate::input::Command::ClosePicker);
+        let _ = s.handle_command(crate::input::Command::OpenMessageActions);
+        let _ = s.handle_command(crate::input::Command::PickerConfirm);
+        s.handle(AppEvent::FeedbackPutDone);
+        assert!(s.message_action.feedback_marked.is_none(), "补交成功清标记");
+        assert!(
+            s.notice.as_deref().unwrap_or("").contains("补交成功"),
+            "notice 提示补交成功"
+        );
+    }
+
+    #[test]
+    fn feedback_permission_denied_no_local_mark_d50() {
+        let (mut s, _sid) = msg_app_with_blocks(vec![
+            (1, "user/message", Some("你好")),
+            (5, "assistant/message", Some("m5")),
+        ]);
+        s.cursor_block = 1;
+        let _ = s.handle_command(crate::input::Command::OpenMessageActions);
+        let cmds = s.handle_command(crate::input::Command::PickerConfirm);
+        assert!(cmds.iter().any(|c| matches!(c, Cmd::FeedbackPut { .. })));
+        // 权限错误 → 不降级不自动重试，error.code 可见。
+        s.handle(AppEvent::FeedbackPutFailed {
+            error: ClientError::Remote {
+                code: "PERMISSION_DENIED".into(),
+                message: "无权限".into(),
+                class: crate::api::envelope::ErrorClass::PermissionDenied,
+            },
+        });
+        assert!(
+            s.message_action.feedback_marked.is_none(),
+            "权限错误不做本地标记"
+        );
+        assert_eq!(
+            s.message_action.last_error_code.as_deref(),
+            Some("PERMISSION_DENIED")
+        );
+        let notice = s.notice.as_deref().unwrap_or("");
+        assert!(notice.contains("无权限"), "notice 展示权限错误, {notice}");
+    }
+
+    #[test]
+    fn feedback_local_mark_distinguishes_negative_d50() {
+        let (mut s, _sid) = msg_app_with_blocks(vec![
+            (1, "user/message", Some("你好")),
+            (5, "assistant/message", Some("m5")),
+        ]);
+        s.cursor_block = 1;
+        let _ = s.handle_command(crate::input::Command::OpenMessageActions);
+        let _ = s.handle_command(crate::input::Command::PickerDown); // feedback-
+        let cmds = s.handle_command(crate::input::Command::PickerConfirm);
+        assert!(cmds
+            .iter()
+            .any(|c| matches!(c, Cmd::FeedbackPut { rating, .. }
+            if rating == "negative")));
+        s.handle(AppEvent::FeedbackPutFailed {
+            error: ClientError::HttpStatus {
+                status: 503,
+                url: "http://x".into(),
+            },
+        });
+        assert_eq!(
+            s.message_action.feedback_marked.as_deref(),
+            Some("negative"),
+            "5xx（HttpStatus 结构化）同样本地降级"
+        );
+    }
+
+    #[test]
+    fn message_action_running_turn_requires_double_confirm_ac007_28() {
+        let (mut s, sid) = msg_app_with_blocks(vec![(1, "user/message", Some("你好"))]);
+        s.running_sessions.insert(sid.clone());
+        s.cursor_block = 0;
+        let _ = s.handle_command(crate::input::Command::OpenMessageActions);
+        // running：不可 branch；仅 retry。第一次 Enter → confirm 态不发。
+        let cmds = s.handle_command(crate::input::Command::PickerConfirm);
+        assert!(cmds.is_empty(), "运行中第一次 Enter 不执行");
+        assert!(s.message_action.confirm_running);
+        assert_eq!(s.message_action.menu_seq, Some(1));
+        // 第二次 Enter → 确认执行 retry。
+        let cmds = s.handle_command(crate::input::Command::PickerConfirm);
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, Cmd::SendPrompt { session_id, .. } if session_id == &sid)),
+            "二次确认后执行"
+        );
+        // Esc 取消路径：重新打开 → Esc 清态。
+        let _ = s.handle_command(crate::input::Command::OpenMessageActions);
+        let _ = s.handle_command(crate::input::Command::PickerConfirm); // confirm 态
+        assert!(s.message_action.confirm_running);
+        let _ = s.handle_command(crate::input::Command::ClosePicker);
+        assert_eq!(s.mode, Mode::Normal);
+        assert!(s.message_action.menu_seq.is_none());
+        assert!(s.msg_action_target.is_none());
+    }
+
+    #[test]
+    fn message_action_branch_failure_shows_code_ac007_27() {
+        let mut s = AppState {
+            active_session: Some(SessionId("sess-x".into())),
+            ..Default::default()
+        };
+        let _ = s.handle(AppEvent::MessageActionFailed {
+            op: crate::model::MessageActionKind::Branch,
+            error: ClientError::Remote {
+                code: "session/fork-unavailable".into(),
+                message: "不可用".into(),
+                class: ErrorClass::UserFacing,
+            },
+        });
+        assert!(s.notice.as_deref().unwrap_or("").contains("branch 失败"));
+        assert_eq!(
+            s.message_action.last_error_code.as_deref(),
+            Some("session/fork-unavailable")
+        );
+    }
+
+    // ---------- REQ-007 V0.4 图片同消息 pager（AC-007-06/30） ----------
+
+    #[test]
+    fn image_pager_step_cycles_sibling_images_ac007_06() {
+        let mut s = AppState {
+            kitty_capable: true, // ImageView pager 仅 Kitty 路径
+            ..Default::default()
+        };
+        let sid = SessionId("sess-img".into());
+        s.active_session = Some(sid.clone());
+        // 会话窗口：连续 3 图（seq 10/11/12）。
+        let w = s.sessions.touch(&sid.0, 50);
+        let records = (10u64..=12)
+            .map(|seq| SessionHistoryRecord::Event {
+                event: SessionWireEvent {
+                    event_type: "image".into(),
+                    seq: Some(SessionSeq(seq)),
+                    time: None,
+                    request_id: None,
+                    ignorable: None,
+                    source_event_seqs: None,
+                    surface_op: None,
+                    data: Some(serde_json::json!({
+                        "attachmentId": format!("a{seq}"),
+                        "width": 8, "height": 8
+                    })),
+                },
+            })
+            .collect::<Vec<_>>();
+        let _ = w.apply(Incoming::Snapshot {
+            cursor: None,
+            records,
+            has_more: false,
+            projections: None,
+        });
+        // 打开中间图（seq 11）——直接置 view（fetch 路径由 execute_one 驱动，
+        // 这里仅验证 run/pager 计算与步进命令）。
+        s.image_cache.abort(&AttachmentId("a11".into()));
+        let blocks = s.active_window().unwrap().block_snapshot();
+        assert_eq!(blocks.len(), 3, "窗口 3 块: {blocks:?}");
+        assert!(
+            blocks
+                .iter()
+                .all(|b| matches!(b, crate::model::Block::Image { .. })),
+            "全为 Image: {blocks:?}"
+        );
+        let (start, total, index) =
+            crate::model::image::image_run_of(&blocks, SessionSeq(11)).unwrap();
+        assert_eq!((start, total, index), (0, 3, 1), "连续 3 图 run");
+        s.image_view
+            .open_view(SessionSeq(11), AttachmentId("a11".into()), None, None);
+        s.image_view.set_pager(total, index);
+        s.mode = Mode::ImageView;
+        // `]` → 步进到 seq 12。
+        let cmds = s.handle_command(crate::input::Command::ImageViewPager { delta: 1 });
+        assert_eq!(s.image_view.block_seq, Some(SessionSeq(12)), "步进到下一图");
+        assert_eq!(s.image_view.pager.as_ref().map(|p| p.index), Some(2));
+        // `[` → 回 seq 11。
+        let back_cmds = s.handle_command(crate::input::Command::ImageViewPager { delta: -1 });
+        assert_eq!(
+            s.image_view.block_seq,
+            Some(SessionSeq(11)),
+            "回 seq11 (cmds={back_cmds:?})"
+        );
+        // 真实循环中离开后 on_attachment_ready 对非目标会 abort+清 loading；
+        // 单测无 fetch 完成，模拟该清理再步进 12。
+        s.image_cache.abort(&AttachmentId("a12".into()));
+        s.image_loading.remove(&AttachmentId("a12".into()));
+        let _ = s.handle_command(crate::input::Command::ImageViewPager { delta: 1 });
+        assert_eq!(s.image_view.block_seq, Some(SessionSeq(12)), "再次步进 12");
+        // 组边界停留（seq 12 再 ] 不动）。
+        s.image_cache.abort(&AttachmentId("a11".into()));
+        s.image_loading.remove(&AttachmentId("a11".into()));
+        let _ = s.handle_command(crate::input::Command::ImageViewPager { delta: 1 });
+        assert_eq!(s.image_view.block_seq, Some(SessionSeq(12)), "组尾停留");
+        let _cmds = cmds;
+        let _ = back_cmds;
+    }
+
+    #[test]
+    fn image_pager_closed_and_no_pager_when_single_image() {
+        let mut s = AppState::default();
+        s.image_view
+            .open_view(SessionSeq(1), AttachmentId("a1".into()), None, None);
+        s.image_view.set_pager(1, 0);
+        assert!(s.image_view.pager.is_none() || s.image_view.pager.as_ref().unwrap().total == 1);
+        s.image_view.close();
+        assert!(s.image_view.pager.is_none());
+    }
+
+    // ---------- REQ-007 D-45 图片 zoom（AC-007-06/30） ----------
+
+    /// 构造「ImageView 已渲染 + 缓存有条目」状态（zoom reducer 前置）。
+    fn zoom_ready_view(s: &mut AppState, sid: &SessionId, att: &str, seq: u64) {
+        s.active_session = Some(sid.clone());
+        // reducer 测试不真正 kitty 编码：文件字节任意即可（write_temp_file
+        // 只落盘 + 记账）。
+        let path = s
+            .image_cache
+            .write_temp_file(
+                &crate::api::types::MediaType("image/png".into()),
+                vec![1, 2, 3],
+            )
+            .unwrap();
+        let _ = s.image_cache.complete(
+            &AttachmentId(att.into()),
+            crate::model::ImageCacheEntry {
+                attachment_id: AttachmentId(att.into()),
+                media_type: crate::api::types::MediaType("image/png".into()),
+                bytes: 3,
+                width: 64,
+                height: 64,
+                temp_file: path,
+                last_used: 0,
+            },
+        );
+        s.image_cache.pin(&AttachmentId(att.into()));
+        s.image_view
+            .open_view(SessionSeq(seq), AttachmentId(att.into()), None, None);
+        s.image_view.mark_rendered();
+        s.mode = Mode::ImageView;
+    }
+
+    #[test]
+    fn image_zoom_in_out_reset_emits_reencode_ac007_06() {
+        let mut s = AppState {
+            kitty_capable: true, // ImageView zoom 仅 Kitty 路径
+            ..Default::default()
+        };
+        let sid = SessionId("sess-z".into());
+        zoom_ready_view(&mut s, &sid, "za", 7);
+        // `+`：zoom 变档 + 发重编码命令（带 zoom scale）。
+        let cmds = s.handle_command(crate::input::Command::ImageViewZoomIn);
+        assert!((s.image_view.zoom - 1.25).abs() < 1e-6);
+        assert!(
+            cmds.iter().any(|c| matches!(
+                c,
+                Cmd::RenderImageViewZoom {
+                    attachment_id,
+                    zoom,
+                    ..
+                } if attachment_id.0 == "za" && (*zoom - 1.25).abs() < 1e-6
+            )),
+            "cmds={cmds:?}"
+        );
+        assert!(s.image_view.zoom_inflight, "重编码在途标记");
+        // `-`：在途时只更新状态不重复发（单飞）。
+        let cmds2 = s.handle_command(crate::input::Command::ImageViewZoomOut);
+        assert!(cmds2.is_empty(), "单飞：在途不再发, cmds2={cmds2:?}");
+        assert!((s.image_view.zoom - 1.0).abs() < 1e-6, "zoom 状态仍更新");
+        // 回执完成：编码 zoom=1.25 ≠ 当前 1.0 → 再发一轮（连按取最新）。
+        let sid2 = sid.clone();
+        let cmds3 = s.handle(AppEvent::AttachmentReady {
+            session_id: sid2,
+            attachment_id: AttachmentId("za".into()),
+            block_seq: SessionSeq(7),
+            meta: crate::model::AttachmentRef {
+                attachment_id: AttachmentId("za".into()),
+                media_type: crate::api::types::MediaType("image/png".into()),
+                bytes: 1,
+                width: 64,
+                height: 64,
+                name: None,
+                original_dimensions: None,
+            },
+            frame: None,
+            entry: crate::model::ImageCacheEntry {
+                attachment_id: AttachmentId("za".into()),
+                media_type: crate::api::types::MediaType("image/png".into()),
+                bytes: 1,
+                width: 64,
+                height: 64,
+                temp_file: std::path::PathBuf::from("/tmp/x"),
+                last_used: 0,
+            },
+            cached: true,
+            for_viewer: false,
+        });
+        assert!(
+            cmds3.iter().any(|c| matches!(
+                c,
+                Cmd::RenderImageViewZoom { zoom, .. } if (*zoom - 1.0).abs() < 1e-6
+            )),
+            "zoom 在途变了 → 以最新 zoom 再发, cmds3={cmds3:?}"
+        );
+        assert!(!s.image_view.zoom_inflight);
+    }
+
+    #[test]
+    fn image_zoom_reset_and_close_cancel_inflight_ac007_06() {
+        let mut s = AppState::default();
+        let sid = SessionId("sess-z2".into());
+        zoom_ready_view(&mut s, &sid, "zb", 8);
+        // 0：重置 1.0 + 发重编码（当前已是 1.0，仍发以便与 fit 一致）。
+        let cmds = s.handle_command(crate::input::Command::ImageViewZoomReset);
+        assert_eq!(s.image_view.zoom, 1.0);
+        assert!(cmds.iter().any(|c| matches!(
+            c,
+            Cmd::RenderImageViewZoom { zoom, .. } if (*zoom - 1.0).abs() < 1e-6
+        )));
+        // close：取消在途（不残留 inflight 标记），收面板回 Normal。
+        s.image_view.zoom_inflight = true;
+        let cmds2 = s.handle_command(crate::input::Command::ImageViewClose);
+        assert!(cmds2.is_empty());
+        assert_eq!(s.mode, Mode::Normal);
+        assert!(!s.image_view.zoom_inflight);
+        assert!(!s.image_view.open);
+    }
+
+    #[test]
+    fn image_zoom_noop_when_not_rendered_or_not_imageview() {
+        // 非 ImageView 模式：zoom 不动作。
+        let mut s = AppState::default();
+        let cmds = s.handle_command(crate::input::Command::ImageViewZoomIn);
+        assert!(cmds.is_empty());
+        assert_eq!(s.image_view.zoom, 1.0);
+        // ImageView 但 Loading（无帧可重编码）：只更新状态 + 登记在途编码
+        // zoom=1.0（打开路径帧到达时补发重编码）——不发命令（无 temp_file）。
+        let sid = SessionId("sess-z3".into());
+        s.active_session = Some(sid.clone());
+        s.image_view
+            .open_view(SessionSeq(1), AttachmentId("zc".into()), None, None);
+        s.mode = Mode::ImageView;
+        assert_eq!(s.image_view.phase, crate::model::ImageViewPhase::Loading);
+        let cmds2 = s.handle_command(crate::input::Command::ImageViewZoomIn);
+        assert!(cmds2.is_empty());
+        assert!((s.image_view.zoom - 1.25).abs() < 1e-6, "状态可先变");
+        assert!(
+            s.image_view.zoom_inflight,
+            "登记在途编码（等待打开帧到达补发）"
+        );
+        assert_eq!(
+            s.image_view.zoom_encoded,
+            Some(1.0),
+            "打开路径在途帧为 zoom=1.0"
+        );
+    }
+
+    #[test]
+    fn image_zoom_during_loading_refires_on_frame_arrival_d45() {
+        // D-45（spec review 修复）：Loading 期按 `+`（zoom 1.0→1.25）→
+        // 打开路径帧（zoom=1.0 编码）到达时发现 zoom 已变 → 补发 1.25
+        // 重编码，画面最终与标题 zoom% 一致（不静默停在 1.0）。
+        let mut s = AppState {
+            kitty_capable: true,
+            ..Default::default()
+        };
+        let sid = SessionId("sess-zl".into());
+        zoom_ready_view(&mut s, &sid, "zl", 7); // 缓存就绪（补发源文件）
+                                                // 回到 Loading 形态：重新 open 复位 zoom=1.0 + inflight=false。
+        s.image_view
+            .open_view(SessionSeq(8), AttachmentId("zl".into()), None, None);
+        assert_eq!(s.image_view.phase, crate::model::ImageViewPhase::Loading);
+        // Loading 期按 `+`：状态 1.25，登记在途编码 zoom=1.0，不发命令。
+        let cmds = s.handle_command(crate::input::Command::ImageViewZoomIn);
+        assert!(cmds.is_empty());
+        assert!((s.image_view.zoom - 1.25).abs() < 1e-6);
+        assert_eq!(s.image_view.zoom_encoded, Some(1.0), "登记打开帧 zoom=1.0");
+        // 打开路径帧（zoom=1.0 编码）到达 → finish 发现 zoom 已变 → 补发。
+        let cmds = s.handle(AppEvent::AttachmentReady {
+            session_id: sid,
+            attachment_id: AttachmentId("zl".into()),
+            block_seq: SessionSeq(8),
+            meta: crate::model::AttachmentRef {
+                attachment_id: AttachmentId("zl".into()),
+                media_type: crate::api::types::MediaType("image/png".into()),
+                bytes: 3,
+                width: 64,
+                height: 64,
+                name: Some("zl.png".into()),
+                original_dimensions: None,
+            },
+            frame: None,
+            entry: crate::model::ImageCacheEntry {
+                attachment_id: AttachmentId("zl".into()),
+                media_type: crate::api::types::MediaType("image/png".into()),
+                bytes: 3,
+                width: 64,
+                height: 64,
+                temp_file: std::path::PathBuf::from("/nonexistent"),
+                last_used: 0,
+            },
+            cached: true,
+            for_viewer: false,
+        });
+        assert!(
+            cmds.iter().any(|c| matches!(
+                c,
+                Cmd::RenderImageViewZoom { zoom, .. } if (*zoom - 1.25).abs() < 1e-6
+            )),
+            "打开帧到达后补发 1.25 重编码: {cmds:?}"
+        );
+        assert!(!s.image_view.zoom_inflight, "回执清在途");
+    }
+
+    // ---------- REQ-007 V0.4 父→子发送（AC-007-01/10） ----------
+
+    #[test]
+    fn subagent_child_submit_routes_to_subagents_prompt_ac007_01_10() {
+        let mut s = AppState::default();
+        let child = SessionId("c1".into());
+        s.active_session = Some(child.clone());
+        s.composer.visible = true;
+        s.composer.active_session = Some(child.clone());
+        s.draft = Some(DraftState {
+            text: "子代理继续".into(),
+            cursor: 0,
+            bound_session: child.clone(),
+        });
+        // 登记 child→parent（模拟目录打开）。
+        s.subagent_parents.insert("c1".into(), "p1".into());
+        s.mode = Mode::Insert;
+        let cmds = s.submit_input(PromptMode::Queue);
+        // 断言路由到 SendSubagentPrompt 而非 SendPrompt。
+        assert!(
+            cmds.iter().any(|c| matches!(
+                c,
+                Cmd::SendSubagentPrompt { parent_id, child_id, content, .. }
+                    if parent_id == "p1" && child_id == "c1"
+                    && matches!(&content[0], PromptContentPart::Text { text } if text == "子代理继续")
+            )),
+            "child 发送走 subagents/prompt: {cmds:?}"
+        );
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Cmd::SendPrompt { .. })),
+            "不误走 session/prompt"
+        );
+        // 普通会话仍走 SendPrompt。
+        let mut s2 = AppState::default();
+        let sid = SessionId("sess-n".into());
+        s2.active_session = Some(sid.clone());
+        s2.composer.visible = true;
+        s2.composer.active_session = Some(sid.clone());
+        s2.draft = Some(DraftState {
+            text: "你好".into(),
+            cursor: 0,
+            bound_session: sid.clone(),
+        });
+        s2.mode = Mode::Insert;
+        let cmds2 = s2.submit_input(PromptMode::Queue);
+        assert!(cmds2.iter().any(|c| matches!(c, Cmd::SendPrompt { .. })));
+    }
+
+    #[test]
+    fn reconnect_keeps_open_subagent_child_address_ac007_01() {
+        // child 打开态断线重连：follow 仍走 subagent address、不退回普通
+        // session/control（与首次打开语义一致，避免 address 漂移）。
+        let mut s = AppState::default();
+        let sid = SessionId("c1".into());
+        s.active_session = Some(sid.clone());
+        s.subagent_parents.insert("c1".into(), "p1".into());
+        let cmds = s.handle(AppEvent::Reconnected);
+        assert_eq!(
+            cmds.iter()
+                .filter(|c| matches!(c, Cmd::OpenFollow { .. }))
+                .count(),
+            0,
+            "child 打开态重连不退回普通 session follow"
+        );
+        assert_eq!(
+            cmds.iter()
+                .filter(|c| matches!(c, Cmd::OpenControl { .. }))
+                .count(),
+            0,
+            "child 打开态不订阅 control"
+        );
+        assert!(
+            cmds.iter().any(|c| matches!(
+                c,
+                Cmd::OpenFollowSubagent { parent_id, child_id, .. }
+                    if parent_id == "p1" && child_id == "c1"
+            )),
+            "重连保持 subagent address follow, cmds={cmds:?}"
+        );
+        // 普通会话重连仍发 OpenFollow+OpenControl（回归）。
+        let mut s2 = AppState::default();
+        let sid2 = SessionId("s1".into());
+        s2.active_session = Some(sid2.clone());
+        let cmds2 = s2.handle(AppEvent::Reconnected);
+        assert_eq!(
+            cmds2
+                .iter()
+                .filter(|c| matches!(c, Cmd::OpenFollow { .. }))
+                .count(),
+            1
+        );
+        assert!(cmds2.iter().any(|c| matches!(c, Cmd::OpenControl { .. })));
     }
 }

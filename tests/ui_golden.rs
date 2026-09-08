@@ -546,7 +546,8 @@ fn non_kitty_placeholder_shows_system_viewer_hint() {
 
 #[test]
 fn image_view_mode_shows_image_status_and_actions() {
-    // AC-004-05 状态栏：IMAGE 徽标 + [o]系统查看器 [y]复制路径 [q]关闭。
+    // AC-004-05 状态栏：IMAGE 徽标 + [o]系统查看器 [y]复制路径
+    // [+/-]缩放 [0]重置 [q]关闭（REQ-007 D-45 zoom 提示）。
     let mut app = AppState::default();
     app.conn = ConnState::Ready;
     app.mode = dshtui::app::Mode::ImageView;
@@ -562,10 +563,31 @@ fn image_view_mode_shows_image_status_and_actions() {
     let text = rendered_text(&terminal);
     assert!(text.contains("IMAGE"), "text={text}");
     assert!(
-        text.contains("[o]系统查看器 [y]复制路径 [q]关闭"),
+        text.contains("[o]系统查看器 [y]复制路径 [+/-]缩放 [0]重置 [q]关闭"),
         "text={text}"
     );
     assert!(text.contains("加载中"), "text={text}");
+}
+
+#[test]
+fn image_view_pager_tag_renders_when_group_ac007_06() {
+    // 同消息多图（pager total=3, index 1）→ 标题 `(2/3)`。
+    let mut app = AppState::default();
+    app.conn = ConnState::Ready;
+    app.mode = dshtui::app::Mode::ImageView;
+    app.image_view.open_view(
+        SessionSeq(5),
+        dshtui::api::types::AttachmentId("att-y".into()),
+        Some("y.png".into()),
+        Some("10x20".into()),
+    );
+    app.image_view.set_pager(3, 1);
+    let backend = TestBackend::new(100, 12);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::render(frame, &app)).unwrap();
+    let text = rendered_text(&terminal);
+    assert!(text.contains("(2/3)"), "pager 标签, text={text}");
+    assert!(text.contains("y.png"), "text={text}");
 }
 
 // ============================================================================

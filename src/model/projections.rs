@@ -71,6 +71,15 @@ pub struct ModelSelection {
     pub next: Option<String>,
 }
 
+/// imageLimits projection（REQ-007 AC-007-24；官方 `{maxImageBytes,
+/// maxImagesPerMessage, mediaTypes}`，`[未验证]` 宽容读取）。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ImageLimits {
+    pub max_image_bytes: Option<u64>,
+    pub max_images_per_message: Option<u64>,
+    pub media_types: Vec<String>,
+}
+
 /// Normalize one `modelSelection.lastUsed|next` value to a display string
 /// (string passthrough / object `provider/model`). Missing/unknown → None.
 fn wire_model_display(value: Option<&Value>) -> Option<String> {
@@ -213,6 +222,128 @@ impl ProjectionSnapshot {
         }
         out
     }
+
+    // ---------- REQ-007 V0.4 projection readers (goal/todos/plan; ADR-008
+    // read-only official projections, never self-computed) ----------
+
+    /// `goal` projection: per-session singleton goal (wire correction: no
+    /// list endpoint). Returns (snapshot fields, roundsStarted/createdAt/
+    /// updatedAt); `None` when absent or malformed (missing/unknown shape →
+    /// "不支持" degrade, AC-007-11).
+    pub fn goal(&self) -> Option<crate::model::GoalView> {
+        let g = self.raw.get("goal")?;
+        if g.is_null() {
+            return None;
+        }
+        let goal = g.get("goal").unwrap_or(g);
+        Some(crate::model::GoalView {
+            id: goal
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            revision: goal.get("revision").and_then(Value::as_u64).unwrap_or(0),
+            objective: goal
+                .get("objective")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            phase: goal
+                .get("phase")
+                .and_then(Value::as_str)
+                .and_then(|p| serde_json::from_str(&format!("\"{p}\"")).ok()),
+            blocked_reason: goal.get("blockedReason").and_then(|v| {
+                v.as_str()
+                    .map(|s| s.to_string())
+                    .or_else(|| v.get("message").and_then(Value::as_str).map(String::from))
+            }),
+            max_goal_rounds: goal.get("maxGoalRounds").and_then(Value::as_u64),
+            rounds_started: g.get("roundsStarted").and_then(Value::as_u64),
+            created_at: g.get("createdAt").and_then(Value::as_i64),
+            updated_at: g.get("updatedAt").and_then(Value::as_i64),
+        })
+    }
+
+    /// `todos` projection: independent key, `TodoItem{content,status}[]`.
+    /// Returns raw item list (contents) — TUI shows read-only.
+    pub fn todos(&self) -> Vec<(String, String)> {
+        let Some(arr) = self.raw.get("todos").and_then(Value::as_array) else {
+            return Vec::new();
+        };
+        arr.iter()
+            .filter_map(|item| {
+                let content = item.get("content").and_then(Value::as_str)?;
+                let status = item
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                Some((content.to_string(), status))
+            })
+            .collect()
+    }
+
+    /// `plan` projection — wire correction: ONLY `{active,pending}` (plan-mode
+    /// toggle state). No deliverables projection exists.
+    pub fn plan(&self) -> Option<(bool, bool)> {
+        let p = self.raw.get("plan")?;
+        if p.is_null() {
+            return None;
+        }
+        Some((
+            p.get("active").and_then(Value::as_bool).unwrap_or(false),
+            p.get("pending").and_then(Value::as_bool).unwrap_or(false),
+        ))
+    }
+
+    /// imageLimits projection（缺字段/未知形状 → 全 None/空 = 无限制语义，
+    /// 发送侧不强制校验）。
+    pub fn image_limits(&self) -> ImageLimits {
+        let Some(l) = self.raw.get("imageLimits") else {
+            return ImageLimits::default();
+        };
+        ImageLimits {
+            max_image_bytes: l.get("maxImageBytes").and_then(Value::as_u64),
+            max_images_per_message: l.get("maxImagesPerMessage").and_then(Value::as_u64),
+            media_types: l
+                .get("mediaTypes")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .map(String::from)
+                        .collect()
+                })
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Subagent activity projection (`subagentTiming` / per-child) — `[未验证]`
+    /// tolerant: only the highest-confidence field read, missing → None.
+    pub fn subagent_running_children(&self) -> Vec<String> {
+        let Some(v) = self
+            .raw
+            .get("subagentTiming")
+            .or_else(|| self.raw.get("subagents"))
+        else {
+            return Vec::new();
+        };
+        // Both possible shapes (array of {id,..} / object keyed by id) are
+        // tolerated; only string ids are returned.
+        let mut out = Vec::new();
+        if let Some(arr) = v.as_array() {
+            for item in arr {
+                if let Some(id) = item.get("id").and_then(Value::as_str) {
+                    out.push(id.to_string());
+                }
+            }
+        } else if let Some(map) = v.as_object() {
+            for key in map.keys() {
+                out.push(key.clone());
+            }
+        }
+        out
+    }
 }
 
 #[cfg(test)]
@@ -317,5 +448,73 @@ mod tests {
         }));
         assert_eq!(p.context_pressure(), ContextPressure::default());
         assert_eq!(p.token_usage(), TokenUsage::default());
+    }
+
+    // ---------- REQ-007 V0.4 projection readers ----------
+
+    #[test]
+    fn goal_projection_reads_singleton_snapshot_ac007_11() {
+        let p = ProjectionSnapshot::new(serde_json::json!({
+            "goal": {
+                "goal": {"id": "g1", "revision": 3, "objective": "交付",
+                         "phase": "active", "maxGoalRounds": 5},
+                "roundsStarted": 2, "createdAt": 100, "updatedAt": 200
+            }
+        }));
+        let g = p.goal().unwrap();
+        assert_eq!(g.id, "g1");
+        assert_eq!(g.revision, 3);
+        assert_eq!(g.objective, "交付");
+        assert_eq!(g.max_goal_rounds, Some(5));
+        assert_eq!(g.rounds_started, Some(2));
+        // 无 goal 投影 / null → None（"不支持"降级，不伪造）。
+        assert!(ProjectionSnapshot::new(serde_json::json!({}))
+            .goal()
+            .is_none());
+        assert!(ProjectionSnapshot::new(serde_json::json!({"goal": null}))
+            .goal()
+            .is_none());
+    }
+
+    #[test]
+    fn todos_projection_reads_content_and_status() {
+        let p = ProjectionSnapshot::new(serde_json::json!({
+            "todos": [
+                {"content": "实现 api", "status": "done"},
+                {"content": "写测试"}
+            ]
+        }));
+        let todos = p.todos();
+        assert_eq!(todos.len(), 2);
+        assert_eq!(todos[0], ("实现 api".into(), "done".into()));
+        assert_eq!(todos[1].1, "", "缺失 status 容忍为空");
+        assert!(ProjectionSnapshot::new(serde_json::json!({}))
+            .todos()
+            .is_empty());
+    }
+
+    #[test]
+    fn plan_projection_is_active_pending_only_ac007_26() {
+        let p = ProjectionSnapshot::new(
+            serde_json::json!({"plan": {"active": true, "pending": false}}),
+        );
+        assert_eq!(p.plan(), Some((true, false)));
+        let p = ProjectionSnapshot::new(serde_json::json!({"plan": null}));
+        assert_eq!(p.plan(), None);
+        let p = ProjectionSnapshot::new(serde_json::json!({}));
+        assert_eq!(p.plan(), None);
+    }
+
+    #[test]
+    fn subagent_projection_tolerates_both_shapes() {
+        let p = ProjectionSnapshot::new(serde_json::json!({
+            "subagentTiming": [{"id": "c1"}, {"id": "c2"}]
+        }));
+        assert_eq!(p.subagent_running_children(), vec!["c1", "c2"]);
+        let p = ProjectionSnapshot::new(serde_json::json!({"subagents": {"c3": {}}}));
+        assert_eq!(p.subagent_running_children(), vec!["c3"]);
+        assert!(ProjectionSnapshot::new(serde_json::json!({}))
+            .subagent_running_children()
+            .is_empty());
     }
 }
