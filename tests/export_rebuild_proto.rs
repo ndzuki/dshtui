@@ -89,8 +89,10 @@ async fn serve_page_rpc(listener: TcpListener) -> tokio::task::JoinHandle<()> {
             let body: Value = serde_json::from_str(&text[body_start..]).unwrap_or(Value::Null);
             let rpc_id = body.get("rpcId").and_then(|v| v.as_str()).unwrap_or("r");
             // Pick page by beforeSeq value (deterministic fixture).
+            // session/page 单 request 形参（wire 校正 0.1.2-rc.1）：
+            // beforeSeq 位于 args.request.beforeSeq。
             let before_seq = body
-                .pointer("/payload/args/beforeSeq")
+                .pointer("/payload/args/request/beforeSeq")
                 .and_then(|v| v.as_u64());
             let (records, has_more) = match before_seq {
                 None => (vec![record(6), record(5)], true),

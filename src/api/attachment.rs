@@ -92,9 +92,14 @@ pub async fn fetch(
     session_id: &SessionId,
     attachment_id: &AttachmentId,
 ) -> Result<AttachmentData, ClientError> {
+    // wire 校正（0.1.2-rc.1 实读）：`session/attachment` 单 request 形参，
+    // sessionId/attachmentId 嵌套在 args.request 内
+    // （SessionAttachmentRequest{sessionId,attachmentId}）。
     let args = serde_json::json!({
-        "sessionId": session_id.0,
-        "attachmentId": attachment_id.0,
+        "request": {
+            "sessionId": session_id.0,
+            "attachmentId": attachment_id.0,
+        }
     });
     let value = unary(http, base, "session/attachment", args).await?;
     parse_response(&value)

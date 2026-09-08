@@ -303,13 +303,16 @@ async fn prompt_unary_posts_official_args_and_parses_accepted() {
         let body: Value = serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
         assert_eq!(body["type"], "client-request");
         assert_eq!(body["method"], "session/prompt");
+        // 单 request 形参：业务字段嵌套在 args.request（wire 校正 0.1.2-rc.1）。
         let args = &body["payload"]["args"];
-        assert_eq!(args["requestId"], "client-minted-1");
-        assert_eq!(args["sessionId"], "sess-1");
-        assert_eq!(args["mode"], "queue");
-        assert_eq!(args["content"][0]["type"], "text");
-        assert_eq!(args["content"][0]["text"], "你好 draft");
-        assert!(args.get("clientTimeZone").is_none());
+        assert!(args.get("requestId").is_none(), "不得平铺 requestId");
+        let req = &args["request"];
+        assert_eq!(req["requestId"], "client-minted-1");
+        assert_eq!(req["sessionId"], "sess-1");
+        assert_eq!(req["mode"], "queue");
+        assert_eq!(req["content"][0]["type"], "text");
+        assert_eq!(req["content"][0]["text"], "你好 draft");
+        assert!(req.get("clientTimeZone").is_none());
         let rpc_id = body["rpcId"].as_str().unwrap().to_string();
         write_json_response(
             &mut socket,
@@ -446,7 +449,9 @@ async fn cancel_unary_returns_typed_accepted_receipt() {
         assert!(request.starts_with("POST /api/session/cancel HTTP/1.1"));
         let body: Value = serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
         assert_eq!(body["method"], "session/cancel");
-        assert_eq!(body["payload"]["args"]["sessionId"], "sess-1");
+        // 单 request 形参（wire 校正 0.1.2-rc.1）：sessionId 嵌套在 args.request。
+        assert!(body["payload"]["args"].get("sessionId").is_none());
+        assert_eq!(body["payload"]["args"]["request"]["sessionId"], "sess-1");
         let rpc_id = body["rpcId"].as_str().unwrap().to_string();
         write_json_response(
             &mut socket,
@@ -546,7 +551,9 @@ async fn search_unary_posts_query_and_parses_session_level_hits() {
         let body: Value = serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
         let rpc_id = body["rpcId"].as_str().unwrap().to_string();
         assert_eq!(body["method"], "session/search");
-        assert_eq!(body["payload"]["args"]["query"], "deploy");
+        // 单 request 形参（wire 校正 0.1.2-rc.1）：query 嵌套在 args.request。
+        assert!(body["payload"]["args"].get("query").is_none());
+        assert_eq!(body["payload"]["args"]["request"]["query"], "deploy");
         write_json_response(
             &mut socket,
             json!({
@@ -782,8 +789,13 @@ async fn attachment_fetch_sends_envelope_and_decodes_base64_data() {
         let request: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(request["type"], "client-request");
         assert_eq!(request["method"], "session/attachment");
-        assert_eq!(request["payload"]["args"]["sessionId"], "sess-1");
-        assert_eq!(request["payload"]["args"]["attachmentId"], "att-9");
+        // 单 request 形参（wire 校正 0.1.2-rc.1）：嵌套在 args.request。
+        assert!(request["payload"]["args"].get("sessionId").is_none());
+        assert_eq!(request["payload"]["args"]["request"]["sessionId"], "sess-1");
+        assert_eq!(
+            request["payload"]["args"]["request"]["attachmentId"],
+            "att-9"
+        );
         let rpc_id = request["rpcId"].as_str().unwrap();
 
         let png: Vec<u8> = vec![0x89, b'P', b'N', b'G', 1, 2, 3, 4];
@@ -1651,7 +1663,9 @@ async fn skills_list_session_scoped_and_typed_entries() {
         assert!(request.starts_with("POST /api/skills/list HTTP/1.1"));
         let body: Value = serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
         assert_eq!(body["method"], "skills/list");
-        assert_eq!(body["payload"]["args"]["sessionId"], "sess-1");
+        // 单 request 形参（wire 校正 0.1.2-rc.1）：sessionId 嵌套在 args.request。
+        assert!(body["payload"]["args"].get("sessionId").is_none());
+        assert_eq!(body["payload"]["args"]["request"]["sessionId"], "sess-1");
         let rpc_id = body["rpcId"].as_str().unwrap().to_string();
         write_json_response(
             &mut socket,
@@ -1760,7 +1774,10 @@ async fn feedback_put_nests_cas_fields_and_lists() {
                     .await;
                 }
                 _ => {
-                    assert_eq!(body["payload"]["args"]["sessionId"], "sess-1");
+                    // messageFeedback/list 单 request 形参（wire 校正
+                    // 0.1.2-rc.1）：sessionId 嵌套在 args.request。
+                    assert!(body["payload"]["args"].get("sessionId").is_none());
+                    assert_eq!(body["payload"]["args"]["request"]["sessionId"], "sess-1");
                     write_json_response(
                         &mut socket,
                         json!({"type": "server-response", "rpcId": rpc_id,

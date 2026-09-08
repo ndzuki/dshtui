@@ -52,7 +52,15 @@ pub async fn list(
     base: &str,
     cursor: Option<&str>,
 ) -> Result<SessionListPage, ClientError> {
-    let args = serde_json::json!({ "cursor": cursor });
+    // wire 校正（0.1.2-rc.1 实读 + live 冒烟）：`session/list` 参数 wire 是
+    // `_request`（带下划线），业务字段嵌套在 args._request 内。cursor 为
+    // SessionListRequest{cursor?} 可选字段——None 时整键省略（官方 zod
+    // `.optional()` 拒绝 null，live `{"_request":{}}` 实测 ok）。
+    let mut request = serde_json::Map::new();
+    if let Some(c) = cursor {
+        request.insert("cursor".into(), serde_json::json!(c));
+    }
+    let args = serde_json::json!({ "_request": request });
     let value = unary(http, base, "session/list", args).await?;
     let items = value
         .get("items")
@@ -82,9 +90,14 @@ pub async fn open_follow(
     address: &SessionAddress,
     max_messages: usize,
 ) -> Result<StreamHandle, ClientError> {
+    // wire 校正（0.1.2-rc.1 实读）：`session/follow` mux open 帧 args 按
+    // descriptor 嵌套 —— wire=`request`，open payload.args 为
+    // `{"request":{address,maxMessages}}`（SessionFollowRequest）。
     let args = serde_json::json!({
-        "address": address,
-        "maxMessages": max_messages,
+        "request": {
+            "address": address,
+            "maxMessages": max_messages,
+        }
     });
     mux.open_stream("session/follow", args).await
 }
@@ -99,13 +112,18 @@ pub async fn page(
     before_seq: Option<SessionSeq>,
     max_messages: usize,
 ) -> Result<PageResult, ClientError> {
+    // wire 校正（0.1.2-rc.1 实读 + live 冒烟）：`session/page` 单 request 形参，
+    // args 嵌套 `{"request":{...}}`（SessionPageRequest：address/throughSeq 必填、
+    // beforeSeq/maxMessages 可选）。beforeSeq 仅在 Some 时出现。
     let mut args = serde_json::json!({
-        "address": address,
-        "throughSeq": through_seq,
-        "maxMessages": max_messages,
+        "request": {
+            "address": address,
+            "throughSeq": through_seq,
+            "maxMessages": max_messages,
+        }
     });
     if let Some(b) = before_seq {
-        args["beforeSeq"] = serde_json::json!(b);
+        args["request"]["beforeSeq"] = serde_json::json!(b);
     }
     let value = unary(http, base, "session/page", args).await?;
     serde_json::from_value(value)
@@ -129,13 +147,18 @@ pub async fn page_raw(
     before_seq: Option<SessionSeq>,
     max_messages: usize,
 ) -> Result<RawPage, ClientError> {
+    // wire 校正（0.1.2-rc.1 实读 + live 冒烟）：`session/page` 单 request 形参，
+    // args 嵌套 `{"request":{...}}`（SessionPageRequest：address/throughSeq 必填、
+    // beforeSeq/maxMessages 可选）。beforeSeq 仅在 Some 时出现。
     let mut args = serde_json::json!({
-        "address": address,
-        "throughSeq": through_seq,
-        "maxMessages": max_messages,
+        "request": {
+            "address": address,
+            "throughSeq": through_seq,
+            "maxMessages": max_messages,
+        }
     });
     if let Some(b) = before_seq {
-        args["beforeSeq"] = serde_json::json!(b);
+        args["request"]["beforeSeq"] = serde_json::json!(b);
     }
     let value = unary(http, base, "session/page", args).await?;
     let records = value
@@ -158,8 +181,12 @@ pub async fn prompt(
     base: &str,
     request: &PromptRequest,
 ) -> Result<AcceptedValue, ClientError> {
-    let args = serde_json::to_value(request)
+    // wire 校正（0.1.2-rc.1 实读）：`session/prompt` 单 request 形参（wire=
+    // `request`），业务字段必须嵌套在 args.request 内（SessionPromptRequest
+    // {requestId,sessionId,mode,content,clientTimeZone?}），不能平铺。
+    let req = serde_json::to_value(request)
         .map_err(|e| ClientError::Protocol(format!("session/prompt 参数序列化失败: {e}")))?;
+    let args = serde_json::json!({ "request": req });
     let value = unary(http, base, "session/prompt", args).await?;
     accepted_receipt("session/prompt", value)
 }
@@ -172,7 +199,9 @@ pub async fn cancel(
     base: &str,
     session_id: &str,
 ) -> Result<AcceptedValue, ClientError> {
-    let args = serde_json::json!({ "sessionId": session_id });
+    // wire 校正（0.1.2-rc.1 实读）：`session/cancel` 单 request 形参，业务
+    // 字段嵌套在 args.request 内（SessionCancelRequest{sessionId}）。
+    let args = serde_json::json!({ "request": { "sessionId": session_id } });
     let value = unary(http, base, "session/cancel", args).await?;
     accepted_receipt("session/cancel", value)
 }
@@ -230,20 +259,26 @@ pub async fn search(
     query: &str,
     timeout: std::time::Duration,
 ) -> Result<super::types::SearchResult, ClientError> {
-    let args = serde_json::json!({ "query": query });
+    // wire 校正（0.1.2-rc.1 实读）：`session/search` 单 request 形参，query
+    // 嵌套在 args.request 内（SessionSearchRequest{query}）。
+    let args = serde_json::json!({ "request": { "query": query } });
     let value = super::unary_with_timeout(http, base, "session/search", args, timeout).await?;
     serde_json::from_value(value)
         .map_err(|e| ClientError::Protocol(format!("session/search 响应形状异常: {e}")))
 }
 
 /// Open a `session/control` stream (REQ-003 §3): live baseline + replacement
-/// frames for running/queued state. The open-frame args follow the official
-/// address shape; payload fields stay `[未验证]`-tolerant.
+/// frames for running/queued state. Control is **Host-wide**（含所有 session 的
+/// queues/jobs/projections），descriptor parameters 为空（0.1.2-rc.1 实读
+/// dsh-api-session-controller typert.remote-client.js：`session/control`
+/// 无 request 参数），因此 mux open 帧 args 为 `{}`——与官方 client
+/// `control(signal)` 零参惯例一致。`address` 仅用于追溯调用方上下文（本机
+/// 单服务），不上送。
 pub async fn open_control(
     mux: &super::Mux,
-    address: &SessionAddress,
+    _address: &SessionAddress,
 ) -> Result<StreamHandle, ClientError> {
-    let args = serde_json::json!({ "address": address });
+    let args = serde_json::json!({});
     mux.open_stream("session/control", args).await
 }
 
