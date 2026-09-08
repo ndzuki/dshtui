@@ -70,7 +70,8 @@ CI 门禁（fmt/clippy/test + 契约冒烟）见 `.github/workflows/ci.yml`（V1
 ```
 
 - `type`：`feat`（功能/验收接线）、`fix`（缺陷/评审修复）、`style`（fmt/clippy 收敛）、
-  `refactor`（结构性调整）；范围恒为 `dshtui`。
+  `refactor`（结构性调整）、`docs`（文档/注释）、`chore`（构建/工具/权限位等杂项）；
+  范围恒为 `dshtui`。
 - 描述为**中文**，一句话概括 + 破折号展开关键点；涉及需求时标注 `REQ-00X` /
   `AC-XXX` / `D-XX` 编号；行为改动附**测试证据**（如「AC-008-09/10 测试证据」、
   「full NNN PASS」）。

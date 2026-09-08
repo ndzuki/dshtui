@@ -122,7 +122,8 @@ pub struct PerfLogEntry {
 }
 
 impl PerfLogEntry {
-    /// 单行 key=val 文本（兼容既有 `/tmp/dshtui-perf.log` 行形态，追加写入）。
+    /// 单行 key=val 文本（沿用既有 `/tmp/dshtui-perf.log` 路径与追加写入方式；
+    /// 字段 schema 为 REQ-008 `PerfLogEntry`，不与旧 monitor 行混合解析）。
     pub fn to_line(&self) -> String {
         let mut line = format!(
             "ts={} rss_kb={} frame_ms_p50={:.1} frame_ms_p99={:.1}",

@@ -975,9 +975,8 @@ async fn execute_one(
             let Some(client) = client.as_ref() else {
                 return;
             };
-            let address = SessionAddress::session(&session_id.0);
             let opened = match open_mux_stream(client, mux, mux_generation, event_tx).await {
-                Ok(mux_ref) => session::open_control(mux_ref, &address).await,
+                Ok(mux_ref) => session::open_control(mux_ref).await,
                 Err(error) => Err(error),
             };
             match opened {

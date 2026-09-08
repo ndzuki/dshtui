@@ -620,15 +620,26 @@ pub struct SessionMeta {
     pub last_turn_preview: Option<String>,
 }
 
-/// Raw `session/list` entry (compatible with both shapes: direct fields /
-/// projections.values, Notes/03 §5).
+/// Raw `session/list` entry.
+///
+/// 官方 wire 形状（0.1.2-rc.1 live 实证，typert.remote-client.d.ts
+/// SessionSummary）：顶层 `sessionId / updatedAt / running / blank /
+/// parentSessionId? / origin? / cwd? / projections?`，全部 camelCase 且与
+/// Rust 字段名不同（`sessionId`→`id`、`updatedAt`→`updated_at_ms`、
+/// `parentSessionId`→`parent_id`），因此每个官方字段用逐字段 `alias` 声明，
+/// 同时保留自然键/旧 mock 形状（`id`/`updatedAtMs`/`updated_at_ms`/
+/// `parentId`/`parent_id`）兼容。title/cwd/updated_at/running/blank 等另有
+/// projections.values 兜底（含无 projections 的浅 item 顶层直读）。
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ListItemRaw {
+    /// 官方 wire `sessionId`；旧形状顶层 `id` 兼容。
+    #[serde(alias = "sessionId")]
     pub id: String,
     #[serde(default)]
     pub workspace: Option<String>,
-    #[serde(default)]
+    /// 官方 wire `parentSessionId`；`parentId`/`parent_id` 兼容。
+    #[serde(default, alias = "parentSessionId", alias = "parent_id")]
     pub parent_id: Option<String>,
     #[serde(default)]
     pub projections: Option<serde_json::Value>,
@@ -637,7 +648,9 @@ pub struct ListItemRaw {
     pub title: Option<String>,
     #[serde(default)]
     pub cwd: Option<String>,
-    #[serde(default)]
+    /// 官方 wire `updatedAt`（epoch ms，每个 item 都有）；`updatedAtMs`/
+    /// `updated_at_ms` 兼容。
+    #[serde(default, alias = "updatedAt", alias = "updated_at_ms")]
     pub updated_at_ms: Option<i64>,
     #[serde(default)]
     pub running: Option<bool>,
@@ -675,10 +688,16 @@ pub fn meta_from_raw(raw: ListItemRaw) -> Option<SessionMeta> {
             .find_map(|k| vals.and_then(|v| v.get(k)).and_then(|x| x.as_bool()))
     };
     let metadata = vals.and_then(|v| v.get("sessionListMetadata"));
-    let updated_at_ms = metadata
-        .and_then(|m| m.get("lastPromptAt"))
-        .and_then(|x| x.as_i64())
-        .or(raw.updated_at_ms)
+    // 主源：官方顶层 `updatedAt`（alias 后 raw.updated_at_ms 直接可读，浅 item
+    // 也有）；旧兜底：projections.values.sessionListMetadata.lastPromptAt
+    // （与 updatedAt 同值，live 实证；保留兼容旧 mock）。
+    let updated_at_ms = raw
+        .updated_at_ms
+        .or_else(|| {
+            metadata
+                .and_then(|m| m.get("lastPromptAt"))
+                .and_then(|x| x.as_i64())
+        })
         .unwrap_or(0);
 
     // Summary of the last turnOutline response (≤120 chars, official
@@ -1095,11 +1114,61 @@ mod tests {
     }
 
     #[test]
-    fn meta_from_raw_reads_projections_values_shape() {
+    fn list_item_raw_parses_official_wire_shape() {
+        // 官方 0.1.2-rc.1 session/list item 形状（live 实证千余条）：顶层
+        // sessionId/updatedAt/running/blank/parentSessionId/origin/cwd/
+        // projections，title 在 projections.values 内。全部需经逐字段 alias
+        // 解析（旧形状 id/updatedAtMs/parentId 与官方不同名）。
         let raw: ListItemRaw = serde_json::from_str(
             r#"{
-                "id": "sess-7",
-                "workspace": "ws-1",
+                "sessionId": "sess-9",
+                "updatedAt": 1788864117943,
+                "running": false,
+                "blank": false,
+                "parentSessionId": "parent-1",
+                "origin": "subagent",
+                "cwd": "/home/nd",
+                "projections": {"asOfSeq": 94826, "values": {
+                    "title": "部署排查",
+                    "sessionListMetadata": {"lastPromptAt": 1788864117943, "blank": false},
+                    "turnOutline": [
+                        {"turn": 1, "seq": 3, "prompt": "p", "response": "r1"},
+                        {"turn": 2, "seq": 6, "prompt": "p2", "response": "r2"}
+                    ]
+                }}
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(raw.id, "sess-9");
+        assert_eq!(raw.updated_at_ms, Some(1788864117943));
+        assert_eq!(raw.parent_id.as_deref(), Some("parent-1"));
+        assert_eq!(raw.cwd.as_deref(), Some("/home/nd"));
+        assert_eq!(raw.origin.as_deref(), Some("subagent"));
+        assert_eq!(raw.running, Some(false));
+        assert_eq!(raw.blank, Some(false));
+
+        let m = meta_from_raw(raw).unwrap();
+        assert_eq!(m.id, SessionId("sess-9".into()));
+        assert_eq!(m.title.as_deref(), Some("部署排查"));
+        assert_eq!(m.cwd.as_deref(), Some("/home/nd"));
+        assert_eq!(m.updated_at_ms, 1788864117943);
+        assert!(!m.running);
+        assert!(!m.blank);
+        assert_eq!(m.origin.as_deref(), Some("subagent"));
+        assert_eq!(m.parent_id, Some(SessionId("parent-1".into())));
+        assert_eq!(m.workspace, None);
+        assert_eq!(m.last_turn_preview.as_deref(), Some("r2"));
+    }
+
+    #[test]
+    fn meta_from_raw_reads_projections_values_and_prefers_updated_at() {
+        // 官方形状：title/running/blank/lastPromptAt 等走 projections.values
+        // 兜底；顶层 updatedAt（主源）与 values.sessionListMetadata.lastPromptAt
+        // 并存时以 updatedAt 为准（live 实证两者同值，浅 item 也只有 updatedAt）。
+        let raw: ListItemRaw = serde_json::from_str(
+            r#"{
+                "sessionId": "sess-7",
+                "updatedAt": 2000,
                 "projections": {"values": {
                     "title": "部署排查",
                     "cwd": "/home/nd",
@@ -1117,27 +1186,63 @@ mod tests {
         assert_eq!(m.id, SessionId("sess-7".into()));
         assert_eq!(m.title.as_deref(), Some("部署排查"));
         assert_eq!(m.cwd.as_deref(), Some("/home/nd"));
-        assert_eq!(m.updated_at_ms, 1000);
+        assert_eq!(m.updated_at_ms, 2000, "顶层 updatedAt 应为 updated_at 主源");
         assert!(m.running);
         assert!(!m.blank);
-        assert_eq!(m.workspace, Some(WorkspaceId("ws-1".into())));
+        assert_eq!(m.workspace, None);
         assert_eq!(m.last_turn_preview.as_deref(), Some("r2"));
     }
 
     #[test]
-    fn meta_from_raw_tolerates_missing_fields() {
-        let raw: ListItemRaw = serde_json::from_str(r#"{"id":"sess-8"}"#).unwrap();
+    fn meta_from_raw_tolerates_missing_fields_official_shape() {
+        // 官方最小 item：仅 sessionId（浅 item 无 projections/origin 等，顶层
+        // 字段可整体省略）→ 除 id 外全空但可解析。
+        let raw: ListItemRaw = serde_json::from_str(r#"{"sessionId":"sess-8"}"#).unwrap();
         let m = meta_from_raw(raw).unwrap();
         assert_eq!(m.id, SessionId("sess-8".into()));
         assert_eq!(m.title, None);
+        assert_eq!(m.cwd, None);
         assert_eq!(m.updated_at_ms, 0);
         assert!(!m.running);
+        assert_eq!(m.origin, None);
+        assert_eq!(m.parent_id, None);
     }
 
     #[test]
-    fn meta_from_raw_rejects_empty_id() {
-        let raw: ListItemRaw = serde_json::from_str(r#"{"id":""}"#).unwrap();
-        assert!(meta_from_raw(raw).is_none());
+    fn list_item_raw_still_accepts_legacy_shapes() {
+        // 旧 mock/直连形状（snake `id`/`updated_at_ms`/`parent_id` 与顶层
+        // workspace）仍兼容：id 是自然主键，updated_at_ms/parent_id 的 snake
+        // alias 兜底。
+        let raw: ListItemRaw = serde_json::from_str(
+            r#"{
+                "id": "sess-8",
+                "workspace": "ws-1",
+                "parent_id": "p8",
+                "updated_at_ms": 123
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(raw.id, "sess-8");
+        assert_eq!(raw.updated_at_ms, Some(123));
+        assert_eq!(raw.parent_id.as_deref(), Some("p8"));
+        let m = meta_from_raw(raw).unwrap();
+        assert_eq!(m.id, SessionId("sess-8".into()));
+        assert_eq!(m.updated_at_ms, 123);
+        assert_eq!(m.parent_id, Some(SessionId("p8".into())));
+        assert_eq!(m.workspace, Some(WorkspaceId("ws-1".into())));
+        assert_eq!(m.title, None);
+        // camel 自然键（updatedAtMs/parentId）也可用。
+        let raw: ListItemRaw =
+            serde_json::from_str(r#"{"id":"s2","updatedAtMs":9,"parentId":"q1"}"#).unwrap();
+        assert_eq!(raw.updated_at_ms, Some(9));
+        assert_eq!(raw.parent_id.as_deref(), Some("q1"));
+    }
+
+    #[test]
+    fn meta_from_raw_rejects_empty_session_id() {
+        // meta_from_raw 依赖非空 id 过滤：官方 sessionId 与旧 id 皆拒绝空串。
+        assert!(meta_from_raw(serde_json::from_str(r#"{"sessionId":""}"#).unwrap()).is_none());
+        assert!(meta_from_raw(serde_json::from_str(r#"{"id":""}"#).unwrap()).is_none());
     }
 
     #[test]

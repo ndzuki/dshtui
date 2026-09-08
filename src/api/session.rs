@@ -272,12 +272,8 @@ pub async fn search(
 /// queues/jobs/projections），descriptor parameters 为空（0.1.2-rc.1 实读
 /// dsh-api-session-controller typert.remote-client.js：`session/control`
 /// 无 request 参数），因此 mux open 帧 args 为 `{}`——与官方 client
-/// `control(signal)` 零参惯例一致。`address` 仅用于追溯调用方上下文（本机
-/// 单服务），不上送。
-pub async fn open_control(
-    mux: &super::Mux,
-    _address: &SessionAddress,
-) -> Result<StreamHandle, ClientError> {
+/// `control(signal)` 零参惯例一致。
+pub async fn open_control(mux: &super::Mux) -> Result<StreamHandle, ClientError> {
     let args = serde_json::json!({});
     mux.open_stream("session/control", args).await
 }
