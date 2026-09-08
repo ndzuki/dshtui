@@ -1796,8 +1796,10 @@ impl AppState {
 
     // ---------- REQ-007 V0.4 `:edit` 外部编辑器（AC-007-25，prototype ✅） ----------
 
-    /// 解析 `$EDITOR`（`$VISUAL` 优先，回退 `$EDITOR`）；两者皆无 → None。
-    fn resolve_editor() -> Option<String> {
+    /// 解析 `:edit` 编辑器（D-52 三级选择链）：`$VISUAL` → `$EDITOR` →
+    /// config `[ui].editor`（`self.editor_fallback`，启动注入）；皆无 → None
+    /// （调用方给可读提示，不猜测启动外部编辑器）。
+    fn resolve_editor(&self) -> Option<String> {
         std::env::var("VISUAL")
             .ok()
             .filter(|v| !v.trim().is_empty())
@@ -1806,6 +1808,7 @@ impl AppState {
                     .ok()
                     .filter(|v| !v.trim().is_empty())
             })
+            .or_else(|| self.editor_fallback.clone())
     }
 
     /// 起始 `:edit`：把当前 composer 草稿写入 state 目录临时文件并挂起主循环
@@ -1824,8 +1827,8 @@ impl AppState {
             .as_ref()
             .map(|d| d.text.clone())
             .unwrap_or_default();
-        let Some(editor) = Self::resolve_editor() else {
-            self.notice = Some("未设置 $EDITOR（export EDITOR=vim）".into());
+        let Some(editor) = self.resolve_editor() else {
+            self.notice = Some("未设置 $VISUAL/$EDITOR 且未配置 [ui].editor（export EDITOR=vim 或 config 设置）".into());
             return vec![];
         };
         // 临时文件放 state 目录（~/.local/state/dshtui/，与主进程同文件系统；
@@ -7181,6 +7184,10 @@ mod tests {
     use super::*;
     use crate::input::Command as C;
 
+    /// 串行化 `:edit` 相关测试的 env 读写（$VISUAL/$EDITOR/XDG_STATE_HOME）：
+    /// 多个测试共享同一把锁，防并行 env 竞争导致 flaky（D-52 并行实测教训）。
+    static EDITOR_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn snapshot(sid: &str, running: bool) -> AppEvent {
         AppEvent::FollowSnapshot {
             session_id: SessionId(sid.into()),
@@ -9848,9 +9855,8 @@ mod tests {
 
     #[test]
     fn external_edit_begin_writes_tmp_and_emits_cmd_ac007_25() {
-        // 隔离 $EDITOR（静态锁防并行 env 竞争）。
-        static EDITOR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = EDITOR_LOCK.lock().unwrap();
+        // 隔离 $EDITOR（共享 EDITOR_ENV_LOCK 防并行 env 竞争）。
+        let _guard = EDITOR_ENV_LOCK.lock().unwrap();
         let prev = std::env::var("EDITOR").ok();
         let prev_visual = std::env::var("VISUAL").ok();
         std::env::remove_var("VISUAL");
@@ -9892,6 +9898,99 @@ mod tests {
         match prev_visual {
             Some(v) => std::env::set_var("VISUAL", v),
             None => std::env::remove_var("VISUAL"),
+        }
+    }
+
+    #[test]
+    fn external_edit_editor_chain_visual_editor_config_d52() {
+        // D-52：`$VISUAL` → `$EDITOR` → config `[ui].editor` 三级链；
+        // 前级存在覆盖后级；全缺 → 可读提示不发命令。
+        let _guard = EDITOR_ENV_LOCK.lock().unwrap();
+        let prev_editor = std::env::var("EDITOR").ok();
+        let prev_visual = std::env::var("VISUAL").ok();
+        let prev_xdg = std::env::var("XDG_STATE_HOME").ok();
+        let state_dir =
+            std::env::temp_dir().join(format!("dshtui-edit-chain-{}", std::process::id()));
+        std::env::set_var("XDG_STATE_HOME", &state_dir);
+        let mut s = AppState::default();
+        s.editor_fallback = Some("/bin/true".into());
+        let sid = SessionId("sess-e2".into());
+        s.composer.visible = true;
+        s.composer.active_session = Some(sid.clone());
+        s.draft = Some(DraftState {
+            text: "草稿".into(),
+            cursor: 0,
+            bound_session: sid.clone(),
+        });
+        // ① env 全缺 → config fallback。
+        std::env::remove_var("EDITOR");
+        std::env::remove_var("VISUAL");
+        let cmds = s.external_edit_begin();
+        let Cmd::ExternalEdit { tmp_path, editor } =
+            cmds.iter().find(|c| matches!(c, Cmd::ExternalEdit { .. })).unwrap()
+        else {
+            panic!("config fallback 编辑器应生效，{cmds:?}")
+        };
+        assert_eq!(editor, "/bin/true", "config [ui].editor 生效");
+        let _ = std::fs::remove_file(tmp_path);
+        s.external_edit.cancel();
+        s.mode = Mode::Normal;
+        s.composer.visible = false;
+        // ② $EDITOR 存在 → 覆盖 config。
+        s.editor_fallback = Some("/bin/true".into());
+        std::env::set_var("EDITOR", "/bin/echo");
+        s.composer.visible = true;
+        s.composer.active_session = Some(sid.clone());
+        let cmds = s.external_edit_begin();
+        let Cmd::ExternalEdit { tmp_path, editor } =
+            cmds.iter().find(|c| matches!(c, Cmd::ExternalEdit { .. })).unwrap()
+        else {
+            panic!("$EDITOR 应覆盖 config，{cmds:?}")
+        };
+        assert_eq!(editor, "/bin/echo", "$EDITOR 优先于 config");
+        let _ = std::fs::remove_file(tmp_path);
+        s.external_edit.cancel();
+        s.composer.visible = false;
+        // ③ $VISUAL 存在 → 覆盖 $EDITOR。
+        std::env::set_var("VISUAL", "/bin/cat");
+        std::env::remove_var("EDITOR");
+        s.editor_fallback = Some("/bin/true".into());
+        s.composer.visible = true;
+        s.composer.active_session = Some(sid.clone());
+        let cmds = s.external_edit_begin();
+        let Cmd::ExternalEdit { tmp_path, editor } =
+            cmds.iter().find(|c| matches!(c, Cmd::ExternalEdit { .. })).unwrap()
+        else {
+            panic!("$VISUAL 应生效，{cmds:?}")
+        };
+        assert_eq!(editor, "/bin/cat", "$VISUAL 最优先");
+        let _ = std::fs::remove_file(tmp_path);
+        s.external_edit.cancel();
+        s.composer.visible = false;
+        // ④ 全缺（含 config None）→ 可读提示，不发命令。
+        std::env::remove_var("VISUAL");
+        std::env::remove_var("EDITOR");
+        s.editor_fallback = None;
+        s.composer.visible = true;
+        s.composer.active_session = Some(sid.clone());
+        let cmds = s.external_edit_begin();
+        assert!(cmds.is_empty(), "无编辑器不发命令");
+        let notice = s.notice.as_deref().unwrap_or("");
+        assert!(notice.contains("EDITOR"), "提示选择链, {notice}");
+        assert!(notice.contains("[ui].editor"), "提示 config, {notice}");
+        // 清理：env + state 临时目录。
+        let _ = std::fs::remove_dir_all(&state_dir);
+        match prev_editor {
+            Some(v) => std::env::set_var("EDITOR", v),
+            None => std::env::remove_var("EDITOR"),
+        }
+        match prev_visual {
+            Some(v) => std::env::set_var("VISUAL", v),
+            None => std::env::remove_var("VISUAL"),
+        }
+        match prev_xdg {
+            Some(v) => std::env::set_var("XDG_STATE_HOME", v),
+            None => std::env::remove_var("XDG_STATE_HOME"),
         }
     }
 
