@@ -75,6 +75,20 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
                 Style::default().fg(accent),
             )));
         }
+        ExportPhase::Rebuilding => {
+            // D-46 兜底：官方路由不可用 → session/page 全量重建 JSONL。
+            lines.push(Line::from(Span::styled(
+                format!(
+                    " ♻ 官方导出路由不可用，本地重建 JSONL… 已收集 {} 条 records",
+                    e.records_collected
+                ),
+                Style::default().fg(Color::Yellow),
+            )));
+            lines.push(Line::from(Span::styled(
+                " [Esc] 取消（完成后清理临时文件）",
+                Style::default().fg(accent),
+            )));
+        }
         ExportPhase::Done => {
             lines.push(Line::from(Span::styled(
                 format!(

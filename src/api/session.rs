@@ -112,6 +112,44 @@ pub async fn page(
         .map_err(|e| ClientError::Protocol(format!("session/page 响应形状异常: {e}")))
 }
 
+/// `session/page` raw variant（D-46 export 兜底）：返回每条 record 的原始 JSON
+/// `Value`（不解析成 typed），供 JSONL 逐行落盘（api/main 层直接收集 raw
+/// records，不污染 TranscriptWindow）。分页语义与 `page` 一致。
+#[derive(Debug, Clone, Default)]
+pub struct RawPage {
+    pub records: Vec<serde_json::Value>,
+    pub has_more: bool,
+}
+
+pub async fn page_raw(
+    http: &reqwest::Client,
+    base: &str,
+    address: &SessionAddress,
+    through_seq: SessionSeq,
+    before_seq: Option<SessionSeq>,
+    max_messages: usize,
+) -> Result<RawPage, ClientError> {
+    let mut args = serde_json::json!({
+        "address": address,
+        "throughSeq": through_seq,
+        "maxMessages": max_messages,
+    });
+    if let Some(b) = before_seq {
+        args["beforeSeq"] = serde_json::json!(b);
+    }
+    let value = unary(http, base, "session/page", args).await?;
+    let records = value
+        .get("records")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let has_more = value
+        .get("hasMore")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    Ok(RawPage { records, has_more })
+}
+
 /// `session/prompt` typed unary (REQ-002 §3): posts the official camelCase
 /// args and returns the `{accepted:true}` receipt. Errors keep
 /// `code/message/details` via the shared envelope classification.

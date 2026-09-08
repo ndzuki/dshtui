@@ -1224,6 +1224,62 @@ async fn execute_one(
                 let _ = tx.send(event).await;
             });
         }
+        // ---------- REQ-007 D-46：export page 重建兜底 ----------
+        // 官方导出路由不可用（404/5xx/transport，app 已分类）→ 以
+        // `session/page` 全量 records 重建 JSONL：每页检查取消令牌、上报
+        // 已收集 records；页错误/取消清 tmp 不留半成品。
+        Cmd::ExportRebuild {
+            session_id,
+            path,
+            address,
+            through_seq,
+        } => {
+            let Some(client) = client.as_ref() else {
+                let event = AppEvent::ExportRebuildFailed {
+                    error: ClientError::Transport("未连接（dsh web 不可达）".into()),
+                };
+                commands.extend(app.handle(event));
+                return;
+            };
+            app.export_cancel.store(false, Ordering::Relaxed);
+            let http = client.http.clone();
+            let base = client.base.clone();
+            let cancel = app.export_cancel.clone();
+            let tx = event_tx.clone();
+            tokio::spawn(async move {
+                let mut progress = |records: u64| {
+                    let _ = tx.try_send(AppEvent::ExportRebuildProgress { records });
+                };
+                let is_cancelled = || cancel.load(Ordering::Relaxed);
+                // through_seq = 会话最新 seq（app 由 follow 游标/窗口尾推导）；
+                // None = 空/未加载会话 → 直接写 header-only 文件（可恢复）。
+                let result = match through_seq {
+                    Some(seq) => {
+                        dshtui::api::export::rebuild_export_jsonl(
+                            &http,
+                            &base,
+                            &session_id,
+                            &address,
+                            seq,
+                            &path,
+                            &mut progress,
+                            is_cancelled,
+                        )
+                        .await
+                    }
+                    None => write_header_only_jsonl(&session_id, &path).await,
+                };
+                let cancelled = cancel.load(Ordering::Relaxed);
+                let event = match result {
+                    Ok(receipt) => AppEvent::ExportRebuildDone {
+                        path: receipt.final_path,
+                    },
+                    Err(_) if cancelled => AppEvent::ExportCancelled,
+                    Err(error) => AppEvent::ExportRebuildFailed { error },
+                };
+                let _ = tx.send(event).await;
+            });
+        }
         // ---------- REQ-007：settings / skills（AC-007-15~19） ----------
         Cmd::FetchSettingsDescribe => {
             let Some(client) = client.as_ref() else {
@@ -1838,6 +1894,53 @@ fn encode_area(app: &AppState) -> ratatui::layout::Rect {
         app.details_width_cells,
     )
     .center
+}
+
+/// D-46：空/未加载会话的 page 重建——只写 header 行（records=0，可恢复；
+/// 会话有内容时 app 侧会带 through_seq 走真实分页）。
+async fn write_header_only_jsonl(
+    session_id: &str,
+    path: &std::path::Path,
+) -> Result<dshtui::api::export::ExportReceipt, ClientError> {
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
+    let tmp_name = format!(
+        "{}.rebuild-{}",
+        path.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "export".into()),
+        std::process::id()
+    );
+    let tmp_path = match parent {
+        Some(p) => {
+            if let Err(e) = tokio::fs::create_dir_all(p).await {
+                return Err(ClientError::Transport(format!(
+                    "创建导出目录失败（{}）: {e}",
+                    p.display()
+                )));
+            }
+            p.join(&tmp_name)
+        }
+        None => std::path::PathBuf::from(&tmp_name),
+    };
+    let header = dshtui::model::export::rebuild_header_line(session_id);
+    let bytes = header.len() as u64;
+    match tokio::fs::write(&tmp_path, header.as_bytes()).await {
+        Ok(()) => {}
+        Err(e) => {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            return Err(ClientError::Transport(format!(
+                "导出重建写入失败（{}）: {e}",
+                tmp_path.display()
+            )));
+        }
+    }
+    tokio::fs::rename(&tmp_path, path)
+        .await
+        .map_err(|e| ClientError::Transport(format!("导出落盘 rename 失败: {e}")))?;
+    Ok(dshtui::api::export::ExportReceipt {
+        bytes,
+        final_path: path.to_path_buf(),
+    })
 }
 
 /// 从缓存/视图临时文件重解码 + kitty 编码（不重复远程拉取）。`zoom` =

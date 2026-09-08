@@ -69,6 +69,11 @@ pub enum ClientError {
     Auth(String),
     #[error("HTTP 请求失败: {0}")]
     Http(String),
+    /// 结构化 HTTP 状态（导出专用：404/5xx 与 401/403 可区分，D-46 兜底
+    /// 分类依据）。注意：普通 unary 走 Remote 信封错误，此变体仅用于
+    /// 非 Remote 的 HTTP 下载/探测路由。
+    #[error("HTTP {status}（{url}）")]
+    HttpStatus { status: u16, url: String },
     #[error("信封解析失败: {0}")]
     Envelope(String),
     #[error("rpcId 不匹配: 期望 {expected} 收到 {actual}")]
@@ -126,6 +131,7 @@ impl ClientError {
             ClientError::Transport(_) => "transport".into(),
             ClientError::Auth(_) => "auth".into(),
             ClientError::Http(_) => "http".into(),
+            ClientError::HttpStatus { status, .. } => format!("http-{status}"),
             ClientError::Envelope(_) => "envelope".into(),
             ClientError::RpcIdMismatch { .. } => "rpc-id-mismatch".into(),
             ClientError::Protocol(_) => "protocol".into(),
@@ -136,10 +142,27 @@ impl ClientError {
         match self {
             ClientError::Transport(_) => ErrorClass::Retryable,
             ClientError::Remote { class, .. } | ClientError::Stream { class, .. } => *class,
+            ClientError::HttpStatus { status, .. } => {
+                if *status == 401 || *status == 403 {
+                    ErrorClass::PermissionDenied
+                } else {
+                    ErrorClass::UserFacing
+                }
+            }
             ClientError::Auth(_) | ClientError::Http(_) | ClientError::Envelope(_) => {
                 ErrorClass::UserFacing
             }
             ClientError::RpcIdMismatch { .. } | ClientError::Protocol(_) => ErrorClass::UserFacing,
+        }
+    }
+
+    /// 结构化 HTTP 状态（若为 `HttpStatus` 变体）。供 export 兜底分类：
+    /// 404/5xx（官方路由不可用）→ 触发 page 重建；401/403（权限）→ 不降级
+    /// 不自动重试（D-46）。
+    pub fn http_status(&self) -> Option<u16> {
+        match self {
+            ClientError::HttpStatus { status, .. } => Some(*status),
+            _ => None,
         }
     }
 }

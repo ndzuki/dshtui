@@ -1139,6 +1139,17 @@ pub enum AppEvent {
         error: ClientError,
     },
     ExportCancelled,
+    // ---------- REQ-007 D-46 export page 重建兜底 ----------
+    /// Rebuild 进度（已收集 records 数）。
+    ExportRebuildProgress {
+        records: u64,
+    },
+    ExportRebuildDone {
+        path: std::path::PathBuf,
+    },
+    ExportRebuildFailed {
+        error: ClientError,
+    },
     // ---------- REQ-007 V0.4 消息动作回执 ----------
     MessageBranchDone {
         session_id: String,
@@ -1328,6 +1339,16 @@ pub enum Cmd {
     ExportSession {
         session_id: String,
         path: std::path::PathBuf,
+    },
+    /// REQ-007 D-46：官方导出路由不可用（404/5xx/transport）→ `session/page`
+    /// 全量 records 重建 JSONL 兜底。
+    ExportRebuild {
+        session_id: String,
+        path: std::path::PathBuf,
+        /// page 目标 address（session 或 subagent 形态，与打开会话一致）。
+        address: crate::api::types::SessionAddress,
+        /// 起始 through_seq（会话最新 seq；None = 空会话，只写 header 行）。
+        through_seq: Option<SessionSeq>,
     },
     // ---------- REQ-007 V0.4 消息动作（AC-007-27/28） ----------
     /// 分支：`session/fork atSeq`（静止轮次末条 user 消息）。
@@ -2568,9 +2589,11 @@ impl AppState {
                 }]
             }
             C::ClosePicker | C::Quit => {
-                if self.export.phase == crate::model::export::ExportPhase::Downloading {
-                    // 请求取消：置位令牌（background 任务每 chunk 检查并清理
-                    // 临时文件 → ExportCancelled 回执后才收面板，AC-007-17）。
+                if self.export.phase == crate::model::export::ExportPhase::Downloading
+                    || self.export.phase == crate::model::export::ExportPhase::Rebuilding
+                {
+                    // 请求取消：置位令牌（background 任务每 chunk/每页检查并
+                    // 清理临时文件 → ExportCancelled 回执后才收面板）。
                     self.export_cancel
                         .store(true, std::sync::atomic::Ordering::Relaxed);
                     self.export.cancelled = true;
@@ -2596,7 +2619,7 @@ impl AppState {
     }
 
     /// 用户取消导出：background 任务已清理临时文件 → 状态机安全回 Idle
-    /// （AC-007-17 取消不留半成品；幂等可重试）。
+    /// （AC-007-17 取消不留半成品；幂等可重试）。Rebuilding 阶段复用同回执。
     pub fn export_cancelled(&mut self) {
         self.export_cancel
             .store(false, std::sync::atomic::Ordering::Relaxed);
@@ -2605,13 +2628,99 @@ impl AppState {
         self.notice = Some("导出已取消（临时文件已清理）".into());
     }
 
-    pub fn export_failed(&mut self, error: &ClientError) {
+    /// D-46：导出失败分类分流（返回可执行 Cmd，如 page 重建兜底）。
+    ///
+    /// - 401/403（HttpStatus）或权限类 Remote → Failed 展示 error.code、
+    ///   不降级不自动重试；
+    /// - 404/5xx/transport（官方路由不可用）→ 自动转 Rebuilding 并 emit
+    ///   `Cmd::ExportRebuild`（仅当状态机在 Downloading/Failed 可进入时）；
+    /// - 其它 → Failed。
+    pub fn export_failed(&mut self, error: &ClientError) -> Vec<Cmd> {
         self.export_cancel
             .store(false, std::sync::atomic::Ordering::Relaxed);
-        self.export.fail(error.code());
-        self.notice = Some(format!("导出失败: {error}"));
+        let code = error.code();
+        let class = error.class();
+        let is_permission = class == crate::api::envelope::ErrorClass::PermissionDenied
+            || error.http_status().is_some_and(|s| s == 401 || s == 403);
+        // 官方路由不可用（404/5xx/transport 而非权限）→ 可走 page 重建兜底。
+        let route_unavailable = error.http_status().is_some_and(|s| s == 404 || s >= 500)
+            || class == crate::api::envelope::ErrorClass::Retryable;
+        if is_permission || !route_unavailable {
+            self.export.fail(code.clone());
+            self.notice = Some(format!("导出失败: {error}"));
+            if is_permission {
+                tracing::error!(error = %error, "导出权限不足");
+            }
+            return vec![];
+        }
+        // 404/5xx/transport：自动转 Rebuilding（D-46 硬性契约；页面只读提示）。
+        if self.export.begin_rebuild() {
+            let Some(sid) = self.export.session_id.clone() else {
+                self.export.fail(code.clone());
+                return vec![];
+            };
+            let path = std::path::PathBuf::from(self.export.path.clone());
+            let address = self.export_address(&sid);
+            let through_seq = self.session_latest_seq(&sid);
+            self.notice = Some("官方导出路由不可用，改用本地重建（session/page）…".into());
+            vec![Cmd::ExportRebuild {
+                session_id: sid,
+                path,
+                address,
+                through_seq,
+            }]
+        } else {
+            self.export.fail(code.clone());
+            self.notice = Some(format!("导出失败: {error}"));
+            vec![]
+        }
+    }
+
+    /// D-46：export 目标会话的 page address（子代理 child 用 subagent
+    /// address——与打开会话一致）。
+    fn export_address(&self, session_id: &str) -> crate::api::types::SessionAddress {
+        match self.subagent_parents.get(session_id) {
+            Some(parent) => {
+                crate::api::types::SessionAddress::subagent(parent, session_id, "continuable")
+            }
+            None => crate::api::types::SessionAddress::session(session_id),
+        }
+    }
+
+    /// D-46：目标会话「最新 seq」（page through_seq 锚点）：优先 follow
+    /// 游标（SessionLogOffset），其次窗口尾 seq；都没有 = 空/未加载 → None
+    /// （重建只写 header，防通过 seq 误伤）。
+    fn session_latest_seq(&self, session_id: &str) -> Option<SessionSeq> {
+        let w = self.sessions.get(session_id)?;
+        w.cursor().map(|c| SessionSeq(c.0)).or_else(|| w.tail_seq())
+    }
+
+    /// D-46：重建进度（已收集 records 数）。
+    pub fn export_rebuild_progress(&mut self, records: u64) {
+        self.export.mark_rebuild_progress(records);
+    }
+
+    /// D-46：重建完成。
+    pub fn export_rebuild_done(&mut self, path: &std::path::Path) {
+        self.export_cancel
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        self.export.finish();
+        self.notice = Some(format!(
+            "导出完成（本地重建）: {}（{} 条 records）",
+            path.display(),
+            self.export.records_collected
+        ));
+    }
+
+    /// D-46：重建失败 → Failed（不再次触发兜底，防循环）；权限不自动重试。
+    pub fn export_rebuild_failed(&mut self, error: &ClientError) {
+        self.export_cancel
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        let code = error.code();
+        self.export.fail(code);
+        self.notice = Some(format!("导出重建失败: {error}"));
         if error.class() == crate::api::envelope::ErrorClass::PermissionDenied {
-            tracing::error!(error = %error, "导出权限不足");
+            tracing::error!(error = %error, "导出重建权限不足");
         }
     }
 
@@ -3914,12 +4023,22 @@ impl AppState {
                 self.export_progress(bytes);
                 vec![]
             }
-            AppEvent::ExportFailed { error } => {
-                self.export_failed(&error);
-                vec![]
-            }
+            AppEvent::ExportFailed { error } => self.export_failed(&error),
             AppEvent::ExportCancelled => {
                 self.export_cancelled();
+                vec![]
+            }
+            // REQ-007 D-46：export page 重建兜底回执。
+            AppEvent::ExportRebuildProgress { records } => {
+                self.export_rebuild_progress(records);
+                vec![]
+            }
+            AppEvent::ExportRebuildDone { path } => {
+                self.export_rebuild_done(&path);
+                vec![]
+            }
+            AppEvent::ExportRebuildFailed { error } => {
+                self.export_rebuild_failed(&error);
                 vec![]
             }
             // ---------- REQ-007 V0.4 消息动作回执 ----------
@@ -10828,6 +10947,141 @@ mod tests {
     }
 
     // ---------- REQ-007 V0.4 搜索历史（AC-007-31） ----------
+
+    #[test]
+    fn export_404_triggers_page_rebuild_fallback_ac007_17() {
+        // D-46：官方导出路由 404 → export_failed 自动转 Rebuilding 并 emit
+        // Cmd::ExportRebuild（with session latest seq）。
+        let mut s = AppState::default();
+        let sid = SessionId("sess-r".into());
+        s.active_session = Some(sid.clone());
+        // 会话窗口带 follow 游标（page through_seq 锚点）。
+        let w = s.sessions.touch(&sid.0, 50);
+        let _ = w.apply(crate::model::Incoming::Snapshot {
+            cursor: Some(crate::api::types::SessionLogOffset(12)),
+            records: vec![],
+            has_more: false,
+            projections: None,
+        });
+        s.export.open("sess-r", "out.zip");
+        s.mode = Mode::Export;
+        assert!(s.export.begin_download());
+        let cmds = s.handle(AppEvent::ExportFailed {
+            error: ClientError::HttpStatus {
+                status: 404,
+                url: "http://x/api/session.export".into(),
+            },
+        });
+        assert!(
+            s.export.phase == crate::model::export::ExportPhase::Rebuilding,
+            "404 → 转 Rebuilding"
+        );
+        assert!(
+            cmds.iter().any(|c| matches!(
+                c,
+                Cmd::ExportRebuild {
+                    session_id,
+                    through_seq: Some(seq),
+                    ..
+                } if session_id == "sess-r" && seq.0 == 12
+            )),
+            "emit ExportRebuild with through_seq=12, cmds={cmds:?}"
+        );
+    }
+
+    #[test]
+    fn export_403_and_remote_permission_never_fall_back_ac007_17() {
+        // D-46：401/403/权限 Remote → Failed 展示 code，不降级不自动重试。
+        let mut s = AppState {
+            active_session: Some(SessionId("sess-p".into())),
+            ..Default::default()
+        };
+        s.export.open("sess-p", "out.zip");
+        s.mode = Mode::Export;
+        assert!(s.export.begin_download());
+        let cmds = s.handle(AppEvent::ExportFailed {
+            error: ClientError::HttpStatus {
+                status: 403,
+                url: "http://x/api/session.export".into(),
+            },
+        });
+        assert!(cmds.is_empty(), "403 不降级, cmds={cmds:?}");
+        assert!(s.export.phase == crate::model::export::ExportPhase::Failed);
+        assert_eq!(s.export.last_error_code.as_deref(), Some("http-403"));
+        // 恢复路径：修正后重试可再下载。
+        assert!(s.export.begin_download());
+    }
+
+    #[test]
+    fn export_transport_error_triggers_rebuild_fallback_ac007_17() {
+        // D-46：transport（路由不可达）也走 page 重建兜底（可恢复路径）。
+        let mut s = AppState::default();
+        let sid = SessionId("sess-t".into());
+        s.active_session = Some(sid.clone());
+        let w = s.sessions.touch(&sid.0, 50);
+        let _ = w.apply(crate::model::Incoming::Snapshot {
+            cursor: Some(crate::api::types::SessionLogOffset(3)),
+            records: vec![],
+            has_more: false,
+            projections: None,
+        });
+        s.export.open("sess-t", "out.jsonl");
+        s.mode = Mode::Export;
+        assert!(s.export.begin_download());
+        let cmds = s.handle(AppEvent::ExportFailed {
+            error: ClientError::Transport("导出请求失败: 连接拒绝".into()),
+        });
+        assert!(s.export.phase == crate::model::export::ExportPhase::Rebuilding);
+        assert!(cmds.iter().any(|c| matches!(
+            c,
+            Cmd::ExportRebuild { session_id, .. } if session_id == "sess-t"
+        )));
+        // Rebuilding 中取消 → Esc 置取消令牌（后台清理 → ExportCancelled 收面板）。
+        let _ = s.handle_command(crate::input::Command::ClosePicker);
+        assert!(
+            s.export_cancel.load(std::sync::atomic::Ordering::Relaxed),
+            "Rebuilding 可取消"
+        );
+        let _ = s.handle(AppEvent::ExportCancelled);
+        assert_eq!(s.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn export_rebuild_progress_done_failed_round_trip_ac007_17() {
+        let mut s = AppState {
+            active_session: Some(SessionId("sess-d".into())),
+            ..Default::default()
+        };
+        s.export.open("sess-d", "out.jsonl");
+        assert!(s.export.begin_rebuild());
+        s.mode = Mode::Export;
+        let _ = s.handle(AppEvent::ExportRebuildProgress { records: 42 });
+        assert_eq!(s.export.records_collected, 42);
+        let _ = s.handle(AppEvent::ExportRebuildDone {
+            path: std::path::PathBuf::from("/tmp/out.jsonl"),
+        });
+        assert!(s.export.phase == crate::model::export::ExportPhase::Done);
+        assert!(
+            s.notice.as_deref().unwrap_or("").contains("本地重建"),
+            "完成提示含本地重建, notice={:?}",
+            s.notice
+        );
+        // 失败：不再触发二次兜底（防循环），Failed 可重试。
+        let mut s2 = AppState::default();
+        s2.export.open("sess-d", "out.jsonl");
+        s2.mode = Mode::Export;
+        assert!(s2.export.begin_rebuild());
+        let cmds2 = s2.handle(AppEvent::ExportRebuildFailed {
+            error: ClientError::Remote {
+                code: "PERMISSION_DENIED".into(),
+                message: "no".into(),
+                class: ErrorClass::PermissionDenied,
+            },
+        });
+        assert!(cmds2.is_empty());
+        assert!(s2.export.phase == crate::model::export::ExportPhase::Failed);
+        assert!(s2.export.begin_rebuild(), "重建失败后修正可重跑");
+    }
 
     #[test]
     fn search_history_records_on_close_and_recalls_ac007_31() {
