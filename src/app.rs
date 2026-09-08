@@ -3423,6 +3423,7 @@ impl AppState {
                 // 把发送前登记全文回填注册表供手动重试（含图片路径行完整还原）；
                 // 成功路径（PromptAccepted）已清空。仅 composer 发送登记
                 // pending；retry 动作等非草稿发送无登记 → 不恢复。
+                let mut restored_full_draft = false;
                 if let Some(text) = self.pending_prompt_texts.remove(&session_id.0) {
                     if !text.trim().is_empty() {
                         self.drafts.set(DraftState {
@@ -3431,24 +3432,28 @@ impl AppState {
                             bound_session: session_id.clone(),
                         });
                         self.mark_drafts_dirty();
+                        restored_full_draft = true;
                         tracing::debug!(%session_id, "发送失败，草稿已保留（D-49）");
                     }
                 }
                 // AC-003-16: steer 不被接受（轮次已结束/agent 非运行）→ 状态条
-                // 提示 + 草稿保留（回显文本放回注册表），应用不崩溃。
+                // 提示 + 草稿保留（回显文本放回注册表），应用不崩溃。D-49 已
+                // 完整还原（含图片路径行）时不再用回显摘要覆盖（防丢图路径）。
                 if code == "session/steer-unavailable" {
-                    let echo_text = self
-                        .sessions
-                        .get(&session_id.0)
-                        .and_then(|w| w.echo_text(&request_id))
-                        .map(str::to_string);
-                    if let Some(text) = echo_text {
-                        self.drafts.set(DraftState {
-                            text,
-                            cursor: 0,
-                            bound_session: session_id.clone(),
-                        });
-                        self.mark_drafts_dirty();
+                    if !restored_full_draft {
+                        let echo_text = self
+                            .sessions
+                            .get(&session_id.0)
+                            .and_then(|w| w.echo_text(&request_id))
+                            .map(str::to_string);
+                        if let Some(text) = echo_text {
+                            self.drafts.set(DraftState {
+                                text,
+                                cursor: 0,
+                                bound_session: session_id.clone(),
+                            });
+                            self.mark_drafts_dirty();
+                        }
                     }
                     self.last_error = Some(
                         "steer 不可用（轮次已结束或 agent 未运行），草稿已保留，可改为排队发送"
@@ -8323,6 +8328,42 @@ mod tests {
         );
         s.handle_command(C::InsertMode);
         assert_eq!(s.draft.as_ref().map(|d| d.text.as_str()), Some("steer-me"));
+    }
+
+    #[test]
+    fn steer_unavailable_keeps_full_draft_with_image_paths_d49() {
+        // D-49：composer 发送含图片路径行 → steer-unavailable 失败时恢复
+        // **完整原稿**（含图片路径），不被回显摘要（[N 张图片]）覆盖。
+        let (_dir, file) = temp_img("steer", b"abc");
+        let mut s = AppState::default();
+        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle(snapshot("s1", true));
+        s.handle_command(C::InsertMode);
+        let full = format!("{}\n看图", file.to_string_lossy());
+        s.handle_command(C::PickerInput(full.clone()));
+        let cmds = s.handle_command(C::SubmitInput);
+        let (sid, rid) = match &cmds[0] {
+            Cmd::SendPrompt {
+                session_id,
+                request,
+            } => (session_id.clone(), request.request_id.clone()),
+            _ => panic!(),
+        };
+        s.handle(AppEvent::PromptFailed {
+            session_id: sid.clone(),
+            request_id: rid,
+            error: ClientError::Remote {
+                code: "session/steer-unavailable".into(),
+                message: "轮次已结束".into(),
+                class: ErrorClass::UserFacing,
+            },
+        });
+        assert_eq!(
+            s.drafts.get(&sid).map(|d| d.text.as_str()),
+            Some(full.as_str()),
+            "完整原稿（含图片路径行）保留，不被回显摘要覆盖"
+        );
+        let _ = std::fs::remove_dir_all(&_dir);
     }
 
     #[test]
