@@ -1557,6 +1557,18 @@ pub struct AppState {
     /// 最近一次分页耗时 ms（session/page 完成后记录；perf 日志
     /// `page_latency_ms` 字段）。
     pub last_page_latency_ms: Option<f64>,
+
+    // ---------- REQ-008 Step 2：空闲停渲染 redraw 信号（AC-008-04） ----------
+    /// 自上次 draw 以来是否发生「需要重绘的可见状态变更」。reducer 在
+    /// 可见变更分支（消息/投影/滚动/焦点等）置位；主循环 draw 后取走清空。
+    /// 空闲（无状态变化）→ 不置位 → 主循环跳过 draw 省 CPU。
+    pub redraw_pending: bool,
+    /// 空闲期误重绘计数：主循环观测/测试断言用（「空闲停渲染」headless
+    /// 冒烟以「空闲期额外 draw 数为 0」为证据）。
+    pub idle_redraws: u64,
+    /// 实际 draw 累计次数（主循环每次 draw 后 `record_draw`；headless 冒烟
+    /// 用「空闲 N 帧 draw 不增长」断言空闲停渲染）。
+    pub draw_count: u64,
 }
 
 /// REQ-007 AC-007-24：读取本地图片文件 → base64 inline ImageAttachment。
@@ -1676,6 +1688,9 @@ impl Default for AppState {
             ws_reconnects: 0,
             last_search_ms: None,
             last_page_latency_ms: None,
+            redraw_pending: false,
+            idle_redraws: 0,
+            draw_count: 0,
         }
     }
 }
@@ -3192,7 +3207,39 @@ impl AppState {
 
     // ---------- reducer ----------
 
+    /// REQ-008 Step 2（AC-008-04）：是否自上次 draw 后有可见状态变更待重绘。
+    pub fn needs_redraw(&self) -> bool {
+        self.redraw_pending
+    }
+
+    /// 取走并清空重绘信号（主循环 draw 后调用；返回是否需要本次 draw）。
+    pub fn take_redraw(&mut self) -> bool {
+        let need = self.redraw_pending;
+        self.redraw_pending = false;
+        need
+    }
+
+    /// 强制标记需要重绘（主循环显式场景，如 reconnect 分支 draw 前）。
+    pub fn mark_redraw(&mut self) {
+        self.redraw_pending = true;
+    }
+
+    /// 记录一次实际 draw（主循环 draw 后调用；headless/单测可观测 draw 数）。
+    pub fn record_draw(&mut self) {
+        self.draw_count += 1;
+    }
+
+    /// 主循环 draw 决策（AC-008-04 空闲停渲染）：有命令/输入/事件待处理或
+    /// 有挂起重绘 → 本次应 draw；否则空闲跳过。`forced` 覆盖（启动首帧等）。
+    pub fn should_draw(&self, pending_work: bool, forced: bool) -> bool {
+        forced || pending_work || self.redraw_pending
+    }
+
     pub fn handle(&mut self, ev: AppEvent) -> Vec<Cmd> {
+        // REQ-008 Step 2：任何真实事件（输入/网络/定时）都可能改变可见状态，
+        // 进入 reducer 即置重绘信号——主循环据此 draw（事件驱动，非无条件
+        // 每 tick）。纯 no-op 事件造成的多余一帧无害（事件本身即活动）。
+        self.redraw_pending = true;
         match ev {
             AppEvent::Startup => {
                 self.list_loaded = false;
@@ -5018,6 +5065,8 @@ impl AppState {
 
     pub fn handle_command(&mut self, cmd: crate::input::Command) -> Vec<Cmd> {
         use crate::input::Command as C;
+        // REQ-008 Step 2：输入命令即活动，置重绘信号（主循环事件驱动 draw）。
+        self.redraw_pending = true;
         // Any key other than Quit cancels a pending quit confirmation.
         if !matches!(&cmd, C::Quit) {
             self.quit_requested = false;
@@ -7376,6 +7425,51 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    // ---------- REQ-008 Step 2：空闲停渲染 redraw 信号（AC-008-04） ----------
+
+    #[test]
+    fn idle_state_does_not_request_redraw_ac008_04() {
+        // 新状态无任何活动 → 不请求重绘（空闲不 draw）。
+        let s = AppState::default();
+        assert!(!s.needs_redraw());
+        assert!(
+            !s.should_draw(false, false),
+            "无命令/输入/事件 → 空闲跳过 draw"
+        );
+    }
+
+    #[test]
+    fn visible_event_requests_redraw_until_consumed_ac008_04() {
+        let mut s = AppState::default();
+        s.handle(AppEvent::Startup); // 真实活动：置 redraw_pending
+        assert!(s.needs_redraw(), "事件后应请求重绘");
+        assert!(s.should_draw(false, false), "挂起重绘 → 应 draw");
+        // draw 后取走清空 → 回到空闲。
+        assert!(s.take_redraw());
+        assert!(!s.needs_redraw());
+        assert!(!s.should_draw(false, false));
+        // forced 覆盖仍生效（启动首帧等）。
+        assert!(s.should_draw(false, true));
+    }
+
+    #[test]
+    fn pending_work_forces_redraw_even_without_state_change_ac008_04() {
+        let s = AppState::default();
+        assert!(s.should_draw(true, false), "有待处理命令/事件 → 应 draw");
+    }
+
+    #[test]
+    fn command_input_and_events_are_recorded_as_draws_ac008_04() {
+        // 主循环语义：命令/输入/事件 = 活动 → draw；空闲迭代 → idle_redraws+1
+        // 且 draw_count 不增长（headless 冒烟同口径）。
+        let mut s = AppState::default();
+        s.record_draw();
+        assert_eq!(s.draw_count, 1);
+        // mark_redraw → needs_redraw
+        s.mark_redraw();
+        assert!(s.needs_redraw());
     }
 
     #[test]

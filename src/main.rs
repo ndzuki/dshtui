@@ -507,7 +507,9 @@ async fn run_connected(eff: Effective, token: String, client: DshClient) -> Resu
         }
 
         // One command per iteration: list pagination renders between pages.
+        let mut cmd_had = false;
         if let Some(command) = commands.pop_front() {
+            cmd_had = true;
             // REQ-007 `:edit`（AC-007-25）：需要 TerminalSession 释放/恢复
             // raw mode，主循环内联处理（execute_one 无 terminal 访问）。
             if let Cmd::ExternalEdit { tmp_path, editor } = &command {
@@ -555,12 +557,11 @@ async fn run_connected(eff: Effective, token: String, client: DshClient) -> Resu
             break;
         }
 
-        terminal
-            .terminal
-            .draw(|frame| dshtui::ui::render(frame, &app))
-            .map_err(|e| e.to_string())?;
-        perf.tick(&app);
-
+        // REQ-008 Step 2（AC-008-04）：事件驱动 draw——先收集输入/后台事件
+        // （reducer 置 redraw_pending），再按需重绘；空闲（无输入、无事件、
+        // 无挂起重绘）跳过 draw 省 CPU（Notes/06 §5）。33ms tick 上限保留：
+        // event::poll 超时即回到循环顶部，输入延迟仍 ≤ tick。
+        let mut input_had = false;
         if event::poll(Duration::from_millis(eff.ui.tick_ms)).map_err(|e| e.to_string())? {
             let input = event::read().map_err(|e| e.to_string())?;
             let mode = match app.mode {
@@ -599,14 +600,31 @@ async fn run_connected(eff: Effective, token: String, client: DshClient) -> Resu
             };
             if let Some(command) = decoder.decode(mode, input) {
                 commands.extend(app.handle_command(command));
+                input_had = true;
             }
         }
+        let mut events_had = false;
         while let Ok(event) = event_rx.try_recv() {
             commands.extend(app.handle(event));
+            events_had = true;
         }
         // REQ-007：草稿变更后主循环串行 flush（AC-007-22/ADR-010）。
         if app.take_draft_dirty() {
             flush_drafts(&mut app);
+        }
+        // 空闲停渲染：仅当本 tick 有命令执行/输入/事件/挂起重绘才 draw。
+        if cmd_had || input_had || events_had || app.needs_redraw() {
+            terminal
+                .terminal
+                .draw(|frame| dshtui::ui::render(frame, &app))
+                .map_err(|e| e.to_string())?;
+            app.record_draw();
+            app.take_redraw();
+            // 帧采样只在真实 draw 后 tick（空闲跳过 draw → 不产生帧样本，
+            // frame_ms p50/p99 反映真实渲染帧率，Notes/06 §8）。
+            perf.tick(&app);
+        } else {
+            app.idle_redraws += 1;
         }
     }
     // REQ-004 退出清理：未入缓存的临时文件（缓存目录由 ImageCache Drop 清理）。
