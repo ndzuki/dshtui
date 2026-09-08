@@ -33,6 +33,13 @@ pub enum CliAction {
     Monitor {
         addr: Option<String>,
     },
+    /// `dshtui bench [--report …] [--fixture …] [--scenario …]`（REQ-008
+    /// FR-008-01 性能基准；V1）。
+    Bench {
+        report: Option<String>,
+        fixture: Option<String>,
+        scenario: Option<String>,
+    },
 }
 
 /// Full structure of `~/.config/dshtui/config.toml` (Notes/02 §7 draft).
@@ -639,6 +646,53 @@ pub fn parse_cli<I: IntoIterator<Item = String>>(args: I) -> Result<Cli, String>
         cli.action = CliAction::Monitor { addr };
         return Ok(cli);
     }
+    // `bench` 位置参数（REQ-008 FR-008-01 性能基准）。
+    if it.peek().is_some_and(|a| a == "bench") {
+        it.next();
+        let mut report: Option<String> = None;
+        let mut fixture: Option<String> = None;
+        let mut scenario: Option<String> = None;
+        while let Some(arg) = it.next() {
+            match arg.as_str() {
+                "--help" | "-h" => cli.action = CliAction::Help,
+                "--version" | "-V" => cli.action = CliAction::Version,
+                "--report" => {
+                    let v = it
+                        .next()
+                        .ok_or_else(|| "--report 需要一个路径参数".to_string())?;
+                    report = Some(v);
+                }
+                "--fixture" => {
+                    let v = it
+                        .next()
+                        .ok_or_else(|| "--fixture 需要一个参数（auto|live|seed）".to_string())?;
+                    fixture = Some(v);
+                }
+                "--scenario" => {
+                    let v = it
+                        .next()
+                        .ok_or_else(|| "--scenario 需要一个场景名".to_string())?;
+                    scenario = Some(v);
+                }
+                "--log" => {
+                    let v = it
+                        .next()
+                        .ok_or_else(|| "--log 需要一个文件路径参数".to_string())?;
+                    cli.log_file = Some(v);
+                }
+                other => return Err(format!("未知参数: {other}（--help 查看用法）")),
+            }
+        }
+        if matches!(cli.action, CliAction::Help | CliAction::Version) {
+            return Ok(cli);
+        }
+        cli.action = CliAction::Bench {
+            report,
+            fixture,
+            scenario,
+        };
+        return Ok(cli);
+    }
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--help" | "-h" => cli.action = CliAction::Help,
@@ -724,6 +778,7 @@ dshtui {version} — 官方 dsh web Remote API 的 Rust TUI 客户端
 
 用法: dshtui [--url <url>] [--token <env-name>] [--log <file>] [--help] [--version]
       dshtui monitor [--addr <agent-server>] [--log <file>]
+      dshtui bench [--report <path>] [--fixture auto|live|seed] [--scenario <name>]
 
 选项:
   --url <url>       dsh web 地址（默认 http://127.0.0.1:3080）
@@ -736,6 +791,14 @@ dshtui {version} — 官方 dsh web Remote API 的 Rust TUI 客户端
   monitor           Agent Town 监控面板（REQ-009 V0.3）：直连本机 OTR agent-server，
                     2s 轮询 /agents、30s 轮询 /kb-stats，kitty 终端渲染像素小镇。
     --addr <url>    agent-server 地址（默认 {monitor_addr}）
+  bench             性能基准（REQ-008 FR-008-01）：进程内 headless 测量 7 项
+                    AC-008 指标（startup/first_screen/search/scroll p99 + RSS
+                    三档），报告 JSON 原子写；退出码 0=全 PASS / 1=有 FAIL /
+                    2=全 skip（under-scale）。
+    --report <path> 报告路径（默认 {bench_report}；空 = 只打印摘要）
+    --fixture <m>   auto|live|seed（默认 seed：确定性、无网络；live/auto 需
+                    本机 3080 只读可达，不可达标 skip 退出 2）
+    --scenario <n>  只跑单个场景（默认全量；如 --scenario scroll_frame_p99_ms）
 
 kitty 快捷键（可选，写入 ~/.config/kitty/kitty.conf）:
   map ctrl+shift+a new_tab_with_cwd
@@ -745,7 +808,8 @@ token 来源优先级: --token <env> > 环境变量 {token_env} > 配置文件 >
 ",
         version = env!("CARGO_PKG_VERSION"),
         token_env = DEFAULT_TOKEN_ENV,
-        monitor_addr = DEFAULT_MONITOR_ADDR
+        monitor_addr = DEFAULT_MONITOR_ADDR,
+        bench_report = crate::bench::DEFAULT_REPORT_PATH
     )
 }
 

@@ -21,6 +21,7 @@ use dshtui::api::types::{SessionAddress, SessionId, SessionRequestId, SessionSeq
 use dshtui::api::workspace;
 use dshtui::api::{Backoff, ClientError, DshClient, Mux};
 use dshtui::app::{AppEvent, AppState, Cmd, Mode};
+use dshtui::bench::{BenchConfig, FixtureMode};
 use dshtui::config::{self, Cli, CliAction, Effective};
 use dshtui::input::{Command, InputMode, KeyDecoder};
 use ratatui::backend::CrosstermBackend;
@@ -59,6 +60,37 @@ async fn main() -> ExitCode {
         CliAction::Version => {
             println!("dshtui {}", env!("CARGO_PKG_VERSION"));
             return ExitCode::SUCCESS;
+        }
+        // REQ-008 FR-008-01：`dshtui bench` 性能基准独立分发——不加载
+        // config/token/日志（seed 默认无网络依赖），exit 码 0/1/2 直映射。
+        CliAction::Bench {
+            report,
+            fixture,
+            scenario,
+        } => {
+            let fixture_mode = match fixture.as_deref() {
+                None => FixtureMode::Seed,
+                Some(s) => match FixtureMode::parse(s) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        eprintln!("错误: {e}");
+                        return ExitCode::from(2);
+                    }
+                },
+            };
+            let cfg = BenchConfig {
+                report_path: report
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from(dshtui::bench::DEFAULT_REPORT_PATH)),
+                fixture: fixture_mode,
+                scenario,
+            };
+            let (report, code) = dshtui::bench::run(&cfg);
+            print!("{}", dshtui::bench::format_summary(&report));
+            if !cfg.report_path.as_os_str().is_empty() {
+                println!("报告: {}", cfg.report_path.display());
+            }
+            return ExitCode::from(code.clamp(0, 2) as u8);
         }
         CliAction::Run => {}
         CliAction::Monitor { .. } => {}
