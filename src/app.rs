@@ -1485,6 +1485,11 @@ pub struct AppState {
     /// REQ-007 AC-007-01/10：child session → parent session 映射（child
     /// 打开时记录；composer 发送经 subagents/prompt 路由，父→子消息块可见）。
     pub subagent_parents: std::collections::HashMap<String, String>,
+    /// REQ-007 AC-007-22 / D-49：在途发送的原始草稿全文（session → 发送前
+    /// composer 全文，含图片路径行）。成功（PromptAccepted）即弃；失败
+    /// （PromptFailed，任意类）回填注册表供手动重试——draft 仅存未发送内容、
+    /// 成功才清空。仅内存，随回执生命周期（模式 15 单飞）。
+    pub pending_prompt_texts: std::collections::HashMap<String, String>,
     /// REQ-007 AC-007-15/16：settings 面板。
     pub settings: crate::model::SettingsPanelState,
     /// REQ-007 AC-007-18：skills 目录。
@@ -1619,6 +1624,7 @@ impl Default for AppState {
             msg_action_target: None,
             pending_subagent_open: None,
             subagent_parents: std::collections::HashMap::new(),
+            pending_prompt_texts: std::collections::HashMap::new(),
             settings: crate::model::SettingsPanelState::default(),
             skills: crate::model::SkillsCatalogState::default(),
             export: crate::model::ExportState::default(),
@@ -3347,6 +3353,9 @@ impl AppState {
                 // The success receipt only ends this command's state; the
                 // pending echo is retired solely by durable follow events
                 // (official source of truth, AC-002-06).
+                // D-49：发送成功 → 弃在途草稿登记（注册表已在 submit 清空，
+                // 无需再清；失败才恢复）。
+                self.pending_prompt_texts.remove(&session_id.0);
                 tracing::debug!(%session_id, %request_id, "session/prompt accepted");
                 vec![]
             }
@@ -3359,6 +3368,21 @@ impl AppState {
                 let message = error.to_string();
                 if let Some(w) = self.sessions.get_mut(&session_id.0) {
                     w.fail_echo(&request_id, &code, &message);
+                }
+                // D-49：任意失败都保留未发送草稿（draft 仅存未发送内容）——
+                // 把发送前登记全文回填注册表供手动重试（含图片路径行完整还原）；
+                // 成功路径（PromptAccepted）已清空。仅 composer 发送登记
+                // pending；retry 动作等非草稿发送无登记 → 不恢复。
+                if let Some(text) = self.pending_prompt_texts.remove(&session_id.0) {
+                    if !text.trim().is_empty() {
+                        self.drafts.set(DraftState {
+                            text,
+                            cursor: 0,
+                            bound_session: session_id.clone(),
+                        });
+                        self.mark_drafts_dirty();
+                        tracing::debug!(%session_id, "发送失败，草稿已保留（D-49）");
+                    }
                 }
                 // AC-003-16: steer 不被接受（轮次已结束/agent 非运行）→ 状态条
                 // 提示 + 草稿保留（回显文本放回注册表），应用不崩溃。
@@ -4363,7 +4387,10 @@ impl AppState {
         self.composer.visible = false;
         self.composer.steer = false;
         self.composer.active_session = None;
-        // 发送后清空该会话草稿（AC-003-11）+ 记入输入历史（AC-003-10）。
+        // D-49：发送在途前先登记原始草稿全文（供失败回填；成功即弃）。
+        self.pending_prompt_texts.insert(sid.0.clone(), text.clone());
+        // 发送后清空该会话草稿（AC-003-11）+ 记入输入历史（AC-003-10）；
+        // 失败时由 PromptFailed 回填（D-49：成功才清、失败可重发不丢）。
         self.drafts.clear(&sid);
         self.mark_drafts_dirty();
         self.history.push(&text);
@@ -7569,14 +7596,35 @@ mod tests {
             s.last_error.as_deref().unwrap_or("").contains("发送失败"),
             "状态条错误提示"
         );
-        // 恢复路径：失败后重新输入可再次手动发送（新 requestId、新回显）。
-        let cmds2 = submit_flow(&mut s, "s1", "retry");
+        // D-49 恢复路径：失败后草稿回填注册表 → 再开 composer 看到原稿；
+        // 改输入重发 = 新 requestId、新回显，且不重复旧内容。
+        s.handle_command(C::InsertMode);
+        assert_eq!(
+            s.drafts.get(&session_id).map(|d| d.text.as_str()),
+            Some("bad"),
+            "D-49：失败草稿保留可重发"
+        );
+        s.draft.as_mut().unwrap().text = "retry".into();
+        s.draft.as_mut().unwrap().cursor = "retry".chars().count();
+        let cmds2 = s.handle_command(C::SubmitInput);
         assert_eq!(cmds2.len(), 1, "恢复后可再次手动发送");
-        let request_id2 = match &cmds2[0] {
-            Cmd::SendPrompt { request, .. } => request.request_id.clone(),
-            _ => panic!(),
+        let Cmd::SendPrompt { request, .. } = &cmds2[0] else {
+            panic!()
         };
+        let request_id2 = request.request_id.clone();
         assert_ne!(request_id2, request_id, "新请求使用新 requestId");
+        let crate::api::types::PromptContentPart::Text { text } = &request.content[0] else {
+            panic!("重发为纯文本")
+        };
+        assert_eq!(text, "retry", "重发内容为用户改写后的新文本，无旧稿拼接");
+        s.handle(AppEvent::PromptAccepted {
+            session_id: session_id.clone(),
+            request_id: request_id2,
+        });
+        assert!(
+            s.drafts.get(&session_id).is_none(),
+            "重发成功后草稿清空（draft 仅存未发送内容）"
+        );
     }
 
     #[test]
@@ -7610,6 +7658,71 @@ mod tests {
         let msg = s.last_error.as_deref().unwrap_or("");
         assert!(msg.contains("发送失败"), "状态条错误提示, msg={msg}");
         assert!(msg.contains("PERMISSION_DENIED"), "错误码可见, msg={msg}");
+    }
+
+    #[test]
+    fn draft_restored_on_failure_cleared_on_success_d049() {
+        // 网络类失败 → 原始草稿全文回填注册表，可重发不丢；成功
+        // （PromptAccepted）→ 清空。恢复路径不被旧失败状态污染。
+        let mut s = AppState::default();
+        let cmds = submit_flow(&mut s, "s1", "看图说话");
+        assert_eq!(cmds.len(), 1);
+        let (session_id, request_id) = match &cmds[0] {
+            Cmd::SendPrompt {
+                session_id,
+                request,
+            } => (session_id.clone(), request.request_id.clone()),
+            _ => panic!(),
+        };
+        // 发送瞬间注册表清空（回执前不留旧稿），但全文登记在途。
+        assert!(s.drafts.get(&session_id).is_none());
+        assert_eq!(
+            s.pending_prompt_texts.get(&session_id.0).map(String::as_str),
+            Some("看图说话"),
+            "在途全文已登记（D-49）"
+        );
+        s.handle(AppEvent::PromptFailed {
+            session_id: session_id.clone(),
+            request_id: request_id.clone(),
+            error: ClientError::Transport("网络断开".into()),
+        });
+        // D-49：任意失败恢复草稿（可手动重发不丢）。
+        assert_eq!(
+            s.drafts.get(&session_id).map(|d| d.text.as_str()),
+            Some("看图说话"),
+            "失败后全文恢复"
+        );
+        assert!(s.pending_prompt_texts.is_empty(), "回执后清在途登记");
+        assert!(
+            s.last_error.as_deref().unwrap_or("").contains("网络"),
+            "网络类错误可读提示"
+        );
+        // 恢复路径：再开 composer 直接看到原稿；改写重发 → 成功清空。
+        s.handle_command(C::InsertMode);
+        assert_eq!(
+            s.draft.as_ref().map(|d| d.text.as_str()),
+            Some("看图说话")
+        );
+        s.draft.as_mut().unwrap().text = "重说一遍".into();
+        let cmds2 = s.handle_command(C::SubmitInput);
+        let (_, rid2) = match &cmds2[0] {
+            Cmd::SendPrompt {
+                session_id,
+                request,
+            } => (session_id.clone(), request.request_id.clone()),
+            _ => panic!(),
+        };
+        assert_ne!(rid2, request_id, "重发使用新 requestId");
+        assert!(s.drafts.get(&session_id).is_none(), "重发提交清空注册表");
+        s.handle(AppEvent::PromptAccepted {
+            session_id: session_id.clone(),
+            request_id: rid2,
+        });
+        assert!(s.pending_prompt_texts.is_empty(), "成功即弃在途登记");
+        assert!(
+            s.drafts.get(&session_id).is_none(),
+            "成功清空：draft 仅存未发送内容（D-49）"
+        );
     }
 
     #[test]
