@@ -58,7 +58,9 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
 
     let width = area.width.min(52);
     let x = area.x + area.width.saturating_sub(width) / 2;
-    let height = (actions.len() as u16 + 4).min(area.height);
+    // D-50：本地降级标记提示额外一行（「已本地记录未提交」）。
+    let marker = app.message_action.feedback_marked.as_ref();
+    let height = (actions.len() as u16 + 4 + marker.is_some() as u16).min(area.height);
     let y = area.y + area.height.saturating_sub(height) / 2;
     let overlay = Rect::new(x, y, width, height);
     frame.render_widget(Clear, overlay);
@@ -115,6 +117,16 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
     )));
     let hint_area = Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1);
     frame.render_widget(hint, hint_area);
+
+    // D-50：本地降级标记提示（feedback 端点不可用 → 已本地记录未提交）。
+    if let Some(rating) = marker {
+        let mark_line = Paragraph::new(Line::from(Span::styled(
+            format!(" ⚠ feedback 已本地记录（{rating}，未提交）——端点恢复后可经官方 web 补交"),
+            Style::default().fg(warn),
+        )));
+        let mark_area = Rect::new(inner.x, inner.y + inner.height - 2, inner.width, 1);
+        frame.render_widget(mark_line, mark_area);
+    }
 }
 
 #[cfg(test)]

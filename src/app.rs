@@ -2874,6 +2874,7 @@ impl AppState {
     ) -> Vec<Cmd> {
         match action {
             crate::model::MessageActionKind::Branch => {
+                self.message_action.clear_pending_rating();
                 self.message_action.settle();
                 self.msg_action_target = None;
                 self.mode = Mode::Normal;
@@ -2883,6 +2884,7 @@ impl AppState {
                 }]
             }
             crate::model::MessageActionKind::Retry => {
+                self.message_action.clear_pending_rating();
                 let Some(text) = target.user_text.clone() else {
                     self.message_action.fail("no-user-text".into());
                     return vec![];
@@ -2927,6 +2929,8 @@ impl AppState {
                 } else {
                     "negative"
                 };
+                // D-50：提交前登记在途 rating（回执分类用；菜单已 settle）。
+                self.message_action.set_pending_rating(rating.to_string());
                 vec![Cmd::FeedbackPut {
                     session_id: target.session_id.0.clone(),
                     message_id: mid,
@@ -2956,10 +2960,40 @@ impl AppState {
     }
 
     pub fn feedback_put_done(&mut self) {
-        self.notice = Some("feedback 已提交".into());
+        self.message_action.clear_pending_rating();
+        if self.message_action.feedback_marked.is_some() {
+            // D-50：本地标记的补交成功 → 清除标记（端点恢复）。
+            self.message_action.clear_feedback_local();
+            self.notice = Some("feedback 已提交（补交成功，本地标记清除）".into());
+        } else {
+            self.notice = Some("feedback 已提交".into());
+        }
     }
 
+    /// D-50：feedback 提交失败分类——权限（401/403）→ 展示 error.code 不自动
+    /// 重试；端点不可用（transport/5xx/404）→ 本地降级标记（仅内存、不提交、
+    /// 不崩不重试）；其它业务错误 → 展示。
     pub fn feedback_put_failed(&mut self, error: &ClientError) {
+        use crate::api::envelope::ErrorClass as EC;
+        let rating = self.message_action.pending_rating.take();
+        let class = error.class();
+        let endpoint_unavailable = class == EC::Retryable
+            || error.http_status().is_some_and(|s| s == 404 || s >= 500);
+        if class == EC::PermissionDenied {
+            self.message_action.fail(error.code());
+            self.notice = Some(format!("feedback 提交失败（无权限，不自动重试）: {error}"));
+            tracing::error!(error = %error, "feedback 权限不足");
+            return;
+        }
+        if endpoint_unavailable {
+            if let Some(rating) = rating {
+                self.message_action.mark_feedback_local(rating);
+            }
+            self.notice =
+                Some("feedback 端点不可用——已本地记录（未提交），恢复后可经官方 web 补交".into());
+            tracing::warn!(error = %error, "feedback 端点不可用，本地降级标记");
+            return;
+        }
         self.message_action.fail(error.code());
         self.notice = Some(format!("feedback 提交失败: {error}"));
     }
@@ -11338,6 +11372,111 @@ mod tests {
                 .any(|c| matches!(c, Cmd::FeedbackPut { message_id, rating, .. }
                 if message_id == "m5" && rating == "positive")),
             "feedback+ put m5"
+        );
+    }
+
+    // ---------- REQ-007 D-50：feedback 端点不可用本地降级 ----------
+
+    #[test]
+    fn feedback_endpoint_unavailable_marks_local_d50() {
+        let (mut s, _sid) = msg_app_with_blocks(vec![
+            (1, "user/message", Some("你好")),
+            (5, "assistant/message", Some("m5")),
+        ]);
+        s.cursor_block = 1; // assistant
+        let _ = s.handle_command(crate::input::Command::OpenMessageActions);
+        let cmds = s.handle_command(crate::input::Command::PickerConfirm);
+        assert!(cmds.iter().any(|c| matches!(c, Cmd::FeedbackPut { rating, .. }
+            if rating == "positive")));
+        assert_eq!(
+            s.message_action.pending_rating.as_deref(),
+            Some("positive"),
+            "提交前登记在途 rating（D-50）"
+        );
+        // 端点不可用（网络类）→ 本地降级标记，不崩不重试。
+        s.handle(AppEvent::FeedbackPutFailed {
+            error: ClientError::Transport("连接失败".into()),
+        });
+        assert_eq!(
+            s.message_action.feedback_marked.as_deref(),
+            Some("positive"),
+            "本地标记 rating"
+        );
+        assert!(s.message_action.pending_rating.is_none(), "回执消费在途登记");
+        let notice = s.notice.as_deref().unwrap_or("");
+        assert!(notice.contains("本地记录"), "notice 提示本地记录, {notice}");
+        assert!(notice.contains("未提交"), "notice 提示未提交, {notice}");
+        // 标记不因重开菜单而丢失（持久到端点恢复/补交成功）。
+        s.cursor_block = 1;
+        let _ = s.handle_command(crate::input::Command::OpenMessageActions);
+        assert_eq!(
+            s.message_action.feedback_marked.as_deref(),
+            Some("positive")
+        );
+        // 恢复路径：端点恢复后再次动作成功（FeedbackPutDone）→ 清除标记。
+        let _ = s.handle_command(crate::input::Command::ClosePicker);
+        let _ = s.handle_command(crate::input::Command::OpenMessageActions);
+        let _ = s.handle_command(crate::input::Command::PickerConfirm);
+        s.handle(AppEvent::FeedbackPutDone);
+        assert!(s.message_action.feedback_marked.is_none(), "补交成功清标记");
+        assert!(
+            s.notice.as_deref().unwrap_or("").contains("补交成功"),
+            "notice 提示补交成功"
+        );
+    }
+
+    #[test]
+    fn feedback_permission_denied_no_local_mark_d50() {
+        let (mut s, _sid) = msg_app_with_blocks(vec![
+            (1, "user/message", Some("你好")),
+            (5, "assistant/message", Some("m5")),
+        ]);
+        s.cursor_block = 1;
+        let _ = s.handle_command(crate::input::Command::OpenMessageActions);
+        let cmds = s.handle_command(crate::input::Command::PickerConfirm);
+        assert!(cmds.iter().any(|c| matches!(c, Cmd::FeedbackPut { .. })));
+        // 权限错误 → 不降级不自动重试，error.code 可见。
+        s.handle(AppEvent::FeedbackPutFailed {
+            error: ClientError::Remote {
+                code: "PERMISSION_DENIED".into(),
+                message: "无权限".into(),
+                class: crate::api::envelope::ErrorClass::PermissionDenied,
+            },
+        });
+        assert!(
+            s.message_action.feedback_marked.is_none(),
+            "权限错误不做本地标记"
+        );
+        assert_eq!(
+            s.message_action.last_error_code.as_deref(),
+            Some("PERMISSION_DENIED")
+        );
+        let notice = s.notice.as_deref().unwrap_or("");
+        assert!(notice.contains("无权限"), "notice 展示权限错误, {notice}");
+    }
+
+    #[test]
+    fn feedback_local_mark_distinguishes_negative_d50() {
+        let (mut s, _sid) = msg_app_with_blocks(vec![
+            (1, "user/message", Some("你好")),
+            (5, "assistant/message", Some("m5")),
+        ]);
+        s.cursor_block = 1;
+        let _ = s.handle_command(crate::input::Command::OpenMessageActions);
+        let _ = s.handle_command(crate::input::Command::PickerDown); // feedback-
+        let cmds = s.handle_command(crate::input::Command::PickerConfirm);
+        assert!(cmds.iter().any(|c| matches!(c, Cmd::FeedbackPut { rating, .. }
+            if rating == "negative")));
+        s.handle(AppEvent::FeedbackPutFailed {
+            error: ClientError::HttpStatus {
+                status: 503,
+                url: "http://x".into(),
+            },
+        });
+        assert_eq!(
+            s.message_action.feedback_marked.as_deref(),
+            Some("negative"),
+            "5xx（HttpStatus 结构化）同样本地降级"
         );
     }
 

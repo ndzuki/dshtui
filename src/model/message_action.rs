@@ -41,6 +41,13 @@ pub struct MessageActionState {
     /// Optional feedback note input.
     pub feedback_note: String,
     pub last_error_code: Option<String>,
+    /// In-flight feedback rating awaiting its receipt（提交前登记、回执后清；
+    /// 供失败分类知道是哪一档，D-50）。
+    pub pending_rating: Option<String>,
+    /// D-50：feedback 端点不可用时的本地降级标记（仅内存，不提交）。展示
+    /// 「已本地记录（未提交）」；端点恢复后经官方 web 或再次动作补交，
+    /// FeedbackPutDone 时清除。
+    pub feedback_marked: Option<String>,
 }
 
 impl MessageActionState {
@@ -91,6 +98,31 @@ impl MessageActionState {
         self.inflight = None;
         self.last_error_code = Some(code);
     }
+
+    // ---- D-50 feedback 本地降级 ----
+
+    /// 提交 feedback 前登记在途 rating（回执后消费）。
+    pub fn set_pending_rating(&mut self, rating: String) {
+        self.pending_rating = Some(rating);
+    }
+
+    /// 非 feedback 动作开始/回执完成时清掉残留登记（防跨动作串档）。
+    pub fn clear_pending_rating(&mut self) {
+        self.pending_rating = None;
+    }
+
+    /// 端点不可用 → 本地降级标记（仅内存，不提交；不回错误态）。
+    pub fn mark_feedback_local(&mut self, rating: String) {
+        self.inflight = None;
+        self.last_error_code = None;
+        self.feedback_marked = Some(rating);
+        self.close_menu();
+    }
+
+    /// 补交成功 / 用户已 web 提交 → 清除本地标记。
+    pub fn clear_feedback_local(&mut self) {
+        self.feedback_marked = None;
+    }
 }
 
 /// Only the LAST user message of a still (non-running) session may branch.
@@ -138,5 +170,24 @@ mod tests {
         assert!(can_branch(false, true));
         assert!(!can_branch(true, true), "运行中不可分支");
         assert!(!can_branch(false, false), "非末条 user 不可分支");
+    }
+
+    #[test]
+    fn local_mark_lifecycle_d50() {
+        let mut s = MessageActionState::default();
+        s.set_pending_rating("positive".into());
+        assert_eq!(s.pending_rating.as_deref(), Some("positive"));
+        // 端点不可用 → 本地标记 + 菜单关闭 + 在途清空。
+        s.mark_feedback_local("positive".into());
+        assert_eq!(s.feedback_marked.as_deref(), Some("positive"));
+        assert_eq!(s.menu_seq, None);
+        assert!(s.inflight.is_none());
+        assert_eq!(s.pending_rating.as_deref(), Some("positive"), "回执消费由 reducer 完成");
+        // 补交成功 → 清除标记；非 feedback 动作清残留登记。
+        s.clear_feedback_local();
+        assert!(s.feedback_marked.is_none());
+        s.set_pending_rating("negative".into());
+        s.clear_pending_rating();
+        assert!(s.pending_rating.is_none());
     }
 }
