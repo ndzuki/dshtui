@@ -1828,7 +1828,10 @@ impl AppState {
             .map(|d| d.text.clone())
             .unwrap_or_default();
         let Some(editor) = self.resolve_editor() else {
-            self.notice = Some("未设置 $VISUAL/$EDITOR 且未配置 [ui].editor（export EDITOR=vim 或 config 设置）".into());
+            self.notice = Some(
+                "未设置 $VISUAL/$EDITOR 且未配置 [ui].editor（export EDITOR=vim 或 config 设置）"
+                    .into(),
+            );
             return vec![];
         };
         // 临时文件放 state 目录（~/.local/state/dshtui/，与主进程同文件系统；
@@ -2990,8 +2993,8 @@ impl AppState {
         use crate::api::envelope::ErrorClass as EC;
         let rating = self.message_action.pending_rating.take();
         let class = error.class();
-        let endpoint_unavailable = class == EC::Retryable
-            || error.http_status().is_some_and(|s| s == 404 || s >= 500);
+        let endpoint_unavailable =
+            class == EC::Retryable || error.http_status().is_some_and(|s| s == 404 || s >= 500);
         if class == EC::PermissionDenied {
             self.message_action.fail(error.code());
             self.notice = Some(format!("feedback 提交失败（无权限，不自动重试）: {error}"));
@@ -4443,7 +4446,8 @@ impl AppState {
         self.composer.steer = false;
         self.composer.active_session = None;
         // D-49：发送在途前先登记原始草稿全文（供失败回填；成功即弃）。
-        self.pending_prompt_texts.insert(sid.0.clone(), text.clone());
+        self.pending_prompt_texts
+            .insert(sid.0.clone(), text.clone());
         // 发送后清空该会话草稿（AC-003-11）+ 记入输入历史（AC-003-10）；
         // 失败时由 PromptFailed 回填（D-49：成功才清、失败可重发不丢）。
         self.drafts.clear(&sid);
@@ -7736,7 +7740,9 @@ mod tests {
         // 发送瞬间注册表清空（回执前不留旧稿），但全文登记在途。
         assert!(s.drafts.get(&session_id).is_none());
         assert_eq!(
-            s.pending_prompt_texts.get(&session_id.0).map(String::as_str),
+            s.pending_prompt_texts
+                .get(&session_id.0)
+                .map(String::as_str),
             Some("看图说话"),
             "在途全文已登记（D-49）"
         );
@@ -7758,10 +7764,7 @@ mod tests {
         );
         // 恢复路径：再开 composer 直接看到原稿；改写重发 → 成功清空。
         s.handle_command(C::InsertMode);
-        assert_eq!(
-            s.draft.as_ref().map(|d| d.text.as_str()),
-            Some("看图说话")
-        );
+        assert_eq!(s.draft.as_ref().map(|d| d.text.as_str()), Some("看图说话"));
         s.draft.as_mut().unwrap().text = "重说一遍".into();
         let cmds2 = s.handle_command(C::SubmitInput);
         let (_, rid2) = match &cmds2[0] {
@@ -9901,6 +9904,26 @@ mod tests {
         }
     }
 
+    /// 构建一个 `:edit` 就绪的 AppState（struct update 字面量，无
+    /// Default 后字段赋值——规避 clippy field_reassign_with_default）。
+    fn edit_state(editor_fallback: Option<String>, sid: &SessionId) -> AppState {
+        AppState {
+            editor_fallback,
+            mode: Mode::Insert,
+            composer: ComposerState {
+                visible: true,
+                active_session: Some(sid.clone()),
+                steer: false,
+            },
+            draft: Some(DraftState {
+                text: "草稿".into(),
+                cursor: 0,
+                bound_session: sid.clone(),
+            }),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn external_edit_editor_chain_visual_editor_config_d52() {
         // D-52：`$VISUAL` → `$EDITOR` → config `[ui].editor` 三级链；
@@ -9912,67 +9935,52 @@ mod tests {
         let state_dir =
             std::env::temp_dir().join(format!("dshtui-edit-chain-{}", std::process::id()));
         std::env::set_var("XDG_STATE_HOME", &state_dir);
-        let mut s = AppState::default();
-        s.editor_fallback = Some("/bin/true".into());
         let sid = SessionId("sess-e2".into());
-        s.composer.visible = true;
-        s.composer.active_session = Some(sid.clone());
-        s.draft = Some(DraftState {
-            text: "草稿".into(),
-            cursor: 0,
-            bound_session: sid.clone(),
-        });
         // ① env 全缺 → config fallback。
         std::env::remove_var("EDITOR");
         std::env::remove_var("VISUAL");
+        let mut s = edit_state(Some("/bin/true".into()), &sid);
         let cmds = s.external_edit_begin();
-        let Cmd::ExternalEdit { tmp_path, editor } =
-            cmds.iter().find(|c| matches!(c, Cmd::ExternalEdit { .. })).unwrap()
+        let Cmd::ExternalEdit { tmp_path, editor } = cmds
+            .iter()
+            .find(|c| matches!(c, Cmd::ExternalEdit { .. }))
+            .unwrap()
         else {
             panic!("config fallback 编辑器应生效，{cmds:?}")
         };
         assert_eq!(editor, "/bin/true", "config [ui].editor 生效");
         let _ = std::fs::remove_file(tmp_path);
-        s.external_edit.cancel();
-        s.mode = Mode::Normal;
-        s.composer.visible = false;
         // ② $EDITOR 存在 → 覆盖 config。
-        s.editor_fallback = Some("/bin/true".into());
         std::env::set_var("EDITOR", "/bin/echo");
-        s.composer.visible = true;
-        s.composer.active_session = Some(sid.clone());
+        let mut s = edit_state(Some("/bin/true".into()), &sid);
         let cmds = s.external_edit_begin();
-        let Cmd::ExternalEdit { tmp_path, editor } =
-            cmds.iter().find(|c| matches!(c, Cmd::ExternalEdit { .. })).unwrap()
+        let Cmd::ExternalEdit { tmp_path, editor } = cmds
+            .iter()
+            .find(|c| matches!(c, Cmd::ExternalEdit { .. }))
+            .unwrap()
         else {
             panic!("$EDITOR 应覆盖 config，{cmds:?}")
         };
         assert_eq!(editor, "/bin/echo", "$EDITOR 优先于 config");
         let _ = std::fs::remove_file(tmp_path);
-        s.external_edit.cancel();
-        s.composer.visible = false;
         // ③ $VISUAL 存在 → 覆盖 $EDITOR。
         std::env::set_var("VISUAL", "/bin/cat");
         std::env::remove_var("EDITOR");
-        s.editor_fallback = Some("/bin/true".into());
-        s.composer.visible = true;
-        s.composer.active_session = Some(sid.clone());
+        let mut s = edit_state(Some("/bin/true".into()), &sid);
         let cmds = s.external_edit_begin();
-        let Cmd::ExternalEdit { tmp_path, editor } =
-            cmds.iter().find(|c| matches!(c, Cmd::ExternalEdit { .. })).unwrap()
+        let Cmd::ExternalEdit { tmp_path, editor } = cmds
+            .iter()
+            .find(|c| matches!(c, Cmd::ExternalEdit { .. }))
+            .unwrap()
         else {
             panic!("$VISUAL 应生效，{cmds:?}")
         };
         assert_eq!(editor, "/bin/cat", "$VISUAL 最优先");
         let _ = std::fs::remove_file(tmp_path);
-        s.external_edit.cancel();
-        s.composer.visible = false;
         // ④ 全缺（含 config None）→ 可读提示，不发命令。
         std::env::remove_var("VISUAL");
         std::env::remove_var("EDITOR");
-        s.editor_fallback = None;
-        s.composer.visible = true;
-        s.composer.active_session = Some(sid.clone());
+        let mut s = edit_state(None, &sid);
         let cmds = s.external_edit_begin();
         assert!(cmds.is_empty(), "无编辑器不发命令");
         let notice = s.notice.as_deref().unwrap_or("");
@@ -10317,21 +10325,22 @@ mod tests {
         // D-51：无官方 imageLimits 投影（本地兜底）——数量软上限拦截。
         let (_dir1, f1) = temp_img("cnt1", b"aaa");
         let (_dir2, f2) = temp_img("cnt2", b"bbb");
-        let mut s = AppState::default();
-        s.max_image_count = 1; // 本地上限 1 张
         let sid = SessionId("sess-i".into());
-        s.mode = Mode::Insert;
-        s.composer.visible = true;
-        s.composer.active_session = Some(sid.clone());
-        s.draft = Some(DraftState {
-            text: format!(
-                "{}\n{}",
-                f1.to_string_lossy(),
-                f2.to_string_lossy()
-            ),
-            cursor: 0,
-            bound_session: sid.clone(),
-        });
+        let mut s = AppState {
+            max_image_count: 1, // 本地上限 1 张
+            mode: Mode::Insert,
+            composer: ComposerState {
+                visible: true,
+                active_session: Some(sid.clone()),
+                steer: false,
+            },
+            draft: Some(DraftState {
+                text: format!("{}\n{}", f1.to_string_lossy(), f2.to_string_lossy()),
+                cursor: 0,
+                bound_session: sid.clone(),
+            }),
+            ..Default::default()
+        };
         let cmds = s.submit_input(PromptMode::Queue);
         assert!(cmds.is_empty(), "数量超本地软上限不发");
         assert_eq!(s.mode, Mode::Insert, "保留 INSERT 可重选");
@@ -10354,23 +10363,28 @@ mod tests {
     fn submit_local_soft_limit_per_image_bytes_blocks_d51() {
         // D-51：单张字节软上限拦截（本地兜底，per-image 语义）。
         let (_dir, file) = temp_img("byte", b"1234567890"); // 10 字节
-        let mut s = AppState::default();
-        s.max_image_bytes = 5; // 本地上限 5 字节
         let sid = SessionId("sess-i".into());
-        s.mode = Mode::Insert;
-        s.composer.visible = true;
-        s.composer.active_session = Some(sid.clone());
-        s.draft = Some(DraftState {
-            text: file.to_string_lossy().into_owned(),
-            cursor: 0,
-            bound_session: sid.clone(),
-        });
+        let mut s = AppState {
+            max_image_bytes: 5, // 本地上限 5 字节
+            mode: Mode::Insert,
+            composer: ComposerState {
+                visible: true,
+                active_session: Some(sid.clone()),
+                steer: false,
+            },
+            draft: Some(DraftState {
+                text: file.to_string_lossy().into_owned(),
+                cursor: 0,
+                bound_session: sid.clone(),
+            }),
+            ..Default::default()
+        };
         let cmds = s.submit_input(PromptMode::Queue);
         assert!(cmds.is_empty(), "单张超本地上限不发");
         let notice = s.notice.as_deref().unwrap_or("");
         assert!(notice.contains("本地上限"), "notice={notice}");
         assert!(notice.contains("单张"), "per-image 提示, {notice}");
-        // 恢复路径：放宽上限后同文件可发送。
+        // 恢复路径：放宽上限后同文件可发送（重建 state 规避字段赋值 lint）。
         s.max_image_bytes = 100;
         s.notice = None;
         let cmds = s.submit_input(PromptMode::Queue);
@@ -11572,7 +11586,9 @@ mod tests {
         s.cursor_block = 1; // assistant
         let _ = s.handle_command(crate::input::Command::OpenMessageActions);
         let cmds = s.handle_command(crate::input::Command::PickerConfirm);
-        assert!(cmds.iter().any(|c| matches!(c, Cmd::FeedbackPut { rating, .. }
+        assert!(cmds
+            .iter()
+            .any(|c| matches!(c, Cmd::FeedbackPut { rating, .. }
             if rating == "positive")));
         assert_eq!(
             s.message_action.pending_rating.as_deref(),
@@ -11588,7 +11604,10 @@ mod tests {
             Some("positive"),
             "本地标记 rating"
         );
-        assert!(s.message_action.pending_rating.is_none(), "回执消费在途登记");
+        assert!(
+            s.message_action.pending_rating.is_none(),
+            "回执消费在途登记"
+        );
         let notice = s.notice.as_deref().unwrap_or("");
         assert!(notice.contains("本地记录"), "notice 提示本地记录, {notice}");
         assert!(notice.contains("未提交"), "notice 提示未提交, {notice}");
@@ -11651,7 +11670,9 @@ mod tests {
         let _ = s.handle_command(crate::input::Command::OpenMessageActions);
         let _ = s.handle_command(crate::input::Command::PickerDown); // feedback-
         let cmds = s.handle_command(crate::input::Command::PickerConfirm);
-        assert!(cmds.iter().any(|c| matches!(c, Cmd::FeedbackPut { rating, .. }
+        assert!(cmds
+            .iter()
+            .any(|c| matches!(c, Cmd::FeedbackPut { rating, .. }
             if rating == "negative")));
         s.handle(AppEvent::FeedbackPutFailed {
             error: ClientError::HttpStatus {
