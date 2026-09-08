@@ -1231,6 +1231,16 @@ pub enum Cmd {
         temp_file: std::path::PathBuf,
         media_type: crate::api::types::MediaType,
     },
+    /// REQ-007 D-45 zoom：同缓存 temp_file 路径重编码，但按 `zoom` 中心裁剪
+    /// 放大（AttachmentReady 回流存 image_frame，与打开路径共用）。
+    RenderImageViewZoom {
+        session_id: SessionId,
+        attachment_id: AttachmentId,
+        block_seq: SessionSeq,
+        temp_file: std::path::PathBuf,
+        media_type: crate::api::types::MediaType,
+        zoom: f32,
+    },
     /// 系统查看器打开原图（`open`/`xdg-open` 子进程不阻塞）。
     OpenSystemViewer {
         path: std::path::PathBuf,
@@ -4543,6 +4553,65 @@ impl AppState {
         cmds
     }
 
+    /// REQ-007 D-45 zoom（`+`/`-`/`0`）：更新 zoom 状态并触发同缓存 temp_file
+    /// 重编码（Cmd::RenderImageViewZoom → AttachmentReady 回流 image_frame）。
+    /// 仅在 ImageView 渲染完成态有意义；在途单飞（连按取最新 scale——完成
+    /// 回执时若 zoom 又变则再发一轮）。
+    fn image_view_zoom(&mut self, direction: i8) -> Vec<Cmd> {
+        if self.mode != Mode::ImageView || !self.image_view.open {
+            return vec![];
+        }
+        match direction {
+            d if d > 0 => self.image_view.zoom_in(),
+            d if d < 0 => self.image_view.zoom_out(),
+            _ => self.image_view.zoom_reset(),
+        }
+        if self.image_view.phase != crate::model::ImageViewPhase::Rendered {
+            // Loading/Failed 无帧可重编码：状态已更新，等渲染完成后再按。
+            return vec![];
+        }
+        let Some(att_id) = self.image_view.attachment_id.clone() else {
+            return vec![];
+        };
+        let Some(session_id) = self.active_session.clone() else {
+            return vec![];
+        };
+        let Some(block_seq) = self.image_view.block_seq else {
+            return vec![];
+        };
+        if !self.image_view.begin_zoom_encode() {
+            // 在途单飞：zoom 状态已更新；完成回执时发现 zoom 变了会再发。
+            return vec![];
+        }
+        // 源 = 缓存条目 temp_file + media_type；未入缓存（预算外/超限）用
+        // view_temp_path + image_meta（该图已渲染完成，临时文件必在）。
+        let entry = self.image_cache.get(&att_id);
+        let (temp_file, media_type) = match entry {
+            Some(e) => (e.temp_file, e.media_type),
+            None => {
+                let Some(path) = self.view_temp_path.clone() else {
+                    self.image_view.cancel_zoom_encode();
+                    self.last_error = Some("图片临时文件不可用，无法缩放".into());
+                    return vec![];
+                };
+                let mt = self
+                    .image_meta
+                    .get(&att_id)
+                    .map(|m| m.media_type.clone())
+                    .unwrap_or_else(|| crate::api::types::MediaType("image/png".into()));
+                (path, mt)
+            }
+        };
+        vec![Cmd::RenderImageViewZoom {
+            session_id,
+            attachment_id: att_id,
+            block_seq,
+            temp_file,
+            media_type,
+            zoom: self.image_view.zoom,
+        }]
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn on_attachment_ready(
         &mut self,
@@ -4587,8 +4656,10 @@ impl AppState {
             return vec![];
         }
         self.image_errors.remove(&attachment_id);
-        if cached {
+        if cached && self.image_cache.get(&attachment_id).is_some() {
             // The cache entry already owns the file; do not re-account it.
+            // （仅缓存确有条目时清 view_temp_path——zoom 对「预算外/未入缓存」
+            // 图片重编码时源文件在 view_temp_path，不能清掉。）
             self.view_temp_path = None;
         }
         if for_viewer || !self.kitty_capable {
@@ -4610,6 +4681,20 @@ impl AppState {
             None => {
                 self.image_view
                     .mark_failed("encode/failed".into(), "kitty 帧缺失".into());
+            }
+        }
+        // REQ-007 D-45：zoom 重编码回流完成——期间 zoom 又变了（连按取最新）
+        // → 再发一轮重编码（复用缓存 temp_file）。
+        if let Some(encoded) = self.image_view.finish_zoom_encode() {
+            if (self.image_view.zoom - encoded).abs() > f32::EPSILON {
+                return vec![Cmd::RenderImageViewZoom {
+                    session_id,
+                    attachment_id,
+                    block_seq,
+                    temp_file: entry.temp_file,
+                    media_type: entry.media_type,
+                    zoom: self.image_view.zoom,
+                }];
             }
         }
         vec![]
@@ -4800,6 +4885,9 @@ impl AppState {
                 // 仅 ImageView 模态有意义（pager 步进）。
                 self.image_view_pager_step(delta)
             }
+            C::ImageViewZoomIn => self.image_view_zoom(1),
+            C::ImageViewZoomOut => self.image_view_zoom(-1),
+            C::ImageViewZoomReset => self.image_view_zoom(0),
             C::SubagentInterrupt => {
                 // 仅 subagent 模态上下文有意义（已在 handle_subagent_command
                 // 分流）；此处兜底 no-op。
@@ -11023,6 +11111,145 @@ mod tests {
         assert!(s.image_view.pager.is_none() || s.image_view.pager.as_ref().unwrap().total == 1);
         s.image_view.close();
         assert!(s.image_view.pager.is_none());
+    }
+
+    // ---------- REQ-007 D-45 图片 zoom（AC-007-06/30） ----------
+
+    /// 构造「ImageView 已渲染 + 缓存有条目」状态（zoom reducer 前置）。
+    fn zoom_ready_view(s: &mut AppState, sid: &SessionId, att: &str, seq: u64) {
+        s.active_session = Some(sid.clone());
+        // reducer 测试不真正 kitty 编码：文件字节任意即可（write_temp_file
+        // 只落盘 + 记账）。
+        let path = s
+            .image_cache
+            .write_temp_file(
+                &crate::api::types::MediaType("image/png".into()),
+                vec![1, 2, 3],
+            )
+            .unwrap();
+        let _ = s.image_cache.complete(
+            &AttachmentId(att.into()),
+            crate::model::ImageCacheEntry {
+                attachment_id: AttachmentId(att.into()),
+                media_type: crate::api::types::MediaType("image/png".into()),
+                bytes: 3,
+                width: 64,
+                height: 64,
+                temp_file: path,
+                last_used: 0,
+            },
+        );
+        s.image_cache.pin(&AttachmentId(att.into()));
+        s.image_view
+            .open_view(SessionSeq(seq), AttachmentId(att.into()), None, None);
+        s.image_view.mark_rendered();
+        s.mode = Mode::ImageView;
+    }
+
+    #[test]
+    fn image_zoom_in_out_reset_emits_reencode_ac007_06() {
+        let mut s = AppState {
+            kitty_capable: true, // ImageView zoom 仅 Kitty 路径
+            ..Default::default()
+        };
+        let sid = SessionId("sess-z".into());
+        zoom_ready_view(&mut s, &sid, "za", 7);
+        // `+`：zoom 变档 + 发重编码命令（带 zoom scale）。
+        let cmds = s.handle_command(crate::input::Command::ImageViewZoomIn);
+        assert!((s.image_view.zoom - 1.25).abs() < 1e-6);
+        assert!(
+            cmds.iter().any(|c| matches!(
+                c,
+                Cmd::RenderImageViewZoom {
+                    attachment_id,
+                    zoom,
+                    ..
+                } if attachment_id.0 == "za" && (*zoom - 1.25).abs() < 1e-6
+            )),
+            "cmds={cmds:?}"
+        );
+        assert!(s.image_view.zoom_inflight, "重编码在途标记");
+        // `-`：在途时只更新状态不重复发（单飞）。
+        let cmds2 = s.handle_command(crate::input::Command::ImageViewZoomOut);
+        assert!(cmds2.is_empty(), "单飞：在途不再发, cmds2={cmds2:?}");
+        assert!((s.image_view.zoom - 1.0).abs() < 1e-6, "zoom 状态仍更新");
+        // 回执完成：编码 zoom=1.25 ≠ 当前 1.0 → 再发一轮（连按取最新）。
+        let sid2 = sid.clone();
+        let cmds3 = s.handle(AppEvent::AttachmentReady {
+            session_id: sid2,
+            attachment_id: AttachmentId("za".into()),
+            block_seq: SessionSeq(7),
+            meta: crate::model::AttachmentRef {
+                attachment_id: AttachmentId("za".into()),
+                media_type: crate::api::types::MediaType("image/png".into()),
+                bytes: 1,
+                width: 64,
+                height: 64,
+                name: None,
+                original_dimensions: None,
+            },
+            frame: None,
+            entry: crate::model::ImageCacheEntry {
+                attachment_id: AttachmentId("za".into()),
+                media_type: crate::api::types::MediaType("image/png".into()),
+                bytes: 1,
+                width: 64,
+                height: 64,
+                temp_file: std::path::PathBuf::from("/tmp/x"),
+                last_used: 0,
+            },
+            cached: true,
+            for_viewer: false,
+        });
+        assert!(
+            cmds3.iter().any(|c| matches!(
+                c,
+                Cmd::RenderImageViewZoom { zoom, .. } if (*zoom - 1.0).abs() < 1e-6
+            )),
+            "zoom 在途变了 → 以最新 zoom 再发, cmds3={cmds3:?}"
+        );
+        assert!(!s.image_view.zoom_inflight);
+    }
+
+    #[test]
+    fn image_zoom_reset_and_close_cancel_inflight_ac007_06() {
+        let mut s = AppState::default();
+        let sid = SessionId("sess-z2".into());
+        zoom_ready_view(&mut s, &sid, "zb", 8);
+        // 0：重置 1.0 + 发重编码（当前已是 1.0，仍发以便与 fit 一致）。
+        let cmds = s.handle_command(crate::input::Command::ImageViewZoomReset);
+        assert_eq!(s.image_view.zoom, 1.0);
+        assert!(cmds.iter().any(|c| matches!(
+            c,
+            Cmd::RenderImageViewZoom { zoom, .. } if (*zoom - 1.0).abs() < 1e-6
+        )));
+        // close：取消在途（不残留 inflight 标记），收面板回 Normal。
+        s.image_view.zoom_inflight = true;
+        let cmds2 = s.handle_command(crate::input::Command::ImageViewClose);
+        assert!(cmds2.is_empty());
+        assert_eq!(s.mode, Mode::Normal);
+        assert!(!s.image_view.zoom_inflight);
+        assert!(!s.image_view.open);
+    }
+
+    #[test]
+    fn image_zoom_noop_when_not_rendered_or_not_imageview() {
+        // 非 ImageView 模式：zoom 不动作。
+        let mut s = AppState::default();
+        let cmds = s.handle_command(crate::input::Command::ImageViewZoomIn);
+        assert!(cmds.is_empty());
+        assert_eq!(s.image_view.zoom, 1.0);
+        // ImageView 但 Loading（无帧可重编码）：只更新状态不发命令。
+        let sid = SessionId("sess-z3".into());
+        s.active_session = Some(sid.clone());
+        s.image_view
+            .open_view(SessionSeq(1), AttachmentId("zc".into()), None, None);
+        s.mode = Mode::ImageView;
+        assert_eq!(s.image_view.phase, crate::model::ImageViewPhase::Loading);
+        let cmds2 = s.handle_command(crate::input::Command::ImageViewZoomIn);
+        assert!(cmds2.is_empty());
+        assert!((s.image_view.zoom - 1.25).abs() < 1e-6, "状态可先变");
+        assert!(!s.image_view.zoom_inflight, "不进入重编码");
     }
 
     // ---------- REQ-007 V0.4 父→子发送（AC-007-01/10） ----------

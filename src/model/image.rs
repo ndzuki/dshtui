@@ -142,8 +142,14 @@ pub struct ImagePager {
     pub index: usize,
 }
 
+/// 图片 zoom 边界（REQ-007 D-45：`zoom: f32` + `+`/`-` 缩放、`0` 重置）。
+pub const IMAGE_ZOOM_MIN: f32 = 0.25;
+pub const IMAGE_ZOOM_MAX: f32 = 4.0;
+/// 单步档位（每按 `+`/`-` 变档；乘性档位更贴近图片查看器手感）。
+pub const IMAGE_ZOOM_STEP: f32 = 1.25;
+
 /// ImageView 状态（REQ-004 §5 字段表；仅 Kitty 渲染态出现）。
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ImageViewState {
     pub open: bool,
     /// 来源 `Block::Image.seq`（防串图锚点）。
@@ -155,6 +161,33 @@ pub struct ImageViewState {
     pub error: Option<ImageViewError>,
     /// REQ-007：同消息多图 pager（Some = 组内可 [ ] 切换；None = 单图）。
     pub pager: Option<ImagePager>,
+    /// REQ-007 D-45：放大 zoom（默认 1.0 = 整图 fit 视口；`+`/`-` 变档、
+    /// `0` 重置；渲染 = 重编码中心裁剪放大）。
+    pub zoom: f32,
+    /// zoom 重编码在途单飞标记（D-45：连按取最新 scale、防帧乱序；
+    /// AttachmentReady 回流或 close/pager 切换时清除）。
+    pub zoom_inflight: bool,
+    /// 在途 zoom 重编码的目标 zoom（finish 时与当前 zoom 比对，变了再发一轮
+    /// =「连按取最新」）。
+    pub zoom_encoded: Option<f32>,
+}
+
+impl Default for ImageViewState {
+    fn default() -> Self {
+        Self {
+            open: false,
+            block_seq: None,
+            attachment_id: None,
+            name: None,
+            dims: None,
+            phase: ImageViewPhase::Closed,
+            error: None,
+            pager: None,
+            zoom: 1.0,
+            zoom_inflight: false,
+            zoom_encoded: None,
+        }
+    }
 }
 
 /// Compute the image group (contiguous `Image` blocks in one message):
@@ -225,6 +258,10 @@ impl ImageViewState {
         self.dims = dims;
         self.phase = ImageViewPhase::Loading;
         self.error = None;
+        // 新开/重开图片回到整图 fit（D-45：zoom 按图复位，不继承上一张）。
+        self.zoom = 1.0;
+        self.zoom_inflight = false;
+        self.zoom_encoded = None;
     }
 
     pub fn mark_rendered(&mut self) {
@@ -247,6 +284,9 @@ impl ImageViewState {
         self.phase = ImageViewPhase::Closed;
         self.error = None;
         self.pager = None;
+        self.zoom = 1.0;
+        self.zoom_inflight = false;
+        self.zoom_encoded = None;
     }
 
     /// 打开时记录同消息组 pager（多图切换 `[`/`]`）。
@@ -268,6 +308,57 @@ impl ImageViewState {
         }
         p.index = next as usize;
         true
+    }
+}
+
+/// Zoom 纯函数（REQ-007 D-45 headless seam）：乘性档位 + clamp，返回新 zoom。
+/// `+1` = 放大一档、`-1` = 缩小一档、`0` = 重置 1.0。
+pub fn zoom_step(zoom: f32, direction: i8) -> f32 {
+    match direction {
+        d if d > 0 => (zoom * IMAGE_ZOOM_STEP).min(IMAGE_ZOOM_MAX),
+        d if d < 0 => (zoom / IMAGE_ZOOM_STEP).max(IMAGE_ZOOM_MIN),
+        _ => 1.0,
+    }
+}
+
+impl ImageViewState {
+    /// 放大一档（D-45：`+`/`=`）。
+    pub fn zoom_in(&mut self) {
+        self.zoom = zoom_step(self.zoom, 1);
+    }
+
+    /// 缩小一档（D-45：`-`）。
+    pub fn zoom_out(&mut self) {
+        self.zoom = zoom_step(self.zoom, -1);
+    }
+
+    /// 重置 1.0（D-45：`0`）。
+    pub fn zoom_reset(&mut self) {
+        self.zoom = 1.0;
+    }
+
+    /// 开始一次 zoom 重编码（单飞：在途则返回 false，不重复发）。
+    pub fn begin_zoom_encode(&mut self) -> bool {
+        if self.zoom_inflight {
+            return false;
+        }
+        self.zoom_inflight = true;
+        self.zoom_encoded = Some(self.zoom);
+        true
+    }
+
+    /// zoom 重编码回流完成：清在途，返回「本次已编码的 zoom」——若当前
+    /// zoom 已变（连按取最新），调用方据此再发一轮。
+    pub fn finish_zoom_encode(&mut self) -> Option<f32> {
+        self.zoom_inflight = false;
+        self.zoom_encoded.take()
+    }
+
+    /// pager 切换/close 取消在途重编码（帧防串图守卫由附件 id+block_seq
+    /// 锚定，见 app）。
+    pub fn cancel_zoom_encode(&mut self) {
+        self.zoom_inflight = false;
+        self.zoom_encoded = None;
     }
 }
 
@@ -372,6 +463,41 @@ mod tests {
         assert_eq!(v.pager.as_ref().map(|p| p.index), Some(0));
         v.close();
         assert!(v.pager.is_none(), "close 清 pager");
+    }
+
+    #[test]
+    fn zoom_step_clamps_and_resets_ac007_06() {
+        // 乘性档位 + clamp 边界（D-45 headless seam）。
+        assert!((zoom_step(1.0, 1) - 1.25).abs() < 1e-6, "1.0 → 1.25");
+        assert!((zoom_step(1.25, 1) - 1.5625).abs() < 1e-6, "1.25 → 1.5625");
+        assert!(
+            (zoom_step(3.5, 1) - IMAGE_ZOOM_MAX).abs() < 1e-6,
+            "放大封顶 4.0"
+        );
+        assert_eq!(zoom_step(4.0, 1), IMAGE_ZOOM_MAX, "放大到顶不再超");
+        assert!((zoom_step(1.0, -1) - 0.8).abs() < 1e-6);
+        assert_eq!(zoom_step(0.25, -1), IMAGE_ZOOM_MIN, "缩放到底不再低");
+        assert_eq!(zoom_step(0.5, 0), 1.0, "0 = 重置 1.0");
+        assert_eq!(zoom_step(4.0, 0), 1.0);
+    }
+
+    #[test]
+    fn image_view_zoom_in_out_reset_and_open_resets_ac007_06() {
+        let mut v = ImageViewState::default();
+        assert_eq!(v.zoom, 1.0);
+        v.zoom_in();
+        assert!((v.zoom - 1.25).abs() < 1e-6);
+        v.zoom_out();
+        v.zoom_out();
+        assert!(v.zoom < 1.0, "缩小低于 1.0（可看更小）");
+        v.zoom_reset();
+        assert_eq!(v.zoom, 1.0);
+        // 打开新图：zoom 复位整图 fit（不继承上一张）。
+        v.zoom_in();
+        v.open_view(SessionSeq(7), AttachmentId("a1".into()), None, None);
+        assert_eq!(v.zoom, 1.0, "open_view 复位 zoom");
+        v.close();
+        assert_eq!(v.zoom, 1.0);
     }
 
     #[test]

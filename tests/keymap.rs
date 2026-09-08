@@ -487,6 +487,7 @@ fn attachment_ready_renders_frame_and_marks_rendered_with_anchor() {
         (8, 16),
         ratatui::layout::Rect::new(0, 0, 40, 10),
         1,
+        1.0,
     )
     .unwrap();
     let cmds = app.handle(dshtui::app::AppEvent::AttachmentReady {

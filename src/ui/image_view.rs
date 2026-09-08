@@ -26,13 +26,19 @@ pub fn render(
         .constraints([Constraint::Length(1), Constraint::Min(1)])
         .split(area);
 
-    // 标题行：`名称 · 宽×高`（05 §10）+ 同消息多图 pager `(i/N)`（AC-007-06）。
+    // 标题行：`名称 · 宽×高`（05 §10）+ 同消息多图 pager `(i/N)`（AC-007-06）
+    // + zoom 百分比（REQ-007 D-45；非 1.0 时显示，如 `125%`）。
     let pager_tag = view
         .pager
         .as_ref()
         .filter(|p| p.total > 1)
         .map(|p| format!("({}/{}) ", p.index + 1, p.total))
         .unwrap_or_default();
+    let zoom_tag = if (view.zoom - 1.0).abs() > f32::EPSILON {
+        format!(" {}% ", (view.zoom * 100.0).round() as i64)
+    } else {
+        String::new()
+    };
     let title = match (&view.name, &view.dims) {
         (Some(name), Some(dims)) => format!(" {name} · {dims} "),
         (Some(name), None) => format!(" {name} "),
@@ -50,6 +56,12 @@ pub fn render(
             title,
             Style::default()
                 .fg(Color::LightMagenta)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            zoom_tag,
+            Style::default()
+                .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ),
     ]);
@@ -156,5 +168,29 @@ mod tests {
             "Rendered 但无帧必须降级占位, text={text}"
         );
         assert_eq!(view.phase, ImageViewPhase::Rendered);
+    }
+
+    #[test]
+    fn zoom_title_tag_shows_percent_when_not_one() {
+        // REQ-007 D-45：zoom != 1.0 时标题显示百分比；1.0 不显示。
+        let mut view = ImageViewState::default();
+        view.open_view(
+            SessionSeq(7),
+            AttachmentId("att-1".into()),
+            Some("a.png".into()),
+            None,
+        );
+        view.mark_rendered();
+        view.zoom = 1.25;
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, f.area(), &view, None)).unwrap();
+        let text = rendered_text(&terminal);
+        assert!(text.contains("125%"), "zoom 标题, text={text}");
+
+        view.zoom_reset();
+        terminal.draw(|f| render(f, f.area(), &view, None)).unwrap();
+        let text2 = rendered_text(&terminal);
+        assert!(!text2.contains("%"), "zoom=1 不显示百分比, text={text2}");
     }
 }

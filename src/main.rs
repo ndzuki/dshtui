@@ -1689,6 +1689,7 @@ async fn execute_one(
                                         font_size,
                                         area,
                                         frame_id,
+                                        1.0,
                                     ) {
                                         Ok(f) => event_tx.blocking_send(AppEvent::AttachmentReady {
                                             session_id,
@@ -1761,86 +1762,37 @@ async fn execute_one(
             media_type,
         } => {
             // REQ-004 缓存命中：从临时文件重解码 + kitty 编码（不重复拉取）。
-            let meta = app.image_meta.get(&attachment_id).cloned();
-            let font_size = dshtui::ui::image::terminal_font_size();
-            let area = encode_area(app);
-            let frame_id = app.next_kitty_frame_id();
-            let cache = std::sync::Arc::clone(&app.image_cache);
-            let event_tx = event_tx.clone();
-            tokio::task::spawn_blocking::<_, ()>(move || {
-                let event = match std::fs::read(&temp_file) {
-                    Ok(bytes) => match dshtui::ui::image::decode_image(&bytes, &media_type) {
-                        Ok(decoded) => {
-                            let meta = meta.unwrap_or_else(|| dshtui::model::AttachmentRef {
-                                attachment_id: attachment_id.clone(),
-                                media_type: media_type.clone(),
-                                bytes: bytes.len() as u64,
-                                width: decoded.width as u64,
-                                height: decoded.height as u64,
-                                name: None,
-                                original_dimensions: None,
-                            });
-                            let entry = match cache.get(&attachment_id) {
-                                Some(e) => e,
-                                None => dshtui::model::ImageCacheEntry {
-                                    attachment_id: attachment_id.clone(),
-                                    media_type: media_type.clone(),
-                                    bytes: bytes.len() as u64,
-                                    width: decoded.width as u64,
-                                    height: decoded.height as u64,
-                                    temp_file: temp_file.clone(),
-                                    last_used: 0,
-                                },
-                            };
-                            match dshtui::ui::image::kitty_frame(
-                                image::DynamicImage::ImageRgba8(decoded.rgba),
-                                font_size,
-                                area,
-                                frame_id,
-                            ) {
-                                Ok(f) => AppEvent::AttachmentReady {
-                                    session_id,
-                                    attachment_id,
-                                    block_seq,
-                                    meta,
-                                    frame: Some(dshtui::app::KittyFrame(f)),
-                                    entry,
-                                    cached: true,
-                                    for_viewer: false,
-                                },
-                                Err(e) => AppEvent::AttachmentFailed {
-                                    session_id,
-                                    attachment_id,
-                                    block_seq,
-                                    code: e.code,
-                                    message: e.message,
-                                    retryable: false,
-                                    for_viewer: false,
-                                },
-                            }
-                        }
-                        Err(e) => AppEvent::AttachmentFailed {
-                            session_id,
-                            attachment_id,
-                            block_seq,
-                            code: e.code,
-                            message: e.message,
-                            retryable: false,
-                            for_viewer: false,
-                        },
-                    },
-                    Err(e) => AppEvent::AttachmentFailed {
-                        session_id,
-                        attachment_id,
-                        block_seq,
-                        code: "io".into(),
-                        message: format!("缓存文件读取失败: {e}"),
-                        retryable: false,
-                        for_viewer: false,
-                    },
-                };
-                let _ = event_tx.blocking_send(event);
-            });
+            spawn_cached_frame_render(
+                app,
+                event_tx,
+                session_id,
+                attachment_id,
+                block_seq,
+                temp_file,
+                media_type,
+                1.0, // zoom=1 = 整图 fit（与既有行为一致）
+            );
+        }
+        Cmd::RenderImageViewZoom {
+            session_id,
+            attachment_id,
+            block_seq,
+            temp_file,
+            media_type,
+            zoom,
+        } => {
+            // REQ-007 D-45：zoom 重编码——同一缓存 temp_file，按 zoom 中心
+            // 裁剪放大（AttachmentReady 回流存 image_frame，与打开路径共用）。
+            spawn_cached_frame_render(
+                app,
+                event_tx,
+                session_id,
+                attachment_id,
+                block_seq,
+                temp_file,
+                media_type,
+                zoom,
+            );
         }
         Cmd::OpenSystemViewer { path } => {
             // AC-004-05/07：`open`/`xdg-open` 子进程不阻塞（spawn 不 wait）。
@@ -1886,6 +1838,104 @@ fn encode_area(app: &AppState) -> ratatui::layout::Rect {
         app.details_width_cells,
     )
     .center
+}
+
+/// 从缓存/视图临时文件重解码 + kitty 编码（不重复远程拉取）。`zoom` =
+/// 1.0 整图 fit（RenderCachedImage 打开路径），≠1.0 按 zoom 中心裁剪放大
+/// （REQ-007 D-45 RenderImageViewZoom 路径）。结果经 `AttachmentReady`
+/// 回流（与打开路径共用事件）。
+#[allow(clippy::too_many_arguments)]
+fn spawn_cached_frame_render(
+    app: &mut AppState,
+    event_tx: &mpsc::Sender<AppEvent>,
+    session_id: dshtui::api::types::SessionId,
+    attachment_id: dshtui::api::types::AttachmentId,
+    block_seq: dshtui::api::types::SessionSeq,
+    temp_file: std::path::PathBuf,
+    media_type: dshtui::api::types::MediaType,
+    zoom: f32,
+) {
+    let meta = app.image_meta.get(&attachment_id).cloned();
+    let font_size = dshtui::ui::image::terminal_font_size();
+    let area = encode_area(app);
+    let frame_id = app.next_kitty_frame_id();
+    let cache = std::sync::Arc::clone(&app.image_cache);
+    let event_tx = event_tx.clone();
+    tokio::task::spawn_blocking::<_, ()>(move || {
+        let event = match std::fs::read(&temp_file) {
+            Ok(bytes) => match dshtui::ui::image::decode_image(&bytes, &media_type) {
+                Ok(decoded) => {
+                    let meta = meta.unwrap_or_else(|| dshtui::model::AttachmentRef {
+                        attachment_id: attachment_id.clone(),
+                        media_type: media_type.clone(),
+                        bytes: bytes.len() as u64,
+                        width: decoded.width as u64,
+                        height: decoded.height as u64,
+                        name: None,
+                        original_dimensions: None,
+                    });
+                    let entry = match cache.get(&attachment_id) {
+                        Some(e) => e,
+                        None => dshtui::model::ImageCacheEntry {
+                            attachment_id: attachment_id.clone(),
+                            media_type: media_type.clone(),
+                            bytes: bytes.len() as u64,
+                            width: decoded.width as u64,
+                            height: decoded.height as u64,
+                            temp_file: temp_file.clone(),
+                            last_used: 0,
+                        },
+                    };
+                    match dshtui::ui::image::kitty_frame(
+                        image::DynamicImage::ImageRgba8(decoded.rgba),
+                        font_size,
+                        area,
+                        frame_id,
+                        zoom,
+                    ) {
+                        Ok(f) => AppEvent::AttachmentReady {
+                            session_id,
+                            attachment_id,
+                            block_seq,
+                            meta,
+                            frame: Some(dshtui::app::KittyFrame(f)),
+                            entry,
+                            cached: true,
+                            for_viewer: false,
+                        },
+                        Err(e) => AppEvent::AttachmentFailed {
+                            session_id,
+                            attachment_id,
+                            block_seq,
+                            code: e.code,
+                            message: e.message,
+                            retryable: false,
+                            for_viewer: false,
+                        },
+                    }
+                }
+                Err(e) => AppEvent::AttachmentFailed {
+                    session_id,
+                    attachment_id,
+                    block_seq,
+                    code: e.code,
+                    message: e.message,
+                    retryable: false,
+                    for_viewer: false,
+                },
+            },
+            Err(e) => AppEvent::AttachmentFailed {
+                session_id,
+                attachment_id,
+                block_seq,
+                code: "io".into(),
+                message: format!("缓存文件读取失败: {e}"),
+                retryable: false,
+                for_viewer: false,
+            },
+        };
+        let _ = event_tx.blocking_send(event);
+    });
 }
 
 /// Open a stream on the shared mux, creating the mux connection first if needed.

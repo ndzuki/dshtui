@@ -138,6 +138,13 @@ pub enum Command {
     ImageViewOpenExternal,
     /// `q`：关闭 ImageView 回 transcript（NORMAL）。
     ImageViewClose,
+    // ---------- REQ-007 D-45：ImageView zoom（AC-007-06/30） ----------
+    /// `+`/`=`：放大一档。
+    ImageViewZoomIn,
+    /// `-`：缩小一档。
+    ImageViewZoomOut,
+    /// `0`：重置 zoom 1.0。
+    ImageViewZoomReset,
     // ---------- REQ-005 Trajectory 级键位（D-25/Notes/04 §3.6） ----------
     /// `gt`（Normal→Trajectory，Trajectory→Chat）：顶部 Tab 切换。
     ToggleTrajectory,
@@ -619,6 +626,7 @@ impl KeyDecoder {
 
     /// REQ-004 IMAGEVIEW 级键位（D-14；Notes/05 §10 状态栏）：
     /// `o` 系统查看器 / `y` 复制路径 / `q` 关闭。
+    /// REQ-007 D-45 zoom：`+`/`=` 放大 / `-` 缩小 / `0` 重置（AC-007-06/30）。
     fn image_view(&mut self, key: KeyEvent) -> Option<Command> {
         self.pending_g = false;
         match key.code {
@@ -631,6 +639,10 @@ impl KeyDecoder {
             KeyCode::Char('[') if key.modifiers.is_empty() => {
                 Some(Command::ImageViewPager { delta: -1 })
             }
+            KeyCode::Char('+') if key.modifiers.is_empty() => Some(Command::ImageViewZoomIn),
+            KeyCode::Char('=') if key.modifiers.is_empty() => Some(Command::ImageViewZoomIn),
+            KeyCode::Char('-') if key.modifiers.is_empty() => Some(Command::ImageViewZoomOut),
+            KeyCode::Char('0') if key.modifiers.is_empty() => Some(Command::ImageViewZoomReset),
             _ => None,
         }
     }
@@ -926,6 +938,9 @@ fn default_key_tables() -> std::collections::BTreeMap<InputMode, Vec<(&'static s
             ("image_view_close", 'q', ImageViewClose),
             ("image_view_pager_next", ']', ImageViewPager { delta: 1 }),
             ("image_view_pager_prev", '[', ImageViewPager { delta: -1 }),
+            ("image_view_zoom_in", '+', ImageViewZoomIn),
+            ("image_view_zoom_out", '-', ImageViewZoomOut),
+            ("image_view_zoom_reset", '0', ImageViewZoomReset),
         ],
     );
     m.insert(
@@ -1475,6 +1490,23 @@ mod image_view_tests {
             None
         );
         assert_eq!(d.decode(InputMode::ImageView, key(KeyCode::Enter)), None);
+        // REQ-007 D-45：zoom 键（+ / = / - / 0）。
+        assert_eq!(
+            d.decode(InputMode::ImageView, key(KeyCode::Char('+'))),
+            Some(Command::ImageViewZoomIn)
+        );
+        assert_eq!(
+            d.decode(InputMode::ImageView, key(KeyCode::Char('='))),
+            Some(Command::ImageViewZoomIn)
+        );
+        assert_eq!(
+            d.decode(InputMode::ImageView, key(KeyCode::Char('-'))),
+            Some(Command::ImageViewZoomOut)
+        );
+        assert_eq!(
+            d.decode(InputMode::ImageView, key(KeyCode::Char('0'))),
+            Some(Command::ImageViewZoomReset)
+        );
     }
 
     #[test]

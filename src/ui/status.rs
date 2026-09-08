@@ -13,8 +13,8 @@ use crate::ui::layout::{color_depth, ColorDepth};
 /// 快捷键提示行（FR-001-05，README 键位口径；[/] 搜索为 REQ-002 预留但仍展示）。
 const HINT_LINE: &str = "[i]输入 [/]搜索 [f]切换 [gt]轨迹 [M]模型 [:]命令 [gv]视图 [?]帮助 [q]退出";
 /// IMAGEVIEW 模式提示行（REQ-004 D-14/05 §10：`o` 系统查看器 `y` 复制路径
-/// `q` 关闭）。
-const IMAGE_HINT_LINE: &str = "[o]系统查看器 [y]复制路径 [q]关闭";
+/// `q` 关闭；REQ-007 D-45 zoom `+`/`-`/`0`）。
+const IMAGE_HINT_LINE: &str = "[o]系统查看器 [y]复制路径 [+/-]缩放 [0]重置 [q]关闭";
 /// REQ-005 Trajectory 列表提示行（Notes/05 §7：j/k 选择 Enter 详情 z 折叠
 /// / 搜索 gt 回对话）。
 const TRAJ_HINT_LINE: &str = "[j/k]选择 [Enter]详情 [z]折叠 [/]搜索 [gt]回对话";
