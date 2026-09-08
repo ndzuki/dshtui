@@ -3423,9 +3423,17 @@ impl AppState {
                 // 把发送前登记全文回填注册表供手动重试（含图片路径行完整还原）；
                 // 成功路径（PromptAccepted）已清空。仅 composer 发送登记
                 // pending；retry 动作等非草稿发送无登记 → 不恢复。
+                // 防覆盖（spec review）：回执到达前用户已重开 composer 输入
+                // 了新内容（非空且与登记全文不同）→ 不覆盖用户的在途新稿。
                 let mut restored_full_draft = false;
                 if let Some(text) = self.pending_prompt_texts.remove(&session_id.0) {
-                    if !text.trim().is_empty() {
+                    let composer_has_newer = self.composer.active_session.as_ref()
+                        == Some(&session_id)
+                        && self
+                            .draft
+                            .as_ref()
+                            .is_some_and(|d| !d.text.trim().is_empty() && d.text != text);
+                    if !text.trim().is_empty() && !composer_has_newer {
                         self.drafts.set(DraftState {
                             text,
                             cursor: 0,
@@ -4777,7 +4785,17 @@ impl AppState {
             _ => self.image_view.zoom_reset(),
         }
         if self.image_view.phase != crate::model::ImageViewPhase::Rendered {
-            // Loading/Failed 无帧可重编码：状态已更新，等渲染完成后再按。
+            // Loading/Failed 无帧可重编码：状态已更新。Loading 期在途编码是
+            // 打开路径 zoom=1.0 的帧——登记在途编码 zoom=1.0，帧到达时
+            // finish 发现 zoom 已变会补发重编码（否则标题 125% 但画面仍是
+            // 1.0，直到再按一次键才纠正；D-45 spec review 修复）。Failed
+            // 无在途帧，不登记（不会到达）。
+            if self.image_view.phase == crate::model::ImageViewPhase::Loading
+                && !self.image_view.zoom_inflight
+            {
+                self.image_view.zoom_encoded = Some(1.0);
+                self.image_view.zoom_inflight = true;
+            }
             return vec![];
         }
         let Some(att_id) = self.image_view.attachment_id.clone() else {
@@ -7813,6 +7831,46 @@ mod tests {
         assert_eq!(w.pending().count(), 1, "本地立即回显");
         assert_eq!(w.pending().next().unwrap().text, "首个 turn");
         assert_eq!(w.len(), 0, "空白会话无历史");
+    }
+
+    #[test]
+    fn draft_failure_does_not_overwrite_newer_composer_input_d49() {
+        // D-49（spec review）：失败回执到达前用户已重开 composer 输入了新
+        // 内容（非空、不同于旧稿）→ 恢复逻辑不覆盖在途新稿。
+        let mut s = AppState::default();
+        let cmds = submit_flow(&mut s, "s1", "旧稿");
+        let (session_id, request_id) = match &cmds[0] {
+            Cmd::SendPrompt {
+                session_id,
+                request,
+            } => (session_id.clone(), request.request_id.clone()),
+            _ => panic!(),
+        };
+        // 失败回执到达前：用户重开 composer 输入了新内容（尚未发送）。
+        s.handle_command(C::InsertMode);
+        s.handle_command(C::PickerInput("用户在失败前输入的新稿".into()));
+        s.handle(AppEvent::PromptFailed {
+            session_id: session_id.clone(),
+            request_id,
+            error: ClientError::Transport("网络断开".into()),
+        });
+        // 在途 composer 新稿不被旧稿覆盖。
+        assert_eq!(
+            s.draft.as_ref().map(|d| d.text.as_str()),
+            Some("用户在失败前输入的新稿"),
+            "在途新稿不被恢复的旧稿覆盖"
+        );
+        // 注册表：失败回执不把旧稿塞回（避免下次 i 打开把新稿顶掉）。
+        assert!(
+            s.drafts.get(&session_id).is_none(),
+            "回执前已有新稿 → 不向注册表恢复旧稿"
+        );
+        // 恢复路径：用户仍可正常发送新稿。
+        let cmds2 = s.handle_command(C::SubmitInput);
+        assert!(
+            cmds2.iter().any(|c| matches!(c, Cmd::SendPrompt { .. })),
+            "新稿可正常发送"
+        );
     }
 
     #[test]
@@ -11993,7 +12051,8 @@ mod tests {
         let cmds = s.handle_command(crate::input::Command::ImageViewZoomIn);
         assert!(cmds.is_empty());
         assert_eq!(s.image_view.zoom, 1.0);
-        // ImageView 但 Loading（无帧可重编码）：只更新状态不发命令。
+        // ImageView 但 Loading（无帧可重编码）：只更新状态 + 登记在途编码
+        // zoom=1.0（打开路径帧到达时补发重编码）——不发命令（无 temp_file）。
         let sid = SessionId("sess-z3".into());
         s.active_session = Some(sid.clone());
         s.image_view
@@ -12003,7 +12062,72 @@ mod tests {
         let cmds2 = s.handle_command(crate::input::Command::ImageViewZoomIn);
         assert!(cmds2.is_empty());
         assert!((s.image_view.zoom - 1.25).abs() < 1e-6, "状态可先变");
-        assert!(!s.image_view.zoom_inflight, "不进入重编码");
+        assert!(
+            s.image_view.zoom_inflight,
+            "登记在途编码（等待打开帧到达补发）"
+        );
+        assert_eq!(
+            s.image_view.zoom_encoded,
+            Some(1.0),
+            "打开路径在途帧为 zoom=1.0"
+        );
+    }
+
+    #[test]
+    fn image_zoom_during_loading_refires_on_frame_arrival_d45() {
+        // D-45（spec review 修复）：Loading 期按 `+`（zoom 1.0→1.25）→
+        // 打开路径帧（zoom=1.0 编码）到达时发现 zoom 已变 → 补发 1.25
+        // 重编码，画面最终与标题 zoom% 一致（不静默停在 1.0）。
+        let mut s = AppState {
+            kitty_capable: true,
+            ..Default::default()
+        };
+        let sid = SessionId("sess-zl".into());
+        zoom_ready_view(&mut s, &sid, "zl", 7); // 缓存就绪（补发源文件）
+                                                // 回到 Loading 形态：重新 open 复位 zoom=1.0 + inflight=false。
+        s.image_view
+            .open_view(SessionSeq(8), AttachmentId("zl".into()), None, None);
+        assert_eq!(s.image_view.phase, crate::model::ImageViewPhase::Loading);
+        // Loading 期按 `+`：状态 1.25，登记在途编码 zoom=1.0，不发命令。
+        let cmds = s.handle_command(crate::input::Command::ImageViewZoomIn);
+        assert!(cmds.is_empty());
+        assert!((s.image_view.zoom - 1.25).abs() < 1e-6);
+        assert_eq!(s.image_view.zoom_encoded, Some(1.0), "登记打开帧 zoom=1.0");
+        // 打开路径帧（zoom=1.0 编码）到达 → finish 发现 zoom 已变 → 补发。
+        let cmds = s.handle(AppEvent::AttachmentReady {
+            session_id: sid,
+            attachment_id: AttachmentId("zl".into()),
+            block_seq: SessionSeq(8),
+            meta: crate::model::AttachmentRef {
+                attachment_id: AttachmentId("zl".into()),
+                media_type: crate::api::types::MediaType("image/png".into()),
+                bytes: 3,
+                width: 64,
+                height: 64,
+                name: Some("zl.png".into()),
+                original_dimensions: None,
+            },
+            frame: None,
+            entry: crate::model::ImageCacheEntry {
+                attachment_id: AttachmentId("zl".into()),
+                media_type: crate::api::types::MediaType("image/png".into()),
+                bytes: 3,
+                width: 64,
+                height: 64,
+                temp_file: std::path::PathBuf::from("/nonexistent"),
+                last_used: 0,
+            },
+            cached: true,
+            for_viewer: false,
+        });
+        assert!(
+            cmds.iter().any(|c| matches!(
+                c,
+                Cmd::RenderImageViewZoom { zoom, .. } if (*zoom - 1.25).abs() < 1e-6
+            )),
+            "打开帧到达后补发 1.25 重编码: {cmds:?}"
+        );
+        assert!(!s.image_view.zoom_inflight, "回执清在途");
     }
 
     // ---------- REQ-007 V0.4 父→子发送（AC-007-01/10） ----------

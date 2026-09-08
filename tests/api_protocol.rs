@@ -374,6 +374,69 @@ async fn prompt_unary_surfaces_remote_error_code_and_class() {
 }
 
 #[tokio::test]
+async fn unary_http_error_is_structured_status_d50() {
+    // D-50/D-46：unary 对 HTTP 非 2xx 返回结构化 HttpStatus（404/5xx 与
+    // 401/403 可区分）——feedback 端点不可用降级 / export 兜底分类的前提。
+    // 404 → HttpStatus{404}（UserFacing、http_status()=404）。
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let request = read_request(&mut socket).await;
+        assert!(request.starts_with("POST /api/messageFeedback/put HTTP/1.1"));
+        write_http_json(&mut socket, "404 Not Found", &json!({})).await;
+    });
+    let http = reqwest::Client::new();
+    let err = dshtui::api::feedback::put(
+        &http,
+        &format!("http://{addr}"),
+        &dshtui::api::types::MessageFeedbackPutRequest {
+            session_id: "s1".into(),
+            message_id: "m1".into(),
+            rating: "positive".into(),
+            note: None,
+            if_version: None,
+        },
+    )
+    .await
+    .unwrap_err();
+    match &err {
+        ClientError::HttpStatus { status, .. } => {
+            assert_eq!(*status, 404, "404 结构化状态码");
+            assert_eq!(err.class(), ErrorClass::UserFacing);
+            assert_eq!(err.http_status(), Some(404));
+        }
+        other => panic!("预期 HttpStatus，得到 {other:?}"),
+    }
+    server.await.unwrap();
+
+    // 401 → class PermissionDenied（权限类可区分，不降级不自动重试）。
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let _ = read_request(&mut socket).await;
+        write_http_json(&mut socket, "401 Unauthorized", &json!({})).await;
+    });
+    let http = reqwest::Client::new();
+    let err = dshtui::api::feedback::put(
+        &http,
+        &format!("http://{addr}"),
+        &dshtui::api::types::MessageFeedbackPutRequest {
+            session_id: "s1".into(),
+            message_id: "m1".into(),
+            rating: "negative".into(),
+            note: None,
+            if_version: None,
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.class(), ErrorClass::PermissionDenied, "401 → 权限类");
+    server.await.unwrap();
+}
+
+#[tokio::test]
 async fn cancel_unary_returns_typed_accepted_receipt() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
