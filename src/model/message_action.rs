@@ -182,7 +182,11 @@ mod tests {
         assert_eq!(s.feedback_marked.as_deref(), Some("positive"));
         assert_eq!(s.menu_seq, None);
         assert!(s.inflight.is_none());
-        assert_eq!(s.pending_rating.as_deref(), Some("positive"), "回执消费由 reducer 完成");
+        assert_eq!(
+            s.pending_rating.as_deref(),
+            Some("positive"),
+            "回执消费由 reducer 完成"
+        );
         // 补交成功 → 清除标记；非 feedback 动作清残留登记。
         s.clear_feedback_local();
         assert!(s.feedback_marked.is_none());
