@@ -72,6 +72,15 @@ pub struct UiConfig {
     pub show_turn_rail: bool,
     /// Timeline 缩略条（REQ-007 AC-007-29；默认关）。
     pub show_timeline: bool,
+    /// `:edit` 编辑器选择链第三级（D-52：`$VISUAL`→`$EDITOR`→config
+    /// `[ui].editor`；None = 前两级缺失时提示用户）。
+    pub editor: Option<String>,
+    /// 图片本地软上限（REQ-007 D-51）：单条消息附件数量上限（默认 10）。
+    #[serde(default = "default_max_image_count")]
+    pub max_image_count: usize,
+    /// 图片本地软上限（REQ-007 D-51）：单张附件字节上限（默认 20 MiB）。
+    #[serde(default = "default_max_image_bytes")]
+    pub max_image_bytes: u64,
     pub tick_ms: u64,
 }
 
@@ -119,6 +128,16 @@ impl Default for DraftsConfig {
 
 fn default_true() -> bool {
     true
+}
+
+/// 图片本地软上限默认：单条消息附件数量 ≤10（REQ-007 D-51）。
+fn default_max_image_count() -> usize {
+    10
+}
+
+/// 图片本地软上限默认：单张 ≤20 MiB（REQ-007 D-51）。
+fn default_max_image_bytes() -> u64 {
+    20 * 1024 * 1024
 }
 
 /// `[export]` — export default target path (ADR-010).
@@ -193,6 +212,9 @@ impl Default for UiConfig {
             details_width_cells: DEFAULT_DETAILS_WIDTH_CELLS,
             show_turn_rail: false,
             show_timeline: false,
+            editor: None,
+            max_image_count: default_max_image_count(),
+            max_image_bytes: default_max_image_bytes(),
             tick_ms: DEFAULT_TICK_MS,
         }
     }
@@ -1140,6 +1162,25 @@ quit = "none"
     }
 
     #[test]
+    fn v04_parses_ui_editor_and_image_soft_limits_d51_d52() {
+        // D-51/D-52：`[ui].editor` + max_image_count/max_image_bytes 可解析
+        // 且不再是 deny_unknown_fields 拒绝项。
+        let (_dir, path) = tmp_config(
+            r##"
+[ui]
+theme = "dark"
+editor = "/usr/bin/nano"
+max_image_count = 3
+max_image_bytes = 10485760
+"##,
+        );
+        let cfg = Config::load(Some(&path)).unwrap();
+        assert_eq!(cfg.ui.editor.as_deref(), Some("/usr/bin/nano"));
+        assert_eq!(cfg.ui.max_image_count, 3);
+        assert_eq!(cfg.ui.max_image_bytes, 10 * 1024 * 1024);
+    }
+
+    #[test]
     fn v04_defaults_drafts_enabled_export_empty() {
         let cfg = Config::default();
         assert!(cfg.drafts.enabled);
@@ -1147,8 +1188,13 @@ quit = "none"
         assert!(cfg.export.default_dir.is_empty());
         assert!(cfg.ui.palette.is_empty());
         assert!(!cfg.ui.show_timeline);
+        // D-51/D-52 默认：数量 10 / 单张 20MiB / editor 无。
+        assert_eq!(cfg.ui.max_image_count, 10);
+        assert_eq!(cfg.ui.max_image_bytes, 20 * 1024 * 1024);
+        assert!(cfg.ui.editor.is_none());
         let eff = cfg.resolve(&Cli::default()).unwrap();
         assert!(eff.drafts.enabled);
+        assert_eq!(eff.ui.max_image_count, 10);
     }
 
     #[cfg(unix)]

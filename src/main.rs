@@ -343,6 +343,11 @@ async fn run_connected(eff: Effective, token: String, client: DshClient) -> Resu
     if app.show_timeline {
         app.timeline.show = true;
     }
+    // REQ-007 D-51：图片本地软上限注入（数量/单张字节，config `[ui]`）。
+    app.max_image_count = eff.ui.max_image_count;
+    app.max_image_bytes = eff.ui.max_image_bytes;
+    // REQ-007 D-52：`:edit` 编辑器链第三级（config `[ui].editor`）。
+    app.editor_fallback = eff.ui.editor.clone();
     // REQ-007：主题/palette 从 `[ui] theme/palette` 注入（AC-007-20）；非法
     // 覆盖只警告不崩溃。
     let palette_warnings = app.apply_palette_config(&eff.ui.theme, &eff.ui.palette);

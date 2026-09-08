@@ -69,6 +69,28 @@ impl ImageAttachmentState {
         }
         Ok(())
     }
+
+    /// D-51：本地软上限校验（config，默认 数量 ≤10 / 单张 ≤20MiB）——逐张
+    /// 字节校验（per-image，非合计），与官方 imageLimits（validate）叠加
+    /// 双校验：本地更严/投影缺失时本地兜底生效。超限拒绝并提示可重选。
+    pub fn validate_local_soft_limit(
+        &self,
+        max_count: usize,
+        max_per_image_bytes: u64,
+    ) -> Result<(), String> {
+        if self.pending.len() > max_count {
+            return Err(format!("图片数量超过本地上限（{} 张，可配置）", max_count));
+        }
+        for a in &self.pending {
+            if a.bytes as u64 > max_per_image_bytes {
+                return Err(format!(
+                    "单张图片超过本地上限（{} 字节 > {} 字节），请压缩或换图",
+                    a.bytes, max_per_image_bytes
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Infer media type from a file extension (whitelist; unknown → Err).
@@ -192,5 +214,38 @@ mod tests {
         assert!(!looks_like_local_path("two words.png"));
         assert!(looks_like_local_path("/abs/x.png"));
         assert!(looks_like_local_path("C:\\x.png"));
+    }
+
+    #[test]
+    fn validate_local_soft_limit_per_image_and_count_d51() {
+        let mut s = ImageAttachmentState::default();
+        // 数量：3 张 > 2 上限 → 拒。
+        s.add(png(100));
+        s.add(png(100));
+        s.add(png(100));
+        assert!(
+            s.validate_local_soft_limit(2, 1000).is_err(),
+            "数量超本地软上限"
+        );
+        // 单张：25 字节 > 20 上限（逐张，非合计）→ 拒；另两张小图不连坐。
+        let mut s2 = ImageAttachmentState::default();
+        s2.add(png(10));
+        s2.add(png(25));
+        s2.add(png(5));
+        assert!(
+            s2.validate_local_soft_limit(10, 20).is_err(),
+            "单张超 20 字节本地上限"
+        );
+        let mut s3 = ImageAttachmentState::default();
+        s3.add(png(10));
+        s3.add(png(19));
+        assert!(
+            s3.validate_local_soft_limit(2, 20).is_ok(),
+            "合计 29 但逐张均 ≤20 → 通过（per-image 语义）"
+        );
+        // 边界：恰好 = 上限通过。
+        let mut s4 = ImageAttachmentState::default();
+        s4.add(png(20));
+        assert!(s4.validate_local_soft_limit(10, 20).is_ok());
     }
 }

@@ -1490,6 +1490,13 @@ pub struct AppState {
     /// （PromptFailed，任意类）回填注册表供手动重试——draft 仅存未发送内容、
     /// 成功才清空。仅内存，随回执生命周期（模式 15 单飞）。
     pub pending_prompt_texts: std::collections::HashMap<String, String>,
+    /// REQ-007 D-51：图片本地软上限（数量/单张字节）——config `[ui]`
+    /// max_image_count/max_image_bytes 注入，与官方 imageLimits 叠加双校验。
+    pub max_image_count: usize,
+    pub max_image_bytes: u64,
+    /// REQ-007 D-52：`:edit` 编辑器选择链第三级（config `[ui].editor`；
+    /// `$VISUAL`→`$EDITOR`→此项）。
+    pub editor_fallback: Option<String>,
     /// REQ-007 AC-007-15/16：settings 面板。
     pub settings: crate::model::SettingsPanelState,
     /// REQ-007 AC-007-18：skills 目录。
@@ -1625,6 +1632,9 @@ impl Default for AppState {
             pending_subagent_open: None,
             subagent_parents: std::collections::HashMap::new(),
             pending_prompt_texts: std::collections::HashMap::new(),
+            max_image_count: 10,
+            max_image_bytes: 20 * 1024 * 1024,
+            editor_fallback: None,
             settings: crate::model::SettingsPanelState::default(),
             skills: crate::model::SkillsCatalogState::default(),
             export: crate::model::ExportState::default(),
@@ -4404,6 +4414,14 @@ impl AppState {
             if let Err(msg) = err {
                 self.notice = Some(msg);
                 return vec![]; // 保留草稿在 INSERT（不自动重试）
+            }
+            // D-51：本地软上限（config，数量 ≤10/单张 ≤20MiB 可配）叠加官方
+            // imageLimits 双校验——官方投影缺失时本地兜底生效。
+            if let Err(msg) =
+                state.validate_local_soft_limit(self.max_image_count, self.max_image_bytes)
+            {
+                self.notice = Some(msg);
+                return vec![]; // 保留草稿在 INSERT，可重选（AC-007-24）
             }
             self.pending_image_attachments = attachments;
         }
@@ -10191,6 +10209,75 @@ mod tests {
             s.notice.as_deref().unwrap_or("").contains("上限"),
             "notice={:?}",
             s.notice
+        );
+        let _ = std::fs::remove_dir_all(&_dir);
+    }
+
+    #[test]
+    fn submit_local_soft_limit_blocks_when_projection_absent_d51() {
+        // D-51：无官方 imageLimits 投影（本地兜底）——数量软上限拦截。
+        let (_dir1, f1) = temp_img("cnt1", b"aaa");
+        let (_dir2, f2) = temp_img("cnt2", b"bbb");
+        let mut s = AppState::default();
+        s.max_image_count = 1; // 本地上限 1 张
+        let sid = SessionId("sess-i".into());
+        s.mode = Mode::Insert;
+        s.composer.visible = true;
+        s.composer.active_session = Some(sid.clone());
+        s.draft = Some(DraftState {
+            text: format!(
+                "{}\n{}",
+                f1.to_string_lossy(),
+                f2.to_string_lossy()
+            ),
+            cursor: 0,
+            bound_session: sid.clone(),
+        });
+        let cmds = s.submit_input(PromptMode::Queue);
+        assert!(cmds.is_empty(), "数量超本地软上限不发");
+        assert_eq!(s.mode, Mode::Insert, "保留 INSERT 可重选");
+        let notice = s.notice.as_deref().unwrap_or("");
+        assert!(notice.contains("本地上限"), "notice={notice}");
+        assert!(notice.contains("1"), "提示上限数量, {notice}");
+        // 恢复路径：降到上限内（1 张）可正常发送。
+        s.draft.as_mut().unwrap().text = f1.to_string_lossy().into_owned();
+        s.notice = None;
+        let cmds = s.submit_input(PromptMode::Queue);
+        assert!(
+            cmds.iter().any(|c| matches!(c, Cmd::SendPrompt { .. })),
+            "减到 1 张可发送"
+        );
+        let _ = std::fs::remove_dir_all(&_dir1);
+        let _ = std::fs::remove_dir_all(&_dir2);
+    }
+
+    #[test]
+    fn submit_local_soft_limit_per_image_bytes_blocks_d51() {
+        // D-51：单张字节软上限拦截（本地兜底，per-image 语义）。
+        let (_dir, file) = temp_img("byte", b"1234567890"); // 10 字节
+        let mut s = AppState::default();
+        s.max_image_bytes = 5; // 本地上限 5 字节
+        let sid = SessionId("sess-i".into());
+        s.mode = Mode::Insert;
+        s.composer.visible = true;
+        s.composer.active_session = Some(sid.clone());
+        s.draft = Some(DraftState {
+            text: file.to_string_lossy().into_owned(),
+            cursor: 0,
+            bound_session: sid.clone(),
+        });
+        let cmds = s.submit_input(PromptMode::Queue);
+        assert!(cmds.is_empty(), "单张超本地上限不发");
+        let notice = s.notice.as_deref().unwrap_or("");
+        assert!(notice.contains("本地上限"), "notice={notice}");
+        assert!(notice.contains("单张"), "per-image 提示, {notice}");
+        // 恢复路径：放宽上限后同文件可发送。
+        s.max_image_bytes = 100;
+        s.notice = None;
+        let cmds = s.submit_input(PromptMode::Queue);
+        assert!(
+            cmds.iter().any(|c| matches!(c, Cmd::SendPrompt { .. })),
+            "放宽上限后可发送"
         );
         let _ = std::fs::remove_dir_all(&_dir);
     }
