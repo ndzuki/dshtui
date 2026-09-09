@@ -134,14 +134,26 @@ graph TD
   `page_latency_ms`(可选) / `ws_reconnects`(单调计数)。主 TUI 每帧 tick、每 ~5s 追加一行
   `key=val`（配置 `[perf] log/log_path`，env `DSHTUI_PERF_LOG` 覆盖；空路径禁用）。
   `rss_mb()` 读 `/proc/self/status`；glibc `malloc_trim` 归还堆缓冲（monitor <20MB 目标）。
-- **`dshtui bench`**：性能门禁基准（V1 REQ-008 新增，主会话实现中）——JSON 报告默认
-  `target/perf/perf-report.json`；`--fixture auto|live|seed`、`--scenario <name>`。
-- **schema-compare**：`scripts/schema-compare.mjs`（V1 REQ-008 Step 5）对比官方 `dsh web`
+- **`dshtui bench`**：性能门禁基准（V1 REQ-008 Step 3/A）——**11 项指标**
+  （startup/first_screen/search/scroll p99 + scroll fps + page_flip + 10k 列表
+  搜索·首屏 + RSS 三档），**双产物** JSON `target/perf/perf-report.json` + markdown
+  `target/perf/perf-report.md`（原子写、任一失败 fail-closed）；`--fixture auto`
+  （默认：3080 可达 + DSH_TOKEN → live verified 读真实会话；否则 seed 兜底标注
+  `seed-fallback`）/ `live` / `seed`；10k scale 用确定性合成生成器（D-58）。
+- **schema-compare**：`scripts/schema-compare.mjs`（V1 REQ-008 Step 5/C）对比官方 `dsh web`
   两侧 `typert.remote-client.js`（zod codec bundle）结构 → SchemaDiff JSON
-  （`schema_version:1`，added/removed/changed 按 path 升序，输出可重放）；喂给升级流程与
-  契约冒烟（用法见 README「schema-compare」节）。
+  （`schema_version:1`，added/removed/changed 按 path 升序，输出可重放）；`--mode snapshot`
+  导出**规范 schema 快照 golden**（`schemas/dsh-api-schema-0.1.2-rc.1.json` 已入库，D-63），
+  diff 支持 `--from-snapshot/--to-snapshot`。喂给升级流程与契约冒烟。
+- **export golden**：`fixtures/export-golden/v0.1.2-rc.1/` = 官方同源 HTTP export 的
+  确定性脱敏字节样本（D-65）——`scripts/export-golden-check.sh`（离线 check/capture/
+  live/self-test）+ `live-export-lock.sh --golden`（live-first + golden 离线兜底）。
 - **契约冒烟**：`tests/live_smoke.rs`（连真实后端，需 DSH_TOKEN；默认 ignored）+
-  `tests/api_protocol.rs`/`export_rebuild_proto.rs` 等离线 mock 协议测试。
+  `tests/live_alpha_smoke.rs`（数据无关协议表面，`scripts/ci-live-smoke.sh` 对官方 alpha
+  一次性只读实例跑，D-62）+ `tests/api_protocol.rs`/`export_rebuild_proto.rs` 等离线 mock。
+  `mux` streamId 为**字符串**（官方 validId 要求，见 `src/api/mux.rs`）。
+- **升级信号**：`.github/workflows/upgrade-signal.yml`（每日 + 手动：npm alpha vs
+  last-known-good → 开 24h SLA tracking issue + 内联契约冒烟，D-64）。
 - **空闲停渲染**：`AppState.redraw_pending` 信号 + `should_draw` 事件驱动 draw（Step 2），
   空闲省 CPU。
 
@@ -160,4 +172,5 @@ graph TD
 - 分层入口：`src/lib.rs`（pub api/app/cache/config/input/model/perf/ui）
 - 主入口与编排：`src/main.rs`（CLI/config/日志/`run_connected`/monitor 分派）
 - 集成测试：`tests/`（api_protocol / ui_golden / keymap / model / monitor_protocol /
-  monitor_town / monitor_ui / editor_proto / keymap_override_proto / export_rebuild_proto）
+  monitor_town / monitor_ui / editor_proto / keymap_override_proto / export_rebuild_proto /
+  live_smoke / live_alpha_smoke）

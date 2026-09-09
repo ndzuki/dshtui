@@ -139,9 +139,19 @@ dshtui
 cargo test --all-targets
 
 # 若已 clone 源码并配好 DSH_TOKEN + 本机 dsh web，跑真实后端冒烟（V1 REQ-008 新增；
-# tests/live_smoke.rs 由主会话落地，默认 #[ignore]）
+# tests/live_smoke.rs 默认 #[ignore]）
 cargo test --test live_smoke -- --ignored
+
+# export JSONL live 锁定 + golden 离线复核（D-65；无 token 时 export-golden-check.sh 仍可跑）
+DSH_TOKEN=<token> scripts/live-export-lock.sh --golden
+scripts/export-golden-check.sh            # 离线（无 token 也可跑）
 ```
 
-schema 破坏性变更排查用 `node scripts/schema-compare.mjs --from ... --to ...`
-（V1 REQ-008 新增，见 README「升级兼容流程」）。
+官方新 alpha 升级信号的自动流程见 [README「升级兼容流程」](../README.md#升级兼容流程)
+（`upgrade-signal` workflow 开 24h SLA tracking issue）；无需仓库 secret 的协议表面
+冒烟用 `scripts/ci-live-smoke.sh`（下载官方 alpha → 隔离起只读实例 → 自跑
+`tests/live_alpha_smoke.rs`）。
+
+schema 破坏性变更排查用 `node scripts/schema-compare.mjs --from-snapshot
+schemas/dsh-api-schema-0.1.2-rc.1.json --to <新版 bundle 目录>`（或先 `--mode snapshot`
+导出新 golden；V1 REQ-008 新增，见 README「schema-compare」节）。

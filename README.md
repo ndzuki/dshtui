@@ -11,7 +11,10 @@ ratatui 渲染、vim 风格键位；只读消费本机官方 `dsh web`，不内�
   图片本地软上限、`:edit` 外部编辑器、消息动作（feedback）、模型目录、命令面板；
 - 高级面板：Trajectory、subagent 目录、goal/jobs/settings/skills、@ 提及；
 - 可观测（V1 REQ-008）：perf 日志（RSS/frame p50·p99/search/page/重连）、
-  `dshtui bench` 基准报告、schema-compare 契约对比、契约冒烟测试、空闲停渲染；
+  `dshtui bench` 基准（11 指标 + JSON/md 双报告）、schema-compare + snapshot golden、
+  export golden 离线回归、契约冒烟（live + mock + 官方 alpha 实例）、空闲停渲染；
+- 升级兼容（V1 REQ-008）：`upgrade-signal` workflow（每日检测官方新 alpha → 24h SLA
+  tracking issue + 自动契约冒烟）；
 - 发布（V1 REQ-008）：CI 门禁（fmt/clippy/test + 契约冒烟）+ cargo-dist tag 预编译发布。
 
 ## 功能矩阵
@@ -25,7 +28,7 @@ ratatui 渲染、vim 风格键位；只读消费本机官方 `dsh web`，不内�
 | V0.2 搜索/内容/审批 | REQ-003/004 | `/` 结构化搜索、视觉选择/上下文 yank、approval、turn 大纲导航、Markdown 渲染/代码高亮、图片显示（Kitty/zoom/pager/系统查看器）、草稿 |
 | V0.3 轨迹/工作区/监控 | REQ-005/006/009 | Trajectory 独立投影、model workspace/命令、模型目录（`M`）、命令面板（`:`）、approval 列表、`dshtui monitor` Agent 监控面板 |
 | V0.4 高级会话 | REQ-007 | subagent/父→子发送、goal/jobs/settings/skills、export JSONL（D-46 重建兜底）、消息动作与 feedback、keymap 覆盖、draft 持久化、@ 提及、`:edit` 编辑器链、图片本地软上限、palette |
-| V1 NFR/发布收口 | REQ-008 | 性能门禁 `dshtui bench`（JSON 报告）、perf 日志（七字段行）、schema-compare 契约对比、契约冒烟（live + mock）、export JSONL 行格式锁定、空闲停渲染省 CPU、文件日志轮转、CI 门禁 + cargo-dist tag 发布 |
+| V1 NFR/发布收口 | REQ-008 | 性能门禁 `dshtui bench`（11 指标 + JSON/md 双报告 + 10k scale + live verified）、perf 日志（七字段行）、schema-compare + snapshot golden、契约冒烟（live + mock + 官方 alpha 实例）、export golden 离线回归、export JSONL 行格式锁定、空闲停渲染省 CPU、文件日志轮转、升级信号 workflow（24h SLA）、CI 门禁 + cargo-dist tag 发布 |
 
 ## 快速开始
 
@@ -135,34 +138,56 @@ dshtui monitor [--addr http://127.0.0.1:8799] [--log <file>]
 ### `dshtui bench` —— 性能门禁基准（V1 REQ-008 新增）
 
 ```bash
-dshtui bench [--report <path>] [--fixture auto|live|seed] [--scenario <name>] [--log <file>]
+dshtui bench [--report <path>] [--report-md <path>] [--fixture auto|live|seed] [--scenario <name>]
 ```
 
-- 默认产出 JSON 报告到 `target/perf/perf-report.json`（`--report` 可改路径）；
-- `--fixture`：`auto`（默认）/ `live`（连真实 dsh web）/ `seed`（确定性种子数据）；
-- `--scenario <name>`：运行指定场景（如 search/page/export/长会话渲染等，具体场景名以
-  `dshtui bench --help` 为准）；
-- 报告字段对齐 perf 口径（RSS、帧 p50/p99、search/page 耗时、重连计数等），供 CI 性能门禁判定。
+- 进程内 headless（TestBackend）测量 **11 项 AC-008 指标**，双产物**原子写**：
+  JSON（机器 schema `target/perf/perf-report.json`）+ markdown（人读表
+  `target/perf/perf-report.md`）；`--report`/`--report-md` 可改路径（md 空 =
+  跳过；任一写失败 exit 1 fail-closed）；
+- `--fixture`：`auto`（默认——本机 3080 可达且设 `DSH_TOKEN` → 读真实会话列表做
+  live verified；否则确定性 seed 兜底并标注 `seed-fallback`）/ `live`（强制 live，
+  缺 token/不可达也 seed 兜底不硬失败）/ `seed`（强制确定性，CI 用）；
+- `--scenario <name>`：只跑单个场景（默认全量）。场景名（=报告 metric）：
+  `startup_ms` `first_screen_ms` `search_ms` `scroll_frame_p99_ms` `scroll_fps`
+  `page_flip_ms` `list_10k_search_ms` `list_10k_first_screen_ms` `idle_rss_mb`
+  `stream_rss_mb` `image_rss_mb`；
+- 阈值（REQ 固定，见 `src/bench.rs` THRESHOLDS）：启动 <1000ms、列表首屏 <300ms、
+  搜索 <30ms、滚动 p99 <33ms、滚动 fps ≥15、翻页 <33ms、1 万会话搜索 <30ms/
+  首屏 <300ms、RSS 空闲 <25MB/流式 <80MB/图片密集 <150MB；退出码 0=全 PASS /
+  1=有 FAIL / 2=全 skip（under-scale）。
 
 ### 契约冒烟（V1 REQ-008 新增）
 
 官方 `dsh web` 升级后跑：`tests/live_smoke.rs`（连本机真实 dsh web，需 `DSH_TOKEN` + 运行中的
 后端，ignored 默认；外加 `tests/api_protocol.rs`、`tests/export_rebuild_proto.rs` 等离线 mock）。
+`tests/live_alpha_smoke.rs` 是**数据无关协议表面**冒烟（认证/list envelope/modelCatalog/
+错误信封/export 路由），由 `scripts/ci-live-smoke.sh` 对官方 alpha 一次性只读实例自动跑。
 具体命令见 [docs/install.md](docs/install.md) 与 [docs/contributing.md](docs/contributing.md)。
 
-### schema-compare —— 官方协议 schema 对比（V1 REQ-008）
+### schema-compare —— 官方协议 schema 对比 + snapshot golden（V1 REQ-008）
 
 对比官方 `dsh web` 客户端两侧 `typert.remote-client.js`（zod codec bundle，由
 `@deepseek-ai/dsh-typert-generator` 生成）的结构，产出 `added/removed/changed`
-的 SchemaDiff JSON（`schema_version: 1`）：
+的 SchemaDiff JSON（`schema_version: 1`）。支持 **bundle 直 diff** 与
+**schema snapshot golden diff**（D-63）：
 
 ```bash
+# bundle vs bundle
 node scripts/schema-compare.mjs --from <旧版 dir-or-file> --to <新版 dir-or-file> \
     [--from-version X] [--to-version Y] [--out <path>]
+
+# snapshot vs snapshot（或与 bundle 混用）
+node scripts/schema-compare.mjs --from-snapshot <a.json> --to-snapshot <b.json> [--out <path>]
+
+# 导出规范 schema 快照（golden 入库；确定性字节输出）
+node scripts/schema-compare.mjs --mode snapshot --bundle <dir-or-file> --version X \
+    --out schemas/dsh-api-schema-X.json
 ```
 
-- 输入：单个 `typert.remote-client.js` 或含此类文件的目录（递归收集）；
-- 版本号缺省读就近 `package.json` 的 version；
+- 已入库 golden：`schemas/dsh-api-schema-0.1.2-rc.1.json`（官方 0.1.2-rc.1，
+  16 namespace/74 method/183 entry，确定性）；
+- 输入：单个 `typert.remote-client.js`、含此类文件的目录，或 schema 快照 JSON；
 - 不指定 `--out` 时 SchemaDiff JSON 打到 stdout；指定时原子写；
 - 解析失败/输入无效 → stderr 报错 + exit 1，不产出半成品文件。
 - 完整参数见 `node scripts/schema-compare.mjs --help`。
@@ -182,12 +207,20 @@ ts=<unix-ms> rss_kb=<KB> frame_ms_p50=<..> frame_ms_p99=<..> [search_ms=<..>] [p
 
 官方 `dsh web` 发布新版本时，按以下顺序验证兼容（V1 REQ-008 收口流程）：
 
-1. **schema-compare**：`node scripts/schema-compare.mjs --from <旧> --to <新>`
-   （可加 `--from-version`/`--to-version`/`--out`）对比新旧两侧
-   `typert.remote-client.js` 结构，识别破坏性字段变更；
-2. **契约冒烟**：对变更面跑 mock 协议测试（离线、全量、快），再跑 `tests/live_smoke.rs`
-   连真实后端冒烟；
-3. **修复 SLA**：发现不兼容在 **24 小时内** 修复并合入（export JSONL 行格式已锁定，
+1. **升级信号**（D-64）：`upgrade-signal` workflow 每日 + 手动检测官方 `@deepseek-ai/dsh`
+   新 alpha（vs last-known-good `0.1.2-rc.1`）——发现变化自动开 24h SLA tracking issue
+   并触发 `scripts/ci-live-smoke.sh`（下载该 alpha → 隔离起只读实例 → 数据无关契约
+   表面冒烟，无需仓库 secret）；也可手动 workflow_dispatch 勾选 `upgrade_alpha` 跑同一
+   冒烟。
+2. **schema-compare**：`node scripts/schema-compare.mjs --from-snapshot
+   schemas/dsh-api-schema-0.1.2-rc.1.json --to <新版 bundle 目录>`（或先
+   `--mode snapshot` 导出新 golden）对比结构，识别破坏性字段变更。
+3. **export golden 复核**（D-65）：`scripts/live-export-lock.sh --golden`
+   （或离线 `scripts/export-golden-check.sh`）对新版本官方 export 行格式复核；
+   有变化更新 `fixtures/export-golden/v<版本>/`。
+4. **契约冒烟**：对变更面跑 mock 协议测试（离线、全量、快），再跑 `tests/live_smoke.rs`
+   连真实后端冒烟。
+5. **修复 SLA**：发现不兼容在 **24 小时内** 修复并合入（export JSONL 行格式已锁定，
    变更需走 schema 对比 + 契约测试更新）。
 
 ## 测试质量
@@ -200,17 +233,21 @@ cargo clippy --all-targets --all-features -- -D warnings   # 零告警门禁
 cargo fmt --all -- --check                # 格式门禁
 ```
 
-集成测试在 `tests/`（协议 mock HTTP/WS、模型、keymap、TestBackend golden、export 重建 proto），
-命名风格：`api_protocol` / `ui_golden` / `keymap` / `model` / `monitor_protocol` /
-`export_rebuild_proto`。CI 门禁（fmt/clippy/test + 契约冒烟）见 `.github/workflows/ci.yml`；
-tag 发布（cargo-dist 预编译二进制）见 `.github/workflows/release.yml`（两者随 V1 Step 7 落地）。
+集成测试在 `tests/`（协议 mock HTTP/WS、模型、keymap、TestBackend golden、export 重建 proto、
+live_smoke / live_alpha_smoke 真实/隔离实例冒烟），命名风格：`api_protocol` / `ui_golden` /
+`keymap` / `model` / `monitor_protocol` / `export_rebuild_proto` / `live_smoke` /
+`live_alpha_smoke`。CI 门禁（fmt/clippy/test + 契约冒烟 + upgrade-contract-smoke 可选）见
+`.github/workflows/ci.yml`；官方升级信号 + 24h SLA tracking 见 `.github/workflows/upgrade-signal.yml`；
+tag 发布（cargo-dist 预编译二进制）见 `.github/workflows/release.yml`。
 
 ## 文档导航
 
 | 文档 | 内容 |
 | --- | --- |
-| [docs/install.md](docs/install.md) | 安装（源码 / 预编译 + checksum 校验）、`DSH_TOKEN`、连接本机 dsh web |
+| [docs/install.md](docs/install.md) | 安装（源码 / 预编译 + checksum 校验）、`DSH_TOKEN`、连接本机 dsh web、升级后契约冒烟 |
 | [docs/comparison-dsh-tui.md](docs/comparison-dsh-tui.md) | 与 `@deepseek-harness-tui/dsh-tui`（Node/Ink TUI）对比 |
 | [docs/architecture.md](docs/architecture.md) | 架构分层图与说明、ADR 边界、REQ-008 观测面 |
 | [docs/contributing.md](docs/contributing.md) | 环境、测试、代码风格、commit 规范、评审流程 |
 | `config.example.toml` | 配置示例（含注释） |
+| `schemas/dsh-api-schema-0.1.2-rc.1.json` | 官方协议 schema snapshot golden（D-63） |
+| `fixtures/export-golden/v0.1.2-rc.1/` | export JSONL golden 字节 fixture（D-65，离线回归） |

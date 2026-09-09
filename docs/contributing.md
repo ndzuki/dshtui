@@ -20,7 +20,7 @@ PR 评审 → 合入。评审通过前不直接 push 到受保护分支；PR 目
 
 ```bash
 cargo test --all-targets                                   # 全量（离线 mock 可跑）
-cargo test --all-targets -- --ignored                      # 含 live_smoke（需 DSH_TOKEN + dsh web）
+cargo test --all-targets -- --ignored                      # 含 live_smoke / live_alpha_smoke
 cargo clippy --all-targets --all-features -- -D warnings   # clippy 零告警
 cargo fmt --all -- --check                                 # 格式
 ```
@@ -36,14 +36,29 @@ cargo test --test monitor_protocol        # monitor agent-server mock（REQ-009�
 cargo test --test export_rebuild_proto    # export D-46 重建兜底原型门禁
 cargo test --test editor_proto            # :edit 编辑器链
 cargo test --test keymap_override_proto   # [keymap] 覆盖
+cargo test --lib bench                    # 基准 harness 单测（阈值完整性/方向/10k/md）
+node scripts/schema-compare.test.mjs      # schema 对比 + snapshot golden 自测（80 断言）
+scripts/export-golden-check.sh            # export golden 离线回归（--self-test 负向）
+scripts/headless-smoke.sh                 # 主 TUI 降级路径 headless 冒烟
+```
+
+真实后端冒烟（需 DSH_TOKEN + 运行中的 dsh web）：
+
+```bash
+cargo test --test live_smoke -- --ignored          # 本机真实后端（数据相关契约）
+DSH_TOKEN=... scripts/live-export-lock.sh --golden # export JSONL live 锁定 + golden 复核
+scripts/ci-live-smoke.sh                           # 官方 alpha 一次性只读实例冒烟（无需 secret）
 ```
 
 测试命名风格（tests/ 下）：`api_protocol` / `ui_golden` / `keymap` / `model` /
-`monitor_protocol` / `export_rebuild_proto`；高风险/实验性接缝用 `*_proto.rs`
-throwaway prototype 门禁模式（先原型验证、再进正式层，参考 `export_rebuild_proto.rs`
-头部注释）。集成测试用内联 `TcpListener` mock server，**不依赖真实后端**。
+`monitor_protocol` / `export_rebuild_proto` / `live_smoke` / `live_alpha_smoke`；
+高风险/实验性接缝用 `*_proto.rs` throwaway prototype 门禁模式（先原型验证、再进正式层，
+参考 `export_rebuild_proto.rs` 头部注释）。集成测试用内联 `TcpListener` mock server，
+**不依赖真实后端**（live_* 例外：env 门控 + `#[ignore]`）。
 
-CI 门禁（fmt/clippy/test + 契约冒烟）见 `.github/workflows/ci.yml`（V1 REQ-008 落地）。
+CI 门禁（fmt/clippy/test + 契约冒烟 + upgrade-contract-smoke 可选）见
+`.github/workflows/ci.yml`；官方升级信号 + 24h SLA tracking 见
+`.github/workflows/upgrade-signal.yml`（V1 REQ-008 落地）。
 
 ## 代码风格
 
@@ -110,9 +125,12 @@ PR merge（`Merge pull request #N from ndzuki/task/xxx`），分支命名
 改动触及以下面时**必须**同步对应文档（否则 CI/文档门禁会拦）：
 
 - 协议字段/schema：更新 docs/architecture.md 与 mock 契约测试；官方升级走
-  `node scripts/schema-compare.mjs --from … --to …`（V1 REQ-008）；
-- export JSONL 行格式：格式已锁定，变更必须走 schema 对比 + 契约测试更新；
-- CLI 子命令/选项：更新 `src/config.rs` usage_text 与 README；
+  `node scripts/schema-compare.mjs --from-snapshot … --to …`（快照 diff，V1 REQ-008）；
+  schema golden 变化需重新生成 `schemas/dsh-api-schema-<版本>.json`（`--mode snapshot`）；
+- export JSONL 行格式 / golden：格式已锁定，变更必须走 schema 对比 + 契约测试更新；
+  官方 export 行格式变化需更新 `fixtures/export-golden/v<版本>/`
+  （`scripts/export-golden-check.sh --capture` 再生成）；
+- CLI 子命令/选项（bench/schema-compare）：更新 `src/config.rs` usage_text 与 README；
 - 配置项：更新 `config.example.toml`（带注释与默认值）与 README 配置节；
 - 键位：更新 `input/keymap.rs` 注释/默认表 + README 键位速查；
 - 架构/边界（ADR）：更新 docs/architecture.md。
