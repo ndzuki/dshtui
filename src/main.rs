@@ -656,7 +656,7 @@ async fn run_connected(eff: Effective, token: String, client: DshClient) -> Resu
             // frame_ms p50/p99 反映真实渲染帧率，Notes/06 §8）。
             perf.tick(&app);
         } else {
-            app.idle_redraws += 1;
+            app.record_idle_cycle();
         }
     }
     // REQ-004 退出清理：未入缓存的临时文件（缓存目录由 ImageCache Drop 清理）。
@@ -837,7 +837,9 @@ async fn execute_one(
                 max_messages.min(page_size.max(1)),
             )
             .await;
-            app.last_page_latency_ms = Some(page_start.elapsed().as_secs_f64() * 1000.0);
+            commands.extend(app.handle(AppEvent::PageLatencyMeasured {
+                elapsed_ms: page_start.elapsed().as_secs_f64() * 1000.0,
+            }));
             let event = match result {
                 Ok(page) => AppEvent::PageResult {
                     session_id,
@@ -943,21 +945,18 @@ async fn execute_one(
             };
             // REQ-008 Step 1：检索耗时采集（AC-008-10 search_ms）。
             let search_start = std::time::Instant::now();
-            let event =
-                match session::search(&client.http, &client.base, &query, SEARCH_TIMEOUT).await {
-                    Ok(result) => {
-                        app.last_search_ms = Some(search_start.elapsed().as_secs_f64() * 1000.0);
-                        AppEvent::SearchResult {
-                            generation,
-                            items: result.items,
-                            has_more: result.has_more,
-                        }
-                    }
-                    Err(error) => {
-                        app.last_search_ms = Some(search_start.elapsed().as_secs_f64() * 1000.0);
-                        AppEvent::SearchError { generation, error }
-                    }
-                };
+            let result = session::search(&client.http, &client.base, &query, SEARCH_TIMEOUT).await;
+            commands.extend(app.handle(AppEvent::SearchLatencyMeasured {
+                elapsed_ms: search_start.elapsed().as_secs_f64() * 1000.0,
+            }));
+            let event = match result {
+                Ok(result) => AppEvent::SearchResult {
+                    generation,
+                    items: result.items,
+                    has_more: result.has_more,
+                },
+                Err(error) => AppEvent::SearchError { generation, error },
+            };
             commands.extend(app.handle(event));
         }
         Cmd::DebounceSearch { query, generation } => {
@@ -1772,7 +1771,7 @@ async fn execute_one(
             };
             // REQ-008 Step 1：分页耗时采集（AC-008-10 page_latency_ms）。
             let page_start = std::time::Instant::now();
-            match session::page(
+            let result = session::page(
                 &client.http,
                 &client.base,
                 &SessionAddress::session(&session_id.0),
@@ -1780,10 +1779,12 @@ async fn execute_one(
                 before_seq,
                 LOAD_THROUGH_PAGE_SIZE,
             )
-            .await
-            {
+            .await;
+            commands.extend(app.handle(AppEvent::PageLatencyMeasured {
+                elapsed_ms: page_start.elapsed().as_secs_f64() * 1000.0,
+            }));
+            match result {
                 Ok(page) => {
-                    app.last_page_latency_ms = Some(page_start.elapsed().as_secs_f64() * 1000.0);
                     let has_more = page.has_more;
                     commands.extend(app.handle(AppEvent::LoadThroughPage {
                         session_id: session_id.clone(),
@@ -1792,7 +1793,6 @@ async fn execute_one(
                     }));
                 }
                 Err(error) => {
-                    app.last_page_latency_ms = Some(page_start.elapsed().as_secs_f64() * 1000.0);
                     tracing::warn!(error = %error, "loadThrough 分页失败");
                     app.last_error = Some(format!("跳轮加载失败: {error}"));
                 }

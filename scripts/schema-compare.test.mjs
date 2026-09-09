@@ -267,7 +267,7 @@ if (diff1) {
     JSON.stringify(v1e('session.attachment:param#0')?.fields))
   check('session.control:result summary=union[2]', v1e('session.control:result')?.summary === 'union[2]',
     String(v1e('session.control:result')?.summary))
-  check('session.control:result fields 含两成员对象 key', 
+  check('session.control:result fields 含两成员对象 key',
     JSON.stringify(v1e('session.control:result')?.fields) === JSON.stringify(['type', 'url']),
     JSON.stringify(v1e('session.control:result')?.fields))
 }

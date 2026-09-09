@@ -39,13 +39,9 @@ cargo install --path .          # 等价: cargo build --release && 把 dshtui �
 dshtui --version                # 期望: dshtui 1.0.0
 ```
 
-方式二：预编译二进制（无需本地编译，见 [docs/install.md](docs/install.md)）
+方式二：预编译二进制（无需本地编译）
 
-```bash
-curl -LsSf https://github.com/ndzuki/dshtui/releases/latest/download/dshtui-installer.sh | sh
-```
-
-方式三：手动下载 cargo-dist releases 产物 + checksum 校验，详见 [docs/install.md](docs/install.md)。
+从 GitHub Releases 下载 `x86_64-unknown-linux-gnu` tarball 及对应 `.sha256`，校验后解压安装。V1 当前 `installers = []`，**不发布** `dshtui-installer.sh`；完整命令见 [docs/install.md](docs/install.md)。
 
 ## 配置
 

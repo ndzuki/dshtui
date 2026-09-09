@@ -942,6 +942,16 @@ pub enum AppEvent {
         generation: u64,
         error: ClientError,
     },
+    /// REQ-008 AC-008-10：远程 `session/search` 完成耗时，由 transport
+    /// 测量后经 reducer 写入 perf 观测状态。
+    SearchLatencyMeasured {
+        elapsed_ms: f64,
+    },
+    /// REQ-008 AC-008-10：`session/page` 完成耗时，由 transport 测量后经
+    /// reducer 写入 perf 观测状态。
+    PageLatencyMeasured {
+        elapsed_ms: f64,
+    },
     /// 转发的 `approval/request` waterfall 事件（AC-003-07）。
     ApprovalRequest {
         event: ApprovalEvent,
@@ -3226,7 +3236,12 @@ impl AppState {
 
     /// 记录一次实际 draw（主循环 draw 后调用；headless/单测可观测 draw 数）。
     pub fn record_draw(&mut self) {
-        self.draw_count += 1;
+        self.draw_count = self.draw_count.saturating_add(1);
+    }
+
+    /// 记录一次空闲循环（未 draw）；状态更新仍收敛在 AppState 公共接口内。
+    pub fn record_idle_cycle(&mut self) {
+        self.idle_redraws = self.idle_redraws.saturating_add(1);
     }
 
     /// 主循环 draw 决策（AC-008-04 空闲停渲染）：有命令/输入/事件待处理或
@@ -3671,6 +3686,14 @@ impl AppState {
                         self.search.history_error = Some(format!("全历史搜索失败: {msg}"));
                     }
                 }
+                vec![]
+            }
+            AppEvent::SearchLatencyMeasured { elapsed_ms } => {
+                self.last_search_ms = Some(elapsed_ms);
+                vec![]
+            }
+            AppEvent::PageLatencyMeasured { elapsed_ms } => {
+                self.last_page_latency_ms = Some(elapsed_ms);
                 vec![]
             }
             AppEvent::ApprovalRequest { event } => {
@@ -7467,6 +7490,9 @@ mod tests {
         let mut s = AppState::default();
         s.record_draw();
         assert_eq!(s.draw_count, 1);
+        s.record_idle_cycle();
+        assert_eq!(s.idle_redraws, 1);
+        assert_eq!(s.draw_count, 1, "空闲迭代不应增加 draw_count");
         // mark_redraw → needs_redraw
         s.mark_redraw();
         assert!(s.needs_redraw());
@@ -7500,6 +7526,15 @@ mod tests {
         s.search.query = "x".to_string();
         s.recompute_window_matches();
         assert!(s.last_search_ms.is_some(), "本地 nucleo query 后应记录耗时");
+    }
+
+    #[test]
+    fn transport_latency_events_update_perf_state_through_reducer_ac008_10() {
+        let mut s = AppState::default();
+        s.handle(AppEvent::SearchLatencyMeasured { elapsed_ms: 12.5 });
+        s.handle(AppEvent::PageLatencyMeasured { elapsed_ms: 8.25 });
+        assert_eq!(s.last_search_ms, Some(12.5));
+        assert_eq!(s.last_page_latency_ms, Some(8.25));
     }
 
     #[test]

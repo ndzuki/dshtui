@@ -51,8 +51,8 @@ jobs:
       - name: fmt 检查（AC-008-18）
         run: cargo fmt --all -- --check
 
-      - name: clippy 全 target（-D warnings，AC-008-18）
-        run: cargo clippy --all-targets -- -D warnings
+      - name: clippy 全 target/all features（-D warnings，AC-008-18）
+        run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: cargo test --all-targets（单元 + tests/ 全部 mock 集成测试）
         run: cargo test --all-targets

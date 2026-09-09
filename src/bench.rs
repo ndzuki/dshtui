@@ -288,7 +288,6 @@ fn run_scaled(cfg: &BenchConfig, scale: Scale) -> (PerfReport, i32) {
     }
 
     let summary = summarize(&results);
-    let exit = exit_code_for(&results);
 
     let report = PerfReport {
         schema_version: REPORT_SCHEMA_VERSION,
@@ -304,7 +303,13 @@ fn run_scaled(cfg: &BenchConfig, scale: Scale) -> (PerfReport, i32) {
         summary,
     };
 
-    write_report(&cfg.report_path, &report);
+    let write_ok = write_report(&cfg.report_path, &report);
+    let mut exit = exit_code_for(&report.results);
+    if !write_ok {
+        // 报告是性能门禁的审计产物；写盘失败必须 fail-closed，不能以
+        // stdout 摘要冒充可复核的 PASS 报告（REQ-008 错误模型）。
+        exit = 1;
+    }
     (report, exit)
 }
 
@@ -333,21 +338,22 @@ fn summarize(results: &[MetricResult]) -> String {
 }
 
 /// 原子写报告：同目录 `<name>.report.tmp` + rename；路径为空 = 不写只返回。
-/// 序列化/写盘失败只警告不退出（报告已在内存，exit 由结果决定）。
-fn write_report(path: &Path, report: &PerfReport) {
+/// 序列化/写盘失败返回 false，由调用方 fail-closed。
+fn write_report(path: &Path, report: &PerfReport) -> bool {
     if path.as_os_str().is_empty() {
-        return;
+        return true;
     }
     if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            let _ = std::fs::create_dir_all(parent);
+        if !parent.as_os_str().is_empty() && std::fs::create_dir_all(parent).is_err() {
+            eprintln!("警告: 报告目录创建失败（路径 {}）", path.display());
+            return false;
         }
     }
     let json = match serde_json::to_string_pretty(report) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("警告: PerfReport 序列化失败: {e}");
-            return;
+            return false;
         }
     };
     let tmp = path.with_extension("report.tmp");
@@ -356,6 +362,7 @@ fn write_report(path: &Path, report: &PerfReport) {
         let _ = std::fs::remove_file(&tmp);
         eprintln!("警告: 报告写入失败（路径 {}）", path.display());
     }
+    ok
 }
 
 /// stdout 摘要（main 在 --report 省略时也调用；每行 metric/measured/pass）。
@@ -948,6 +955,21 @@ mod tests {
         // tmp 文件不残留。
         assert!(!path.with_extension("report.tmp").exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn report_write_failure_is_nonzero_and_fail_closed() {
+        let root =
+            std::env::temp_dir().join(format!("dshtui-bench-write-fail-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let parent_file = root.join("parent-file");
+        std::fs::write(&parent_file, b"not a directory").unwrap();
+        let report_path = parent_file.join("perf.json");
+        let (report, exit) = run_scaled(&seed_cfg(report_path.clone()), tiny_scale());
+        assert!(report.summary.contains("PASS"));
+        assert_eq!(exit, 1, "报告写失败必须 fail-closed");
+        assert!(!report_path.exists());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

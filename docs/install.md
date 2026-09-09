@@ -59,16 +59,11 @@ dshtui --help
 每个 tag 发布由 `.github/workflows/release.yml`（cargo-dist）产出预编译产物到 GitHub
 Releases（`https://github.com/ndzuki/dshtui/releases`）。
 
-### 1. 官方一键安装器（推荐，若发布启用）
+### 1. 手动下载 + checksum 校验
 
-```bash
-curl -LsSf https://github.com/ndzuki/dshtui/releases/latest/download/dshtui-installer.sh | sh
-```
-
-> 安装器与产物命名以 cargo-dist 配置为准（V1 REQ-008 发布落地后核对）。若该 installer
-> 未随发布产出，请走下面的手动下载路径。
-
-### 2. 手动下载 + checksum 校验
+> V1 当前 cargo-dist 配置为 `installers = []`，只发布归档与校验和，不生成
+> `dshtui-installer.sh`。以后若启用 installer，必须先同步 Cargo.toml、release workflow
+> 与本安装文档。
 
 cargo-dist 产物命名形如：
 
