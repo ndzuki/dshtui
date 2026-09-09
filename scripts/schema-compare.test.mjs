@@ -16,12 +16,23 @@
  *     - 错误路径：输入不存在 / 零条 schema → stderr 报错 + exit 1 + 不产 out 文件。
  *  3. 真实 bundle 冒烟：--from 与 --to 指向同一个真实 session-controller
  *     typert.remote-client.js → added/removed/changed 全空、exit 0。
+ *  4. snapshot 模式（--mode snapshot，fixture 临时目录）：
+ *     - 同一 bundle 两次导出 → sha256/字节一致（确定性、规范格式、key 字典序）；
+ *     - 快照文件可解析回同一树：快照-vs-快照（同一快照）→ 空 diff、exit 0；
+ *     - bundle-vs-快照 双向混用 → 与 from==to 一致（空 diff）；
+ *     - 合成变异快照：删一个 method / 加一个假 method / 改一条 summary /
+ *       删整个 namespace → removed/added/changed 恰含对应 path；
+ *     - 错误路径：--mode snapshot 输入不存在 / 缺 --out / 缺 --version /
+ *       diff 侧快照文件不存在 / --from 与 --from-snapshot 冲突 /
+ *       版本参数配快照侧 / snapshot 模式带 diff 参数 / schema_version≠1 →
+ *       exit 1（+ 不产半成品文件）。
  */
 
 import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import { spawnSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 
 import { parseBundleText, diffSides, pkgKeyFromName } from './schema-compare.mjs'
@@ -399,6 +410,224 @@ if (fs.existsSync(REAL_SESSION)) {
   }
 } else {
   console.log('  skip 未找到真实 bundle（非本机环境），跳过真实冒烟')
+}
+
+// ---------------------------------------------------------------------------
+// 4. snapshot 模式：确定性导出 / 快照 diff（同快照空 diff、变异 added/removed/
+//    changed）/ bundle-vs-快照混用 / 错误路径
+// ---------------------------------------------------------------------------
+
+console.log('\n== 4. snapshot 模式 + 快照 diff ==')
+
+const snapRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'schema-snapshot-test-'))
+try {
+  // 用与第 2 节相同的 fixture bundle 目录生成快照（同一解析路径）
+  const bundleDir = path.join(snapRoot, 'fake-session-v1')
+  fs.mkdirSync(bundleDir, { recursive: true })
+  fs.writeFileSync(path.join(bundleDir, 'package.json'), pkgJson(FAKE_PKG_NAME, '1.0.0'))
+  fs.writeFileSync(path.join(bundleDir, 'typert.remote-client.js'), FIXTURE_V1)
+
+  const snapA = path.join(snapRoot, 'snap-A.json')
+  const snapB = path.join(snapRoot, 'snap-B.json')
+
+  // 4a. 确定性导出：同一输入两次运行 → sha256/字节一致 + 规范格式（key 字典序）
+  const s1 = runCli(['--mode', 'snapshot', '--bundle', bundleDir, '--version', '1.0.0', '--out', snapA])
+  const s2 = runCli(['--mode', 'snapshot', '--bundle', bundleDir, '--version', '1.0.0', '--out', snapB])
+  check('snapshot 导出 ×2 exit 0',
+    s1.status === 0 && s2.status === 0,
+    `exit=${s1.status}/${s2.status} stderr=${s1.stderr}${s2.stderr}`)
+
+  const hashOf = (p) => createHash('sha256').update(fs.readFileSync(p)).digest('hex')
+  let hasA = ''
+  if (s1.status === 0 && s2.status === 0) {
+    hasA = hashOf(snapA)
+    check('snapshot 两次运行 sha256 一致（确定性）', hasA === hashOf(snapB), `A=${hasA}\nB=${hashOf(snapB)}`)
+    check('snapshot 两次运行文件字节一致', fs.readFileSync(snapA).equals(fs.readFileSync(snapB)))
+  }
+
+  let snapJson = null
+  if (s1.status === 0) {
+    try { snapJson = JSON.parse(fs.readFileSync(snapA, 'utf8')) } catch (e) { check('快照 JSON 可解析', false, e.message) }
+  }
+  if (snapJson) {
+    check('快照顶层 schema_version===1 且 version 内嵌',
+      snapJson.schema_version === 1 && snapJson.version === '1.0.0',
+      JSON.stringify({ schema_version: snapJson.schema_version, version: snapJson.version }))
+    check('快照顶层 key 字典序', JSON.stringify(Object.keys(snapJson)) === JSON.stringify(['namespaces', 'schema_version', 'version']))
+    const ns = snapJson.namespaces || {}
+    check('快照 namespaces 恰含 session 与 fileReferences',
+      JSON.stringify(Object.keys(ns)) === JSON.stringify(['fileReferences', 'session']),
+      `got ${JSON.stringify(Object.keys(ns))}`)
+    if (ns.session && ns.session.methods) {
+      check('快照 session.methods key 字典序（attachment/control）',
+        JSON.stringify(Object.keys(ns.session.methods)) === JSON.stringify(['attachment', 'control']),
+        `got ${JSON.stringify(Object.keys(ns.session.methods))}`)
+    }
+    const fl = ns.fileReferences && ns.fileReferences.methods && ns.fileReferences.methods.list
+    if (fl && Array.isArray(fl.parameter)) {
+      check('快照 parameter 按 index 升序（0,1）',
+        fl.parameter.length === 2 && fl.parameter[0].index === 0 && fl.parameter[1].index === 1,
+        JSON.stringify(fl.parameter.map((p) => p.index)))
+      check('快照叶子条目 key 字典序（fields/index/summary）',
+        JSON.stringify(Object.keys(fl.parameter[0] || {})) === JSON.stringify(['fields', 'index', 'summary']),
+        JSON.stringify(Object.keys(fl.parameter[0] || {})))
+      check('快照摘要/字段与 bundle 解析一致',
+        fl.parameter[0].summary === 'object{prefix,recursive}' && JSON.stringify(fl.parameter[0].fields) === JSON.stringify(['prefix', 'recursive']) &&
+          fl.result.summary === 'array' && JSON.stringify(fl.result.fields) === JSON.stringify(['path', 'kind']),
+        JSON.stringify(fl))
+    }
+  }
+
+  // 4b. 快照-vs-快照（同一快照）→ 空 diff、exit 0；版本号内嵌透传
+  const rt = runCli(['--from-snapshot', snapA, '--to-snapshot', snapB])
+  check('同快照 from-snapshot/to-snapshot exit 0', rt.status === 0, `exit=${rt.status} stderr=${rt.stderr}`)
+  let rtDiff = null
+  try { rtDiff = JSON.parse(rt.stdout) } catch { check('同快照 diff stdout 为合法 JSON', false, rt.stdout.slice(0, 200)) }
+  if (rtDiff) {
+    check('同快照 diff → added/removed/changed 全空',
+      rtDiff.added.length === 0 && rtDiff.removed.length === 0 && rtDiff.changed.length === 0,
+      JSON.stringify({ a: rtDiff.added.length, r: rtDiff.removed.length, c: rtDiff.changed.length }))
+    check('快照 diff 版本号读自快照文件（1.0.0/1.0.0）',
+      rtDiff.from_version === '1.0.0' && rtDiff.to_version === '1.0.0',
+      `got ${rtDiff.from_version}/${rtDiff.to_version}`)
+  }
+
+  // 4c. bundle-vs-快照 双向混用 → 与 bundle from==to 一致（空 diff）
+  const mx1 = runCli(['--from', bundleDir, '--to-snapshot', snapA])
+  const mx2 = runCli(['--from-snapshot', snapA, '--to', bundleDir])
+  check('bundle-vs-快照 双向 exit 0', mx1.status === 0 && mx2.status === 0, `exit=${mx1.status}/${mx2.status}`)
+  const emptyDiff = (s) => {
+    try {
+      const d = JSON.parse(s.stdout)
+      return d && d.added.length === 0 && d.removed.length === 0 && d.changed.length === 0
+    } catch { return false }
+  }
+  check('bundle-vs-快照 双向空 diff（与 bundle from==to 一致）', emptyDiff(mx1) && emptyDiff(mx2),
+    `mx1 stderr=${mx1.stderr} mx2 stderr=${mx2.stderr}`)
+
+  // 4d. 合成变异快照 → removed/added/changed 命中对应 path
+  const readSnap = (p) => JSON.parse(fs.readFileSync(p, 'utf8'))
+  const writeSnap = (p, obj) => fs.writeFileSync(p, `${JSON.stringify(obj, null, 2)}\n`)
+  const pathsOf = (arr) => arr.map((x) => x.path).sort()
+  const setEq = (a, b) => JSON.stringify([...a].sort()) === JSON.stringify([...b].sort())
+
+  // 4d-1. 删一个 method（session.attachment）→ removed 恰含其 param/result
+  const mDel = readSnap(snapA)
+  delete mDel.namespaces.session.methods.attachment
+  const snapDel = path.join(snapRoot, 'snap-del.json')
+  writeSnap(snapDel, mDel)
+  const rd = runCli(['--from-snapshot', snapA, '--to-snapshot', snapDel])
+  check('删 method → exit 0', rd.status === 0, `exit=${rd.status} stderr=${rd.stderr}`)
+  let rdDiff = null
+  try { rdDiff = JSON.parse(rd.stdout) } catch { check('删 method diff 可解析', false, rd.stdout.slice(0, 200)) }
+  if (rdDiff) {
+    const expectRemoved = ['session.attachment:param#0', 'session.attachment:result']
+    check('删 method → removed 恰含 session.attachment 两条',
+      setEq(pathsOf(rdDiff.removed), expectRemoved),
+      `got ${JSON.stringify(pathsOf(rdDiff.removed))}`)
+    check('删 method → added/changed 全空',
+      rdDiff.added.length === 0 && rdDiff.changed.length === 0,
+      JSON.stringify({ a: rdDiff.added.length, c: rdDiff.changed.length }))
+  }
+
+  // 4d-2. 加一个假 method（session.hologram）→ added 恰含其 param/result
+  const mAdd = readSnap(snapA)
+  mAdd.namespaces.session.methods.hologram = {
+    parameter: [{ fields: ['beam'], index: 0, summary: 'object{beam}' }],
+    result: { fields: ['accepted'], summary: 'boolean' },
+  }
+  const snapAdd = path.join(snapRoot, 'snap-add.json')
+  writeSnap(snapAdd, mAdd)
+  const ra = runCli(['--from-snapshot', snapA, '--to-snapshot', snapAdd])
+  check('加 method → exit 0', ra.status === 0, `exit=${ra.status} stderr=${ra.stderr}`)
+  let raDiff = null
+  try { raDiff = JSON.parse(ra.stdout) } catch { check('加 method diff 可解析', false, ra.stdout.slice(0, 200)) }
+  if (raDiff) {
+    const expectAdded = ['session.hologram:param#0', 'session.hologram:result']
+    check('加 method → added 恰含 session.hologram 两条',
+      setEq(pathsOf(raDiff.added), expectAdded),
+      `got ${JSON.stringify(pathsOf(raDiff.added))}`)
+    check('加 method → removed/changed 全空',
+      raDiff.removed.length === 0 && raDiff.changed.length === 0,
+      JSON.stringify({ r: raDiff.removed.length, c: raDiff.changed.length }))
+  }
+
+  // 4d-3. 改一条 summary（session.control:result union[2]→union[3]）→ changed 命中
+  const mChg = readSnap(snapA)
+  mChg.namespaces.session.methods.control.result.summary = 'union[3]'
+  const snapChg = path.join(snapRoot, 'snap-chg.json')
+  writeSnap(snapChg, mChg)
+  const rc = runCli(['--from-snapshot', snapA, '--to-snapshot', snapChg])
+  check('改 summary → exit 0', rc.status === 0, `exit=${rc.status} stderr=${rc.stderr}`)
+  let rcDiff = null
+  try { rcDiff = JSON.parse(rc.stdout) } catch { check('改 summary diff 可解析', false, rc.stdout.slice(0, 200)) }
+  if (rcDiff) {
+    const ch = rcDiff.changed.find((x) => x.path === 'session.control:result')
+    check('改 summary → changed 恰含 session.control:result（union[2]→union[3]）',
+      rcDiff.changed.length === 1 && ch && ch.from === 'union[2]' && ch.to === 'union[3]',
+      JSON.stringify(rcDiff.changed))
+    check('改 summary → added/removed 全空',
+      rcDiff.added.length === 0 && rcDiff.removed.length === 0,
+      JSON.stringify({ a: rcDiff.added.length, r: rcDiff.removed.length }))
+  }
+
+  // 4d-4. 删整个 namespace（fileReferences）→ removed 恰含其 3 条
+  const mNs = readSnap(snapA)
+  delete mNs.namespaces.fileReferences
+  const snapNs = path.join(snapRoot, 'snap-ns.json')
+  writeSnap(snapNs, mNs)
+  const rn = runCli(['--from-snapshot', snapA, '--to-snapshot', snapNs])
+  check('删 namespace → exit 0', rn.status === 0, `exit=${rn.status} stderr=${rn.stderr}`)
+  let rnDiff = null
+  try { rnDiff = JSON.parse(rn.stdout) } catch { check('删 namespace diff 可解析', false, rn.stdout.slice(0, 200)) }
+  if (rnDiff) {
+    const expectRemoved = ['fileReferences.list:param#0', 'fileReferences.list:param#1', 'fileReferences.list:result']
+    check('删 namespace → removed 恰含 fileReferences.list 三条',
+      setEq(pathsOf(rnDiff.removed), expectRemoved),
+      `got ${JSON.stringify(pathsOf(rnDiff.removed))}`)
+  }
+
+  // 4e. 错误路径（一律 exit 1 + 不产半成品文件）
+  const errSnap = path.join(snapRoot, 'err-snap.json')
+  const e1 = runCli(['--mode', 'snapshot', '--bundle', path.join(snapRoot, 'no-such-dir'), '--version', '1.0.0', '--out', errSnap])
+  check('snapshot 模式 输入不存在 → exit 1', e1.status === 1, `exit=${e1.status}`)
+  check('snapshot 模式 输入不存在 → stderr 明确报错', /不存在/.test(e1.stderr), e1.stderr)
+  check('snapshot 模式 输入不存在 → 不产 out/.tmp', !fs.existsSync(errSnap) && !fs.existsSync(`${errSnap}.tmp`))
+
+  const e2 = runCli(['--mode', 'snapshot', '--bundle', bundleDir, '--version', '1.0.0'])
+  check('snapshot 模式 缺 --out → exit 1', e2.status === 1, `exit=${e2.status}`)
+  check('snapshot 模式 缺 --out → stderr 提示', /--out/.test(e2.stderr), e2.stderr)
+
+  const e3Out = path.join(snapRoot, 'e3.json')
+  const e3 = runCli(['--mode', 'snapshot', '--bundle', bundleDir, '--out', e3Out])
+  check('snapshot 模式 缺 --version → exit 1', e3.status === 1, `exit=${e3.status}`)
+  check('snapshot 模式 缺 --version → stderr 提示', /--version/.test(e3.stderr), e3.stderr)
+  check('snapshot 模式 缺 --version → 不产 out 文件', !fs.existsSync(e3Out))
+
+  const e4 = runCli(['--from-snapshot', path.join(snapRoot, 'no-such-snap.json'), '--to-snapshot', snapA])
+  check('diff 快照文件不存在 → exit 1', e4.status === 1, `exit=${e4.status}`)
+  check('diff 快照文件不存在 → stderr 报错', /快照/.test(e4.stderr), e4.stderr)
+
+  const e5 = runCli(['--from', bundleDir, '--from-snapshot', snapA, '--to', bundleDir])
+  check('--from 与 --from-snapshot 同给 → exit 1', e5.status === 1, `exit=${e5.status}`)
+
+  const e6 = runCli(['--from-snapshot', snapA, '--from-version', 'X', '--to', bundleDir])
+  check('版本参数配快照侧 → exit 1', e6.status === 1, `exit=${e6.status}`)
+
+  const e7 = runCli(['--mode', 'snapshot', '--bundle', bundleDir, '--version', '1.0.0', '--out', errSnap, '--from', bundleDir])
+  check('snapshot 模式带 diff 参数 → exit 1', e7.status === 1, `exit=${e7.status}`)
+  check('snapshot 模式带 diff 参数 → 不产 out 文件', !fs.existsSync(errSnap))
+
+  const badSchema = path.join(snapRoot, 'bad-schema.json')
+  fs.writeFileSync(badSchema, '{"schema_version":2,"version":"x","namespaces":{}}\n')
+  const e8 = runCli(['--from-snapshot', badSchema, '--to-snapshot', snapA])
+  check('schema_version≠1 的快照 → exit 1', e8.status === 1, `exit=${e8.status}`)
+
+  const h = runCli(['--help'])
+  check('--help 展示 snapshot/快照用法', h.status === 0 && /--mode snapshot/.test(h.stdout) && /--from-snapshot/.test(h.stdout),
+    `exit=${h.status}`)
+} finally {
+  fs.rmSync(snapRoot, { recursive: true, force: true })
 }
 
 // ---------------------------------------------------------------------------

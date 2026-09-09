@@ -43,18 +43,31 @@
  *
  * 用法
  * ```
+ * # diff 模式（缺省）：对比两个版本（bundle 包树/单文件，或 schema 快照 JSON）
  * node scripts/schema-compare.mjs --from <dir-or-file> --to <dir-or-file> \
  *     [--from-version X] [--to-version Y] [--out path]
+ * node scripts/schema-compare.mjs --from-snapshot <file> --to-snapshot <file> [--out path]
+ *
+ * # snapshot 模式：把一份 bundle 导出为规范 schema 快照 JSON（golden 入库用）
+ * node scripts/schema-compare.mjs --mode snapshot --bundle <dir-or-file> \
+ *     --version X --out schemas/dsh-api-schema-X.json
  * ```
- * - 输入可以是单个 typert.remote-client.js 文件，也可以是包含此类文件的目录
+ * - bundle 输入可以是单个 typert.remote-client.js 文件，也可以是包含此类文件的目录
  *   （递归收集所有 basename 以 `typert.remote-client.js` 结尾的文件）。
- * - 版本号：优先 --from-version/--to-version；缺省读 package.json 的 version
- *   （输入为包目录时读目录根 package.json；否则读首个 bundle 就近的 package.json）；
- *   都取不到时为字符串 "unknown"。
+ * - 版本号（diff 的 bundle 侧）：优先 --from-version/--to-version；缺省读 package.json
+ *   的 version（输入为包目录时读目录根 package.json；否则读首个 bundle 就近的
+ *   package.json）；都取不到时为字符串 "unknown"。snapshot 侧版本内嵌于快照文件，
+ *   不接受 --*-version 覆盖；snapshot 模式用 --version 显式指定（必填）。
+ * - schema 快照（snapshot 模式产物 / --from-snapshot|--to-snapshot 输入）：
+ *   与 diff 同一棵 namespace·method·field 解析树（复用 loadSide 收集 + 条目去重），
+ *   序列化为确定格式 JSON——对象 key 全部字典序、namespace/method 名排序、parameter
+ *   按 index 排序，因此同一输入两次运行字节一致（可作 commit 资产做跨版本 diff）。
  * - --out：原子写（同目录 `<path>.tmp` + rename，参照项目 config::atomic_write_0600
- *   同目录 rename 惯例；此处权限 0644 即可）。未指定时 SchemaDiff JSON 打到 stdout。
+ *   同目录 rename 惯例；此处权限 0644 即可）。未指定时 SchemaDiff JSON 打到 stdout；
+ *   snapshot 模式的 --out 必填（不做 stdout 导出）。
  * - 错误处理：输入路径不存在 / 无匹配文件 / 解析到零条 schema / bundle 语法无法解析
- *   （括号不平衡、pkg 前缀无法确定等）→ stderr 明确报错、exit code 1，
+ *   （括号不平衡、pkg 前缀无法确定等）/ 快照 JSON 非法（schema_version ≠ 1、缺 version、
+ *   结构坏、重复 path）→ stderr 明确报错、exit code 1，
  *   且不会产出半成品文件（所有解析与校验先于原子写完成）。成功 exit code 0。
  *
  * 运行约束：node ESM、顶层 await/import、零第三方依赖；模块同时可被
@@ -648,6 +661,186 @@ export function loadSide(input, versionHint) {
 }
 
 // ---------------------------------------------------------------------------
+// schema 快照（snapshot）：规范 JSON 导出 / 反序列化回 side
+// ---------------------------------------------------------------------------
+//
+// 快照 JSON 形如（schema_version 固定 1；对象 key 全部字典序，namespace/method 名
+// 排序，parameter 按 index 排序 → 同一输入两次运行字节一致）：
+// ```json
+// {
+//   "namespaces": {
+//     "<ns>": {
+//       "methods": {
+//         "<method>": {
+//           "parameter": [
+//             { "fields": ["a", "b"], "index": 0, "summary": "object{a,b}" }
+//           ],
+//           "result": { "fields": ["c"], "summary": "string.optional" }
+//         }
+//       }
+//     }
+//   },
+//   "schema_version": 1,
+//   "version": "0.1.2-rc.1"
+// }
+// ```
+// 叶子数据与 loadSide/parseBundleText 产出的条目一一对应（fields/summary 原样保存），
+// 因此 flattenNamespaceTree 可无损重建 `{ entries, version }`——快照-vs-快照 与
+// bundle-vs-bundle 走同一条 diffSides，结果一致。
+
+/**
+ * 把扁平条目列表组装成规范 namespaces 树（namespace/method 字典序、parameter 按 index
+ * 排序；叶子/结构对象的 key 均按字典序书写，输出天然可复现）。
+ */
+export function buildNamespaceTree(entries) {
+  const nsMap = new Map() // ns → Map(method → Map(kind → data))
+  for (const e of entries) {
+    let methodMap = nsMap.get(e.namespace)
+    if (!methodMap) {
+      methodMap = new Map()
+      nsMap.set(e.namespace, methodMap)
+    }
+    let kindMap = methodMap.get(e.method)
+    if (!kindMap) {
+      kindMap = new Map()
+      methodMap.set(e.method, kindMap)
+    }
+    if (e.kind === 'parameter') {
+      let arr = kindMap.get('parameter')
+      if (!arr) {
+        arr = []
+        kindMap.set('parameter', arr)
+      }
+      arr.push({ fields: e.fields, index: e.index, summary: e.summary })
+    } else {
+      kindMap.set('result', { fields: e.fields, summary: e.summary })
+    }
+  }
+  const out = {}
+  for (const ns of [...nsMap.keys()].sort()) {
+    const methodsOut = {}
+    const methodMap = nsMap.get(ns)
+    for (const method of [...methodMap.keys()].sort()) {
+      const kindMap = methodMap.get(method)
+      const mOut = {}
+      const params = kindMap.get('parameter')
+      if (params) {
+        mOut.parameter = [...params].sort((a, b) => a.index - b.index)
+      }
+      const result = kindMap.get('result')
+      if (result) mOut.result = result
+      methodsOut[method] = mOut
+    }
+    out[ns] = { methods: methodsOut }
+  }
+  return out
+}
+
+/** 由一侧输入（loadSide/loadSnapshotFile 返回的 side）构造快照对象。 */
+export function makeSnapshot(side) {
+  return {
+    namespaces: buildNamespaceTree(side.entries),
+    schema_version: 1,
+    version: side.version ?? 'unknown',
+  }
+}
+
+/** 把快照 JSON 的 namespaces 树展开回扁平条目列表（带结构校验），非法 → 抛错。 */
+export function flattenNamespaceTree(namespaces, where = '') {
+  const ctx = where ? `（${where}）` : ''
+  if (!namespaces || typeof namespaces !== 'object' || Array.isArray(namespaces)) {
+    throw new Error(`快照缺少 namespaces 对象${ctx}`)
+  }
+  const entries = []
+  const push = (e) => {
+    e.path = entryPath(e.namespace, e.method, e.kind, e.index)
+    entries.push(e)
+  }
+  for (const [nsName, nsVal] of Object.entries(namespaces)) {
+    if (
+      !nsVal || typeof nsVal !== 'object' || Array.isArray(nsVal) ||
+      !nsVal.methods || typeof nsVal.methods !== 'object' || Array.isArray(nsVal.methods)
+    ) {
+      throw new Error(`快照 namespace "${nsName}" 结构非法（需 { methods: {...} }）${ctx}`)
+    }
+    for (const [methodName, mVal] of Object.entries(nsVal.methods)) {
+      if (!mVal || typeof mVal !== 'object' || Array.isArray(mVal)) {
+        throw new Error(`快照 method "${nsName}.${methodName}" 结构非法${ctx}`)
+      }
+      const params = mVal.parameter === undefined ? [] : mVal.parameter
+      if (!Array.isArray(params)) {
+        throw new Error(`快照 method "${nsName}.${methodName}" 的 parameter 必须是数组${ctx}`)
+      }
+      for (const [i, p] of params.entries()) {
+        const ok =
+          p && typeof p === 'object' && !Array.isArray(p) &&
+          Number.isInteger(p.index) && p.index >= 0 &&
+          Array.isArray(p.fields) && p.fields.every((f) => typeof f === 'string') &&
+          typeof p.summary === 'string'
+        if (!ok) {
+          throw new Error(
+            `快照 method "${nsName}.${methodName}" 第 ${i} 个 parameter 条目结构非法（需 { index, fields, summary }）${ctx}`,
+          )
+        }
+        push({ namespace: nsName, method: methodName, kind: 'parameter', index: p.index, fields: p.fields, summary: p.summary })
+      }
+      if (mVal.result !== undefined) {
+        const r = mVal.result
+        const ok =
+          r && typeof r === 'object' && !Array.isArray(r) &&
+          Array.isArray(r.fields) && r.fields.every((f) => typeof f === 'string') &&
+          typeof r.summary === 'string'
+        if (!ok) {
+          throw new Error(
+            `快照 method "${nsName}.${methodName}" 的 result 条目结构非法（需 { fields, summary }）${ctx}`,
+          )
+        }
+        push({ namespace: nsName, method: methodName, kind: 'result', fields: r.fields, summary: r.summary })
+      }
+    }
+  }
+  return entries
+}
+
+/**
+ * 加载快照 JSON 文件 → side（{ input, files, entries, version }），供 diff 使用。
+ * 校验：schema_version===1、非空 version、namespaces 结构、无重复 path、零条报错。
+ */
+export function loadSnapshotFile(filePath) {
+  let raw
+  try {
+    raw = fs.readFileSync(filePath, 'utf8')
+  } catch (e) {
+    throw new Error(`无法读取快照文件 ${filePath}: ${e.message}`)
+  }
+  let snap
+  try {
+    snap = JSON.parse(raw)
+  } catch (e) {
+    throw new Error(`快照文件不是合法 JSON: ${filePath}（${e.message}）`)
+  }
+  if (!snap || typeof snap !== 'object' || Array.isArray(snap)) {
+    throw new Error(`快照文件顶层必须是 JSON 对象: ${filePath}`)
+  }
+  if (snap.schema_version !== 1) {
+    throw new Error(`快照 schema_version 不是 1（本工具仅支持 schema_version:1，got ${String(snap.schema_version)}）: ${filePath}`)
+  }
+  if (typeof snap.version !== 'string' || snap.version === '') {
+    throw new Error(`快照缺少非空 version 字符串: ${filePath}`)
+  }
+  const entries = flattenNamespaceTree(snap.namespaces, filePath)
+  if (entries.length === 0) {
+    throw new Error(`快照中无任何条目: ${filePath}`)
+  }
+  const seen = new Set()
+  for (const e of entries) {
+    if (seen.has(e.path)) throw new Error(`快照出现重复 path: ${e.path}（${filePath}）`)
+    seen.add(e.path)
+  }
+  return { input: filePath, files: [filePath], entries, version: snap.version }
+}
+
+// ---------------------------------------------------------------------------
 // diff / 变更描述 / 输出
 // ---------------------------------------------------------------------------
 
@@ -754,19 +947,36 @@ export function writeJsonAtomic(filePath, obj) {
 // ---------------------------------------------------------------------------
 
 const USAGE = `用法:
+  # diff 模式（缺省）：对比两个 bundle，或两个 schema 快照（两侧可混用 bundle/快照）
   node scripts/schema-compare.mjs --from <dir-or-file> --to <dir-or-file> \\
        [--from-version X] [--to-version Y] [--out path]
+  node scripts/schema-compare.mjs --from-snapshot <file> --to-snapshot <file> [--out path]
 
-对比两个版本（from/to）的 typert.remote-client.js 包树/单文件，抽取
+  # snapshot 模式：把一份 bundle 导出为规范 schema 快照 JSON（golden 入库）
+  node scripts/schema-compare.mjs --mode snapshot --bundle <dir-or-file> --version X \\
+       --out schemas/dsh-api-schema-X.json
+
+对比两个版本的 typert.remote-client.js 包树/单文件（或已导出的 schema 快照），抽取
 namespace/method 结构树并输出 SchemaDiff JSON（schema_version:1，含
-added/removed/changed）。输出到 stdout（缺省）或 --out 指定的文件（原子写）。
+added/removed/changed）。diff 输出到 stdout（缺省）或 --out 指定的文件（原子写）；
+snapshot 输出为规范快照 JSON（确定格式，必填 --out 原子写）。
 
-选项:
+选项（diff 模式）:
   --from <dir|file>       from 侧输入：单个 typert.remote-client.js 或含此类文件的目录
   --to <dir|file>         to 侧输入（同上）
-  --from-version X        覆盖 from 版本号（缺省读 package.json，取不到为 "unknown"）
-  --to-version Y          覆盖 to 版本号
+  --from-snapshot <file>  from 侧输入：schema 快照 JSON（版本内嵌于文件）
+  --to-snapshot <file>    to 侧输入：schema 快照 JSON
+  --from-version X        覆盖 from bundle 版本号（缺省读 package.json，取不到为 "unknown"）
+  --to-version Y          覆盖 to bundle 版本号（仅 bundle 侧；快照版本内嵌于文件）
   --out path              输出文件（原子写：同目录 .tmp + rename）；缺省打印到 stdout
+
+选项（snapshot 模式）:
+  --bundle <dir|file>     要导出的 bundle 输入（收集规则同 diff 的 --from/--to）
+  --version X             快照版本号（必填）
+  --out path              输出文件（原子写：同目录 .tmp + rename，必填）
+
+通用:
+  --mode <diff|snapshot>  模式：diff（缺省）或 snapshot
   -h, --help              显示本帮助
 
 SchemaDiff JSON 形如:
@@ -775,13 +985,36 @@ SchemaDiff JSON 形如:
     "removed":[...],
     "changed":[{namespace,method,kind,index?,path,from,to,change}] }
 
-错误处理: 输入路径不存在 / 无匹配文件 / 零条 schema / bundle 无法解析
-→ stderr 报错且 exit code 1，绝不产出半成品文件。`
+Snapshot JSON 形如（对象 key 字典序、namespace/method 排序 → 确定性输出）:
+  { "namespaces": { "<ns>": { "methods": { "<method>": {
+        "parameter": [{ "fields": [...], "index": N, "summary": "..." }],
+        "result":    { "fields": [...], "summary": "..." } } } } },
+    "schema_version": 1, "version": "..." }
+
+错误处理: 输入路径不存在 / 无匹配文件 / 零条 schema / bundle 无法解析 / 快照 JSON
+非法（schema_version≠1、缺 version、结构坏、重复 path）→ stderr 报错且 exit code 1，
+绝不产出半成品文件。`
 
 /** 简易参数解析：--flag value 或 --flag=value；未知选项报错。 */
 function parseArgs(argv) {
-  const args = { from: null, to: null, fromVersion: null, toVersion: null, out: null, help: false }
-  const known = new Set(['--from', '--to', '--from-version', '--to-version', '--out', '--help', '-h'])
+  const args = {
+    mode: 'diff',
+    bundle: null,
+    version: null,
+    from: null,
+    to: null,
+    fromVersion: null,
+    toVersion: null,
+    fromSnapshot: null,
+    toSnapshot: null,
+    out: null,
+    help: false,
+  }
+  const known = new Set([
+    '--mode', '--bundle', '--version',
+    '--from', '--to', '--from-version', '--to-version',
+    '--from-snapshot', '--to-snapshot', '--out', '--help', '-h',
+  ])
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]
     if (a === '--help' || a === '-h') { args.help = true; continue }
@@ -799,14 +1032,81 @@ function parseArgs(argv) {
         if (i >= argv.length) throw new Error(`参数 ${key} 缺少取值\n\n${USAGE}`)
         val = argv[i]
       }
-      if (key === '--from') args.from = val
+      if (key === '--mode') args.mode = val
+      else if (key === '--bundle') args.bundle = val
+      else if (key === '--version') args.version = val
+      else if (key === '--from') args.from = val
       else if (key === '--to') args.to = val
       else if (key === '--from-version') args.fromVersion = val
       else if (key === '--to-version') args.toVersion = val
+      else if (key === '--from-snapshot') args.fromSnapshot = val
+      else if (key === '--to-snapshot') args.toSnapshot = val
       else if (key === '--out') args.out = val
     }
   }
   return args
+}
+
+/**
+ * 每侧输入解析：bundle（--from/--to）或快照（--from-snapshot/--to-snapshot）二选一。
+ * flagBase 用于报错文案（如 '--from' → 对偶快照参数 '--from-snapshot'）。
+ */
+function resolveDiffSide(flagBase, bundleInput, versionHint, snapFile) {
+  if (bundleInput !== null && snapFile !== null) {
+    throw new Error(`不能同时指定 ${flagBase} 与 ${flagBase}-snapshot\n\n${USAGE}`)
+  }
+  if (snapFile !== null) {
+    if (versionHint !== null) {
+      throw new Error(`版本参数不能用于 snapshot 侧（快照版本内嵌于文件）\n\n${USAGE}`)
+    }
+    return loadSnapshotFile(snapFile)
+  }
+  if (bundleInput === null) {
+    throw new Error(`缺少必填参数 ${flagBase}\n\n${USAGE}`)
+  }
+  return loadSide(bundleInput, versionHint)
+}
+
+/** diff 模式主流程：两侧各取 bundle 或快照 → 同一 diffSides。 */
+function runDiffCli(args) {
+  if (args.bundle !== null || args.version !== null) {
+    throw new Error(`diff 模式不接受 --bundle/--version（属 snapshot 模式）\n\n${USAGE}`)
+  }
+  const fromSide = resolveDiffSide('--from', args.from, args.fromVersion, args.fromSnapshot)
+  const toSide = resolveDiffSide('--to', args.to, args.toVersion, args.toSnapshot)
+  const diff = diffSides(fromSide, toSide)
+  if (args.out !== null) {
+    writeJsonAtomic(args.out, diff)
+  } else {
+    console.log(`${JSON.stringify(diff, null, 2)}\n`)
+  }
+  return 0
+}
+
+/** snapshot 模式主流程：解析 bundle → 规范快照 JSON → 原子写（--out 必填）。 */
+function runSnapshotCli(args) {
+  const diffFlags = [
+    ['--from', args.from], ['--to', args.to],
+    ['--from-snapshot', args.fromSnapshot], ['--to-snapshot', args.toSnapshot],
+    ['--from-version', args.fromVersion], ['--to-version', args.toVersion],
+  ]
+  const bad = diffFlags.filter(([, v]) => v !== null).map(([k]) => k)
+  if (bad.length > 0) {
+    throw new Error(`snapshot 模式不接受 ${bad.join('/')}（diff 参数）\n\n${USAGE}`)
+  }
+  if (args.bundle === null) {
+    throw new Error(`snapshot 模式缺少必填参数 --bundle\n\n${USAGE}`)
+  }
+  if (args.version === null || args.version === '') {
+    throw new Error(`snapshot 模式缺少必填参数 --version\n\n${USAGE}`)
+  }
+  if (args.out === null || args.out === '') {
+    throw new Error(`snapshot 模式缺少必填参数 --out\n\n${USAGE}`)
+  }
+  const side = loadSide(args.bundle, args.version)
+  const snap = makeSnapshot(side)
+  writeJsonAtomic(args.out, snap)
+  return 0
 }
 
 /** CLI 主流程（同步）。错误一律：stderr 明确报错 + exit code 1，不产半成品。 */
@@ -817,18 +1117,9 @@ export function runCli(argv) {
       console.log(USAGE)
       return 0
     }
-    if (!args.from || !args.to) {
-      throw new Error(`缺少必填参数 --from 与 --to\n\n${USAGE}`)
-    }
-    const fromSide = loadSide(args.from, args.fromVersion)
-    const toSide = loadSide(args.to, args.toVersion)
-    const diff = diffSides(fromSide, toSide)
-    if (args.out) {
-      writeJsonAtomic(args.out, diff)
-    } else {
-      console.log(`${JSON.stringify(diff, null, 2)}\n`)
-    }
-    return 0
+    if (args.mode === 'snapshot') return runSnapshotCli(args)
+    if (args.mode === 'diff') return runDiffCli(args)
+    throw new Error(`--mode 只支持 diff|snapshot（got "${args.mode}"）\n\n${USAGE}`)
   } catch (e) {
     process.stderr.write(`[schema-compare] error: ${e.message}\n`)
     return 1

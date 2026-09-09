@@ -1,0 +1,1604 @@
+{
+  "namespaces": {
+    "agentPresets": {
+      "methods": {
+        "copy": {
+          "parameter": [
+            {
+              "fields": [],
+              "index": 0,
+              "summary": "string"
+            },
+            {
+              "fields": [],
+              "index": 1,
+              "summary": "string"
+            },
+            {
+              "fields": [],
+              "index": 2,
+              "summary": "union[2]"
+            }
+          ],
+          "result": {
+            "fields": [],
+            "summary": "void"
+          }
+        },
+        "deletePreset": {
+          "parameter": [
+            {
+              "fields": [],
+              "index": 0,
+              "summary": "string"
+            }
+          ],
+          "result": {
+            "fields": [],
+            "summary": "void"
+          }
+        },
+        "list": {
+          "result": {
+            "fields": [
+              "presets",
+              "authorable"
+            ],
+            "summary": "object{presets,authorable}"
+          }
+        },
+        "read": {
+          "parameter": [
+            {
+              "fields": [],
+              "index": 0,
+              "summary": "string"
+            }
+          ],
+          "result": {
+            "fields": [
+              "agentPreset",
+              "trust",
+              "content",
+              "name",
+              "description"
+            ],
+            "summary": "object{agentPreset,trust,content,name,description}"
+          }
+        },
+        "select": {
+          "parameter": [
+            {
+              "fields": [],
+              "index": 0,
+              "summary": "intersection[2]"
+            },
+            {
+              "fields": [],
+              "index": 1,
+              "summary": "string"
+            }
+          ],
+          "result": {
+            "fields": [],
+            "summary": "string"
+          }
+        }
+      }
+    },
+    "commands": {
+      "methods": {
+        "execute": {
+          "parameter": [
+            {
+              "fields": [],
+              "index": 0,
+              "summary": "intersection[2]"
+            },
+            {
+              "fields": [],
+              "index": 1,
+              "summary": "string"
+            },
+            {
+              "fields": [
+                "mediaType",
+                "data",
+                "name"
+              ],
+              "index": 2,
+              "summary": "array"
+            }
+          ],
+          "result": {
+            "fields": [
+              "commandId",
+              "result"
+            ],
+            "summary": "union[2]"
+          }
+        },
+        "list": {
+          "parameter": [
+            {
+              "fields": [],
+              "index": 0,
+              "summary": "intersection[2]"
+            }
+          ],
+          "result": {
+            "fields": [
+              "name",
+              "description",
+              "input"
+            ],
+            "summary": "array"
+          }
+        }
+      }
+    },
+    "credentials": {
+      "methods": {
+        "describe": {
+          "parameter": [
+            {
+              "fields": [],
+              "index": 0,
+              "summary": "array"
+            }
+          ],
+          "result": {
+            "fields": [],
+            "summary": "record"
+          }
+        },
+        "set": {
+          "parameter": [
+            {
+              "fields": [],
+              "index": 0,
+              "summary": "string"
+            },
+            {
+              "fields": [],
+              "index": 1,
+              "summary": "string"
+            }
+          ],
+          "result": {
+            "fields": [],
+            "summary": "void"
+          }
+        },
+        "unset": {
+          "parameter": [
+            {
+              "fields": [],
+              "index": 0,
+              "summary": "string"
+            }
+          ],
+          "result": {
+            "fields": [],
+            "summary": "void"
+          }
+        }
+      }
+    },
+    "directoryPicker": {
+      "methods": {
+        "createDirectory": {
+          "parameter": [
+            {
+              "fields": [],
+              "index": 0,
+              "summary": "string"
+            },
+            {
+              "fields": [],
+              "index": 1,
+              "summary": "string"
+            }
+          ],
+          "result": {
+            "fields": [],
+            "summary": "string"
+          }
+        },
+        "list": {
+          "parameter": [
+            {
+              "fields": [],
+              "index": 0,
+              "summary": "union[2]"
+            }
+          ],
+          "result": {
+            "fields": [
+              "path",
+              "home",
+              "crumbs",
+              "entries",
+              "truncated"
+            ],
+            "summary": "object{path,home,crumbs,entries,truncated}"
+          }
+        },
+        "pick": {
+          "result": {
+            "fields": [],
+            "summary": "union[2]"
+          }
+        }
+      }
+    },
+    "dynamicCordisRunner": {
+      "methods": {
+        "getClientCode": {
+          "parameter": [
+            {
+              "fields": [],
+              "index": 0,
+              "summary": "intersection[2]"
+            },
+            {
+              "fields": [],
+              "index": 1,
+              "summary": "intersection[2]"
+            },
+            {
+              "fields": [],
+              "index": 2,
+              "summary": "intersection[2]"
+            }
+          ],
+          "result": {
+            "fields": [
+              "code",
+              "name",
+              "pluginId",
+              "packageId",
+              "pluginRunId"
+            ],
+            "summary": "object{code,name,pluginId,packageId,pluginRunId}"
+          }
+        },
+        "inventory": {
+          "result": {
+            "fields": [
+              "pluginId",
+              "agentId",
+              "packages",
+              "currentPackageId",
+              "nextPackageId",
+              "activeRun",
+              "latestRun"
+            ],
+            "summary": "array"
+          }
+        },
+        "invoke": {
+          "parameter": [
+            {
+              "fields": [],
+              "index": 0,
+              "summary": "intersection[2]"
+            },
+            {
+              "fields": [],
+              "index": 1,
+              "summary": "intersection[2]"
+            },
+            {
+              "fields": [],
+              "index": 2,
+              "summary": "string"
+            },
+            {
+              "fields": [],
+              "index": 3,
+              "summary": "union[7]"
+            }
+          ],
+          "result": {
+            "fields": [
+              "ok",
+              "value"
+            ],
+            "summary": "union[2]"
+          }
+        },
+        "reportClientGuardFailure": {
+          "parameter": [
+            {
+              "fields": [],
+              "index": 0,
+              "summary": "intersection[2]"
+            },
+            {
+              "fields": [],
+              "index": 1,
+              "summary": "intersection[2]"
+            },
+            {
+              "fields": [],
+              "index": 2,
+              "summary": "intersection[2]"
+            },
+            {
+              "fields": [
+                "message",
+                "stack"
+              ],
+              "index": 3,
+              "summary": "object{message,stack}"
+            }
+          ],
+          "result": {
+            "fields": [],
+            "summary": "literal"
+          }
+        },
+        "reportRenderFailure": {
+          "parameter": [
+            {
+              "fields": [],
+              "index": 0,
+              "summary": "intersection[2]"
+            },
+            {
+              "fields": [],
+              "index": 1,
+              "summary": "intersection[2]"
+            },
+            {
+              "fields": [],
+              "index": 2,
+              "summary": "intersection[2]"
+            },
+            {
+              "fields": [
+                "slot",
+                "message",
+                "stack",
+                "abdicated"
+              ],
+              "index": 3,
+              "summary": "object{slot,message,stack,abdicated}"
+            }
+          ],
+          "result": {
+            "fields": [],
+            "summary": "literal"
+          }
+        },
+        "resolveInspectQuery": {
+          "parameter": [
+            {
+              "fields": [],
+              "index": 0,
+              "summary": "intersection[2]"
+            },
+            {
+              "fields": [],
+              "index": 1,
+              "summary": "intersection[2]"
+            },
+            {
+              "fields": [
+                "ok",
+                "data",
+                "reason",
+                "message"
+              ],
+              "index": 2,
+              "summary": "union[2]"
+            }
+          ],
+          "result": {
+            "fields": [
+              "accepted"
+            ],
+            "summary": "object{accepted}"
+          }
+        },
+        "resolveRequestRun": {
+          "parameter": [
+            {
+              "fields": [],
+              "index": 0,
+              "summary": "intersection[2]"
+            },
+            {
+              "fields": [
+                "ok",
+                "pluginRunId",
+                "waitingFor",
+                "reason",
+                "startedHere",
+                "message",
+                "stack"
+              ],
+              "index": 1,
+              "summary": "union[2]"
+            }
+          ],
+          "result": {
+            "fields": [
+              "accepted"
+            ],
+            "summary": "object{accepted}"
+          }
+        },
+        "runHostHalf": {
+          "parameter": [
+            {
+              "fields": [],
+              "index": 0,
+              "summary": "intersection[2]"
+            },
+            {
+              "fields": [],
+              "index": 1,
+              "summary": "intersection[2]"
+            },
+            {
+              "fields": [],
+              "index": 2,
+              "summary": "intersection[2]"
+            },
+            {
+              "fields": [],
+              "index": 3,
+              "summary": "union[2]"
+            },
+            {
+              "fields": [],
+              "index": 4,
+              "summary": "union[2]"
+            },
+            {
+              "fields": [],
+              "index": 5,
+              "summary": "boolean"
+            }
+          ],
+          "result": {
+            "fields": [
+              "ok",
+              "pluginId",
+              "packageId",
+              "pluginRunId",
+              "waitingFor",
+              "startedHere"
+            ],
+            "summary": "union[2]"
+          }
+        },
+        "settleUserRun": {
+          "parameter": [
+            {
+              "fields": [],
+              "index": 0,
+              "summary": "intersection[2]"
+            },
+            {
+              "fields": [],
+              "index": 1,
+              "summary": "intersection[2]"
+            },
+            {
+              "fields": [
+                "ok",
+                "pluginRunId",
+                "waitingFor",
+                "reason",
+                "startedHere",
+                "message",
+                "stack"
+              ],
+              "index": 2,
+              "summary": "union[2]"
+            }
+          ],
+          "result": {
+            "fields": [
+              "ok",
+              "status",
+              "pluginId",
+              "packageId",
+              "pluginRunId",
+              "waitingFor",
+              "clientWaitingFor",
+              "currentPackageId",
+              "nextPackageId",
+              "mode",
+              "reason",
+              "message",
+              "stack"
+            ],
+            "summary": "union[2]"
+          }
+        },
+        "stopFromPanel": {
+          "parameter": [
+            {
+              "fields": [],
+              "index": 0,
+              "summary": "intersection[2]"
+            },
+            {
+              "fields": [],
+              "index": 1,
+              "summary": "intersection[2]"
+            }
+          ],
+          "result": {
+            "fields": [
+              "ok",
+              "reason",
+              "message"
+            ],
+            "summary": "union[2]"
+          }
+        },
+        "syncInspectManifest": {
+          "parameter": [
+            {
+              "fields": [
+                "id",
+                "description",
+                "methods"
+              ],
+              "index": 0,
+              "summary": "array"
+            }
+          ],
+          "result": {
+            "fields": [],
+            "summary": "literal"
+          }
+        },
+        "undefineFromPanel": {
+          "parameter": [
+            {
+              "fields": [],
+              "index": 0,
+              "summary": "intersection[2]"
+            },
+            {
+              "fields": [],
+              "index": 1,
+              "summary": "intersection[2]"
+            }
+          ],
+          "result": {
+            "fields": [
+              "ok",
+              "wasRunning",
+              "reason",
+              "message"
+            ],
+            "summary": "union[2]"
+          }
+        }
+      }
+    },
+    "fileReferences": {
+      "methods": {
+        "list": {
+          "parameter": [
+            {
+              "fields": [],
+              "index": 0,
+              "summary": "intersection[2]"
+            },
+            {
+              "fields": [],
+              "index": 1,
+              "summary": "string"
+            }
+          ],
+          "result": {
+            "fields": [
+              "path",
+              "kind"
+            ],
+            "summary": "array"
+          }
+        }
+      }
+    },
+    "goals": {
+      "methods": {
+        "clear": {
+          "parameter": [
+            {
+              "fields": [],
+              "index": 0,
+              "summary": "intersection[2]"
+            },
+            {
+              "fields": [
+                "id",
+                "revision"
+              ],
+              "index": 1,
+              "summary": "object{id,revision}"
+            }
+          ],
+          "result": {
+            "fields": [
+              "id",
+              "revision"
+            ],
+            "summary": "object{id,revision}"
+          }
+        },
+        "complete": {
+          "parameter": [
+            {
+              "fields": [],
+              "index": 0,
+              "summary": "intersection[2]"
+            },
+            {
+              "fields": [
+                "id",
+                "revision"
+              ],
+              "index": 1,
+              "summary": "object{id,revision}"
+            }
+          ],
+          "result": {
+            "fields": [
+              "roundsStarted",
+              "createdAt",
+              "updatedAt",
+              "activation",
+              "objective",
+              "phase",
+              "blockedReason",
+              "maxGoalRounds",
+              "id",
+              "revision"
+            ],
+            "summary": "object{roundsStarted,createdAt,updatedAt,activation,objective,phase,blockedReason,maxGoalRounds,id,revision}"
+          }
+        },
+        "create": {
+          "parameter": [
+            {
+              "fields": [],
+              "index": 0,
+              "summary": "intersection[2]"
+            },
+            {
+              "fields": [
+                "objective",
+                "maxGoalRounds"
+              ],
+              "index": 1,
+              "summary": "object{objective,maxGoalRounds}"
+            }
+          ],
+          "result": {
+            "fields": [
+              "ref"
+            ],
+            "summary": "object{ref}"
+          }
+        },
+        "edit": {
+          "parameter": [
+            {
+              "fields": [],
+              "index": 0,
+              "summary": "intersection[2]"
+            },
+            {
+              "fields": [
+                "id",
+                "revision"
+              ],
+              "index": 1,
+              "summary": "object{id,revision}"
+            },
+            {
+              "fields": [
+                "objective",
+                "maxGoalRounds"
+              ],
+              "index": 2,
+              "summary": "object{objective,maxGoalRounds}"
+            }
+          ],
+          "result": {
+            "fields": [
+              "roundsStarted",
+              "createdAt",
+              "updatedAt",
+              "activation",
+              "objective",
+              "phase",
+              "blockedReason",
+              "maxGoalRounds",
+              "id",
+              "revision"
+            ],
+            "summary": "object{roundsStarted,createdAt,updatedAt,activation,objective,phase,blockedReason,maxGoalRounds,id,revision}"
+          }
+        },
+        "pause": {
+          "parameter": [
+            {
+              "fields": [],
+              "index": 0,
+              "summary": "intersection[2]"
+            },
+            {
+              "fields": [
+                "id",
+                "revision"
+              ],
+              "index": 1,
+              "summary": "object{id,revision}"
+            }
+          ],
+          "result": {
+            "fields": [
+              "roundsStarted",
+              "createdAt",
+              "updatedAt",
+              "activation",
+              "objective",
+              "phase",
+              "blockedReason",
+              "maxGoalRounds",
+              "id",
+              "revision"
+            ],
+            "summary": "object{roundsStarted,createdAt,updatedAt,activation,objective,phase,blockedReason,maxGoalRounds,id,revision}"
+          }
+        },
+        "resume": {
+          "parameter": [
+            {
+              "fields": [],
+              "index": 0,
+              "summary": "intersection[2]"
+            },
+            {
+              "fields": [
+                "id",
+                "revision"
+              ],
+              "index": 1,
+              "summary": "object{id,revision}"
+            }
+          ],
+          "result": {
+            "fields": [
+              "roundsStarted",
+              "createdAt",
+              "updatedAt",
+              "activation",
+              "objective",
+              "phase",
+              "blockedReason",
+              "maxGoalRounds",
+              "id",
+              "revision"
+            ],
+            "summary": "object{roundsStarted,createdAt,updatedAt,activation,objective,phase,blockedReason,maxGoalRounds,id,revision}"
+          }
+        }
+      }
+    },
+    "llm": {
+      "methods": {
+        "discoverModels": {
+          "parameter": [
+            {
+              "fields": [],
+              "index": 0,
+              "summary": "string"
+            },
+            {
+              "fields": [
+                "provider",
+                "baseURL",
+                "api",
+                "apiKey"
+              ],
+              "index": 1,
+              "summary": "object{provider,baseURL,api,apiKey}"
+            }
+          ],
+          "result": {
+            "fields": [
+              "id",
+              "name",
+              "contextWindow",
+              "maxTokens"
+            ],
+            "summary": "array"
+          }
+        },
+        "listConfigurableProviders": {
+          "result": {
+            "fields": [
+              "provider",
+              "displayName",
+              "settingsNs",
+              "settingsPath",
+              "declared"
+            ],
+            "summary": "array"
+          }
+        },
+        "listProviders": {
+          "result": {
+            "fields": [
+              "id",
+              "name"
+            ],
+            "summary": "array"
+          }
+        }
+      }
+    },
+    "messageFeedback": {
+      "methods": {
+        "delete": {
+          "parameter": [
+            {
+              "fields": [
+                "sessionId",
+                "messageId",
+                "ifVersion"
+              ],
+              "index": 0,
+              "summary": "object{sessionId,messageId,ifVersion}"
+            }
+          ],
+          "result": {
+            "fields": [
+              "ok",
+              "value",
+              "error"
+            ],
+            "summary": "union[2]"
+          }
+        },
+        "list": {
+          "parameter": [
+            {
+              "fields": [
+                "sessionId"
+              ],
+              "index": 0,
+              "summary": "object{sessionId}"
+            }
+          ],
+          "result": {
+            "fields": [
+              "ok",
+              "value",
+              "error"
+            ],
+            "summary": "union[2]"
+          }
+        },
+        "put": {
+          "parameter": [
+            {
+              "fields": [
+                "sessionId",
+                "messageId",
+                "rating",
+                "note",
+                "ifVersion"
+              ],
+              "index": 0,
+              "summary": "object{sessionId,messageId,rating,note,ifVersion}"
+            }
+          ],
+          "result": {
+            "fields": [
+              "ok",
+              "value",
+              "error"
+            ],
+            "summary": "union[2]"
+          }
+        }
+      }
+    },
+    "pluginInventory": {
+      "methods": {
+        "list": {
+          "result": {
+            "fields": [
+              "entries",
+              "agentPresets"
+            ],
+            "summary": "object{entries,agentPresets}"
+          }
+        }
+      }
+    },
+    "session": {
+      "methods": {
+        "attachment": {
+          "parameter": [
+            {
+              "fields": [
+                "sessionId",
+                "attachmentId"
+              ],
+              "index": 0,
+              "summary": "object{sessionId,attachmentId}"
+            }
+          ],
+          "result": {
+            "fields": [
+              "attachment",
+              "data"
+            ],
+            "summary": "object{attachment,data}"
+          }
+        },
+        "canOpenWorkspacePath": {
+          "result": {
+            "fields": [],
+            "summary": "boolean"
+          }
+        },
+        "cancel": {
+          "parameter": [
+            {
+              "fields": [
+                "sessionId"
+              ],
+              "index": 0,
+              "summary": "object{sessionId}"
+            }
+          ],
+          "result": {
+            "fields": [
+              "accepted"
+            ],
+            "summary": "object{accepted}"
+          }
+        },
+        "control": {
+          "result": {
+            "fields": [
+              "type",
+              "value",
+              "sessionId",
+              "items",
+              "jobs"
+            ],
+            "summary": "union[4]"
+          }
+        },
+        "create": {
+          "parameter": [
+            {
+              "fields": [
+                "workspaceId",
+                "cwd",
+                "sessionId",
+                "agentPreset"
+              ],
+              "index": 0,
+              "summary": "object{workspaceId,cwd,sessionId,agentPreset}"
+            }
+          ],
+          "result": {
+            "fields": [
+              "sessionId",
+              "agentPreset"
+            ],
+            "summary": "object{sessionId,agentPreset}"
+          }
+        },
+        "follow": {
+          "parameter": [
+            {
+              "fields": [
+                "address",
+                "maxMessages"
+              ],
+              "index": 0,
+              "summary": "object{address,maxMessages}"
+            }
+          ],
+          "result": {
+            "fields": [
+              "type",
+              "event",
+              "header",
+              "cursor",
+              "records",
+              "hasMore",
+              "projections"
+            ],
+            "summary": "union[2]"
+          }
+        },
+        "fork": {
+          "parameter": [
+            {
+              "fields": [
+                "sessionId",
+                "atSeq"
+              ],
+              "index": 0,
+              "summary": "object{sessionId,atSeq}"
+            }
+          ],
+          "result": {
+            "fields": [
+              "sessionId"
+            ],
+            "summary": "object{sessionId}"
+          }
+        },
+        "list": {
+          "parameter": [
+            {
+              "fields": [
+                "cursor"
+              ],
+              "index": 0,
+              "summary": "object{cursor}"
+            }
+          ],
+          "result": {
+            "fields": [
+              "items"
+            ],
+            "summary": "object{items}"
+          }
+        },
+        "modelCatalog": {
+          "result": {
+            "fields": [
+              "default",
+              "routableProviders",
+              "groups",
+              "failures"
+            ],
+            "summary": "object{default,routableProviders,groups,failures}"
+          }
+        },
+        "openWorkspacePath": {
+          "parameter": [
+            {
+              "fields": [
+                "path"
+              ],
+              "index": 0,
+              "summary": "object{path}"
+            }
+          ],
+          "result": {
+            "fields": [
+              "opened"
+            ],
+            "summary": "object{opened}"
+          }
+        },
+        "page": {
+          "parameter": [
+            {
+              "fields": [
+                "address",
+                "throughSeq",
+                "beforeSeq",
+                "maxMessages"
+              ],
+              "index": 0,
+              "summary": "object{address,throughSeq,beforeSeq,maxMessages}"
+            }
+          ],
+          "result": {
+            "fields": [
+              "records",
+              "hasMore"
+            ],
+            "summary": "object{records,hasMore}"
+          }
+        },
+        "prompt": {
+          "parameter": [
+            {
+              "fields": [
+                "requestId",
+                "sessionId",
+                "mode",
+                "content",
+                "clientTimeZone"
+              ],
+              "index": 0,
+              "summary": "object{requestId,sessionId,mode,content,clientTimeZone}"
+            }
+          ],
+          "result": {
+            "fields": [
+              "accepted"
+            ],
+            "summary": "object{accepted}"
+          }
+        },
+        "rename": {
+          "parameter": [
+            {
+              "fields": [
+                "sessionId",
+                "title"
+              ],
+              "index": 0,
+              "summary": "object{sessionId,title}"
+            }
+          ],
+          "result": {
+            "fields": [
+              "title",
+              "seq"
+            ],
+            "summary": "object{title,seq}"
+          }
+        },
+        "search": {
+          "parameter": [
+            {
+              "fields": [
+                "query"
+              ],
+              "index": 0,
+              "summary": "object{query}"
+            }
+          ],
+          "result": {
+            "fields": [
+              "items",
+              "hasMore"
+            ],
+            "summary": "object{items,hasMore}"
+          }
+        },
+        "selectModel": {
+          "parameter": [
+            {
+              "fields": [
+                "sessionId",
+                "provider",
+                "model",
+                "reasoningEffort"
+              ],
+              "index": 0,
+              "summary": "object{sessionId,provider,model,reasoningEffort}"
+            }
+          ],
+          "result": {
+            "fields": [
+              "selected"
+            ],
+            "summary": "object{selected}"
+          }
+        },
+        "updateQueue": {
+          "parameter": [
+            {
+              "fields": [
+                "sessionId",
+                "itemId",
+                "action"
+              ],
+              "index": 0,
+              "summary": "object{sessionId,itemId,action}"
+            }
+          ],
+          "result": {
+            "fields": [
+              "accepted"
+            ],
+            "summary": "object{accepted}"
+          }
+        }
+      }
+    },
+    "sessionReferenceResolver": {
+      "methods": {
+        "candidates": {
+          "parameter": [
+            {
+              "fields": [],
+              "index": 0,
+              "summary": "intersection[2]"
+            },
+            {
+              "fields": [],
+              "index": 1,
+              "summary": "string"
+            }
+          ],
+          "result": {
+            "fields": [
+              "mention",
+              "sessionId",
+              "label",
+              "cwd",
+              "sameWorkspace",
+              "createdAt"
+            ],
+            "summary": "array"
+          }
+        }
+      }
+    },
+    "settings": {
+      "methods": {
+        "canOpenAgentPresetDirectory": {
+          "result": {
+            "fields": [],
+            "summary": "boolean"
+          }
+        },
+        "describe": {
+          "result": {
+            "fields": [
+              "writable",
+              "hasDocument",
+              "namespaces"
+            ],
+            "summary": "object{writable,hasDocument,namespaces}"
+          }
+        },
+        "mutate": {
+          "parameter": [
+            {
+              "fields": [],
+              "index": 0,
+              "summary": "string"
+            },
+            {
+              "fields": [
+                "op",
+                "path",
+                "value"
+              ],
+              "index": 1,
+              "summary": "array"
+            },
+            {
+              "fields": [],
+              "index": 2,
+              "summary": "union[2]"
+            }
+          ],
+          "result": {
+            "fields": [
+              "ns",
+              "schema",
+              "value",
+              "base",
+              "user",
+              "applies",
+              "secrets",
+              "revision"
+            ],
+            "summary": "object{ns,schema,value,base,user,applies,secrets,revision}"
+          }
+        },
+        "openAgentPresetDirectory": {
+          "parameter": [
+            {
+              "fields": [],
+              "index": 0,
+              "summary": "string"
+            }
+          ],
+          "result": {
+            "fields": [
+              "opened",
+              "path"
+            ],
+            "summary": "union[2]"
+          }
+        },
+        "openSettingsDocument": {
+          "result": {
+            "fields": [
+              "opened"
+            ],
+            "summary": "object{opened}"
+          }
+        },
+        "replace": {
+          "parameter": [
+            {
+              "fields": [],
+              "index": 0,
+              "summary": "string"
+            },
+            {
+              "fields": [],
+              "index": 1,
+              "summary": "record"
+            },
+            {
+              "fields": [],
+              "index": 2,
+              "summary": "union[2]"
+            }
+          ],
+          "result": {
+            "fields": [
+              "ns",
+              "schema",
+              "value",
+              "base",
+              "user",
+              "applies",
+              "secrets",
+              "revision"
+            ],
+            "summary": "object{ns,schema,value,base,user,applies,secrets,revision}"
+          }
+        },
+        "update": {
+          "parameter": [
+            {
+              "fields": [],
+              "index": 0,
+              "summary": "string"
+            },
+            {
+              "fields": [],
+              "index": 1,
+              "summary": "record"
+            },
+            {
+              "fields": [],
+              "index": 2,
+              "summary": "union[2]"
+            }
+          ],
+          "result": {
+            "fields": [
+              "ns",
+              "schema",
+              "value",
+              "base",
+              "user",
+              "applies",
+              "secrets",
+              "revision"
+            ],
+            "summary": "object{ns,schema,value,base,user,applies,secrets,revision}"
+          }
+        }
+      }
+    },
+    "skills": {
+      "methods": {
+        "list": {
+          "parameter": [
+            {
+              "fields": [
+                "sessionId"
+              ],
+              "index": 0,
+              "summary": "object{sessionId}"
+            }
+          ],
+          "result": {
+            "fields": [
+              "skills"
+            ],
+            "summary": "object{skills}"
+          }
+        }
+      }
+    },
+    "subagents": {
+      "methods": {
+        "interruptByParent": {
+          "parameter": [
+            {
+              "fields": [],
+              "index": 0,
+              "summary": "intersection[2]"
+            },
+            {
+              "fields": [],
+              "index": 1,
+              "summary": "intersection[2]"
+            },
+            {
+              "fields": [],
+              "index": 2,
+              "summary": "literal"
+            }
+          ],
+          "result": {
+            "fields": [
+              "accepted"
+            ],
+            "summary": "object{accepted}"
+          }
+        },
+        "list": {
+          "parameter": [
+            {
+              "fields": [],
+              "index": 0,
+              "summary": "intersection[2]"
+            }
+          ],
+          "result": {
+            "fields": [
+              "entries",
+              "parentAvailable"
+            ],
+            "summary": "object{entries,parentAvailable}"
+          }
+        },
+        "prompt": {
+          "parameter": [
+            {
+              "fields": [
+                "requestId",
+                "parentSessionId",
+                "childSessionId",
+                "mode",
+                "content",
+                "clientTimeZone"
+              ],
+              "index": 0,
+              "summary": "object{requestId,parentSessionId,childSessionId,mode,content,clientTimeZone}"
+            }
+          ],
+          "result": {
+            "fields": [
+              "messageId"
+            ],
+            "summary": "object{messageId}"
+          }
+        }
+      }
+    },
+    "workspace": {
+      "methods": {
+        "archiveSession": {
+          "parameter": [
+            {
+              "fields": [
+                "sessionId"
+              ],
+              "index": 0,
+              "summary": "object{sessionId}"
+            }
+          ],
+          "result": {
+            "fields": [
+              "archivedSessionIds"
+            ],
+            "summary": "object{archivedSessionIds}"
+          }
+        },
+        "create": {
+          "parameter": [
+            {
+              "fields": [
+                "path"
+              ],
+              "index": 0,
+              "summary": "object{path}"
+            }
+          ],
+          "result": {
+            "fields": [
+              "workspace",
+              "created"
+            ],
+            "summary": "object{workspace,created}"
+          }
+        },
+        "delete": {
+          "parameter": [
+            {
+              "fields": [
+                "workspaceId"
+              ],
+              "index": 0,
+              "summary": "object{workspaceId}"
+            }
+          ],
+          "result": {
+            "fields": [
+              "deleted"
+            ],
+            "summary": "object{deleted}"
+          }
+        },
+        "follow": {
+          "result": {
+            "fields": [
+              "type",
+              "value",
+              "workspace",
+              "workspaceId",
+              "workspaceIds",
+              "archivedSessionIds"
+            ],
+            "summary": "union[5]"
+          }
+        },
+        "insertBefore": {
+          "parameter": [
+            {
+              "fields": [
+                "workspaceId",
+                "beforeWorkspaceId"
+              ],
+              "index": 0,
+              "summary": "object{workspaceId,beforeWorkspaceId}"
+            }
+          ],
+          "result": {
+            "fields": [
+              "workspaceIds"
+            ],
+            "summary": "object{workspaceIds}"
+          }
+        },
+        "insertSessionBefore": {
+          "parameter": [
+            {
+              "fields": [
+                "workspaceId",
+                "sessionId",
+                "beforeSessionId"
+              ],
+              "index": 0,
+              "summary": "object{workspaceId,sessionId,beforeSessionId}"
+            }
+          ],
+          "result": {
+            "fields": [
+              "workspace"
+            ],
+            "summary": "object{workspace}"
+          }
+        },
+        "rename": {
+          "parameter": [
+            {
+              "fields": [
+                "workspaceId",
+                "title"
+              ],
+              "index": 0,
+              "summary": "object{workspaceId,title}"
+            }
+          ],
+          "result": {
+            "fields": [
+              "workspace"
+            ],
+            "summary": "object{workspace}"
+          }
+        }
+      }
+    }
+  },
+  "schema_version": 1,
+  "version": "0.1.2-rc.1"
+}
