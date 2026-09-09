@@ -295,3 +295,147 @@ async fn live_export_route_exists() {
     drop(resp);
     println!("[live_smoke] export 路由存在：HTTP {status}（仅探测状态，未落盘）");
 }
+
+// ============================================================================
+// Step E（AC-008-14 覆盖补全）：envelope 显式断言 / live follow WS（streamId
+// 字符串 wire）/ projections 解析 / attachment 扫描——全部 #[ignore] + env
+// 门控，只读。streamId 字符串 wire 见 src/api/mux.rs（数字 id 被官方网关拒绝
+// 并断开整个 mux——Step E live 实证）。
+// ============================================================================
+
+/// 信封形状显式断言（list 已隐式覆盖，这里把核心信封字段逐项显式锁定）：
+/// `{"type":"server-response","rpcId":<回显>,"result":{"ok":true,"value":…}}`。
+/// 这是 Notes/03 §7.2 的核心契约——升级后若信封字段改名/缺省即在此暴露。
+#[tokio::test]
+#[ignore = "live 冒烟：需 DSH_TOKEN + 真实 dsh web，CI 默认跳过（env 门控）"]
+async fn live_envelope_shape_explicit() {
+    let Some((token, base)) = env_or_skip() else {
+        return;
+    };
+    let client = connect_live(&base, &token).await;
+    let rpc_id = "live-smoke-envelope-explicit";
+    let raw = raw_unary(&client, rpc_id, "session/list", json!({ "_request": {} })).await;
+    let _value = assert_envelope_ok(rpc_id, "session/list", &raw);
+
+    // 逐字段显式断言（envelope 契约锚点）。
+    assert_eq!(raw["type"], "server-response", "type 字段");
+    assert_eq!(raw["rpcId"], rpc_id, "rpcId 应回显");
+    assert_eq!(raw["result"]["ok"], true, "result.ok");
+    println!("[live_smoke] envelope 显式断言通过（rpcId 回显/type/result.ok）");
+}
+
+/// live `session/follow` WS 流（Step E / AC-008-14）：真实 mux 上开 follow，
+/// 必须收到 snapshot 帧且 records 非空可解析。这是 streamId 字符串 wire 的
+/// live 回归锚点。
+#[tokio::test]
+#[ignore = "live 冒烟：需 DSH_TOKEN + 真实 dsh web，CI 默认跳过（env 门控）"]
+async fn live_session_follow_contract() {
+    let Some((token, base)) = env_or_skip() else {
+        return;
+    };
+    let client = connect_live(&base, &token).await;
+    let session_id = live_session_id();
+
+    let mux = client
+        .open_mux()
+        .await
+        .expect("mux 连接应成功（streamId 字符串 wire）");
+    let address = SessionAddress::session(&session_id);
+    let mut stream = session::open_follow(&mux, &address, 2)
+        .await
+        .expect("session/follow open 应成功（官方网关接受字符串 streamId）");
+
+    // 首帧必须是 snapshot（含 records/header/cursor/projections 可解析）。
+    let first = tokio::time::timeout(std::time::Duration::from_secs(15), stream.next())
+        .await
+        .expect("follow 首帧应在超时内到达")
+        .expect("follow 流不应空")
+        .expect("follow 首帧不应是错误");
+    let parsed = dshtui::api::session::parse_follow_item(&first)
+        .expect("首帧应能 parse_follow_item");
+    match parsed {
+        dshtui::api::session::FollowItem::Snapshot {
+            cursor,
+            records,
+            has_more,
+            projections,
+        } => {
+            println!(
+                "[live_smoke] follow snapshot: cursor={cursor:?} records={} has_more={has_more} projections={}",
+                records.len(),
+                projections.is_some()
+            );
+            assert!(
+                !records.is_empty(),
+                "follow snapshot records 不应为空（真实 dsh 会话有历史）"
+            );
+        }
+        other => panic!("follow 首帧应为 Snapshot，实际 {other:?}"),
+    }
+    println!("[live_smoke] follow WS ok（streamId 字符串 wire + snapshot 解析）");
+}
+
+/// projections 解析（AC-008-14 / Notes/03 §7.2）：session/list 的
+/// projections.values 含 modelSelection/tokenUsage/sessionStats 等结构化字段，
+/// 经宽容解析应可达（不崩）。attachment 会话覆盖：真实会话 page 记录扫描
+/// attachment 型记录；无则如实标注覆盖边界（mock 兜底，不伪造通过）。
+#[tokio::test]
+#[ignore = "live 冒烟：需 DSH_TOKEN + 真实 dsh web，CI 默认跳过（env 门控）"]
+async fn live_projections_and_attachment_scan() {
+    let Some((token, base)) = env_or_skip() else {
+        return;
+    };
+    let client = connect_live(&base, &token).await;
+    let session_id = live_session_id();
+
+    // (a) 从 list 取目标会话 projections.values，抽查 modelSelection 可达。
+    let list = session::list(&client.http, &client.base, None)
+        .await
+        .expect("session::list 应 Ok");
+    let target = list.raw_items.iter().find(|r| r.id == session_id).unwrap_or_else(|| {
+        panic!("目标会话 {session_id} 不在 list（DSHTUI_LIVE_SESSION 有误？）")
+    });
+    let proj = target
+        .projections
+        .as_ref()
+        .expect("目标会话应有 projections");
+    let values = proj.pointer("/values").expect("projections.values 应可达");
+    assert!(values.is_object(), "projections.values 应为对象: {values}");
+    let has_known = ["modelSelection", "tokenUsage", "sessionStats", "title"]
+        .iter()
+        .any(|k| values.get(*k).is_some());
+    assert!(
+        has_known,
+        "projections.values 应含至少一个已知投影字段（modelSelection/tokenUsage/sessionStats/title）: {values}"
+    );
+    println!("[live_smoke] projections.values 解析可达（已知字段命中）");
+
+    // (b) attachment 探测：page 尾部原始记录扫描 attachment 型记录
+    // （page_raw 返回原始 JSON Value 供字符串级扫描；typed records 不序列化）。
+    let cursor = proj.pointer("/asOfSeq").and_then(|v| v.as_u64()).unwrap_or(0);
+    let address = SessionAddress::session(&session_id);
+    let page = session::page_raw(
+        &client.http,
+        &client.base,
+        &address,
+        dshtui::api::types::SessionSeq::new(cursor),
+        None,
+        200,
+    )
+    .await
+    .expect("session/page_raw 应 Ok");
+    let mut att = 0usize;
+    for r in &page.records {
+        let s = serde_json::to_string(r).unwrap_or_default();
+        if s.contains("\"attachment\"") || s.contains("image/") {
+            att += 1;
+        }
+    }
+    if att == 0 {
+        println!(
+            "[live_smoke] attachment：目标会话 page 尾部未发现 attachment 记录——标注覆盖边界，mock 兜底"
+        );
+    } else {
+        println!("[live_smoke] attachment：page 尾部发现 {att} 条 attachment/image 记录");
+    }
+}
