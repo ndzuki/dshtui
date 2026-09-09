@@ -122,7 +122,7 @@ fn push_detail_lines(out: &mut Vec<Line<'static>>, detail: &TrajectoryDetail, ap
     let breakdown = app
         .active_session
         .as_ref()
-        .and_then(|sid| app.sessions.get(&sid.0))
+        .and_then(|sid| app.sessions.get(&sid.get()))
         .map(|w| ProjectionSnapshot::new(w.projections().clone()).context_breakdown());
     if let Some(bd) = breakdown {
         if !bd.is_empty() {

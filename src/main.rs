@@ -764,7 +764,7 @@ async fn execute_one(
                 Ok(mux_ref) => session::open_follow(mux_ref, &address, max_messages).await,
                 Err(error) => Err(error),
             };
-            let session_id = SessionId(child_id.clone());
+            let session_id = SessionId::new(child_id.clone());
             match opened {
                 Ok(stream) => {
                     let generation = mux_generation.load(Ordering::Relaxed);
@@ -790,7 +790,7 @@ async fn execute_one(
             let Some(client) = client.as_ref() else {
                 return;
             };
-            let address = SessionAddress::session(&session_id.0);
+            let address = SessionAddress::session(&session_id.get());
             let opened = match open_mux_stream(client, mux, mux_generation, event_tx).await {
                 Ok(mux_ref) => session::open_follow(mux_ref, &address, max_messages).await,
                 Err(error) => Err(error),
@@ -831,7 +831,7 @@ async fn execute_one(
             let result = session::page(
                 &client.http,
                 &client.base,
-                &SessionAddress::session(&session_id.0),
+                &SessionAddress::session(&session_id.get()),
                 through_seq,
                 before_seq,
                 max_messages.min(page_size.max(1)),
@@ -862,7 +862,7 @@ async fn execute_one(
             let Some(client) = client.as_ref() else {
                 return;
             };
-            let event = match session::cancel(&client.http, &client.base, &session_id.0).await {
+            let event = match session::cancel(&client.http, &client.base, &session_id.get()).await {
                 Ok(accepted) => {
                     tracing::debug!(%session_id, ?accepted, "session/cancel accepted");
                     AppEvent::CancelAccepted {
@@ -885,8 +885,8 @@ async fn execute_one(
         } => {
             let Some(client) = client.as_ref() else {
                 let event = AppEvent::PromptFailed {
-                    session_id: SessionId(child_id.clone()),
-                    request_id: SessionRequestId(request_id.clone()),
+                    session_id: SessionId::new(child_id.clone()),
+                    request_id: SessionRequestId::new(request_id.clone()),
                     error: ClientError::Transport("未连接（dsh web 不可达）".into()),
                 };
                 commands.extend(app.handle(event));
@@ -904,13 +904,13 @@ async fn execute_one(
                     tracing::debug!(child = %child_id, message_id = ?receipt.message_id, "subagents/prompt accepted");
                     // 复用 PromptAccepted（child 窗口回显对账）。
                     commands.extend(app.handle(AppEvent::PromptAccepted {
-                        session_id: SessionId(child_id.clone()),
-                        request_id: SessionRequestId(request_id.clone()),
+                        session_id: SessionId::new(child_id.clone()),
+                        request_id: SessionRequestId::new(request_id.clone()),
                     }));
                 }
                 Err(error) => commands.extend(app.handle(AppEvent::PromptFailed {
-                    session_id: SessionId(child_id.clone()),
-                    request_id: SessionRequestId(request_id.clone()),
+                    session_id: SessionId::new(child_id.clone()),
+                    request_id: SessionRequestId::new(request_id.clone()),
                     error,
                 })),
             }
@@ -1094,11 +1094,16 @@ async fn execute_one(
                 commands.extend(app.handle(event));
                 return;
             };
-            let event =
-                match dshtui::api::commands::list(&client.http, &client.base, &agent_id.0).await {
-                    Ok(cmds) => AppEvent::RemoteCommandsLoaded { commands: cmds },
-                    Err(error) => AppEvent::RemoteCommandsFailed { error },
-                };
+            let event = match dshtui::api::commands::list(
+                &client.http,
+                &client.base,
+                &agent_id.get(),
+            )
+            .await
+            {
+                Ok(cmds) => AppEvent::RemoteCommandsLoaded { commands: cmds },
+                Err(error) => AppEvent::RemoteCommandsFailed { error },
+            };
             commands.extend(app.handle(event));
         }
         Cmd::ExecuteCommand { line } => {
@@ -1119,7 +1124,7 @@ async fn execute_one(
             let event = match dshtui::api::commands::execute(
                 &client.http,
                 &client.base,
-                &agent_id.0,
+                &agent_id.get(),
                 &line,
                 &[],
             )
@@ -1178,7 +1183,7 @@ async fn execute_one(
                         .map_err(|e| ("rename session".to_string(), e))
                 }
                 WorkspaceOperation::ArchiveSession { session_id } => {
-                    workspace::archive_session(&client.http, &client.base, &session_id.0)
+                    workspace::archive_session(&client.http, &client.base, &session_id.get())
                         .await
                         .map(|_| OpOutcome::Ack)
                         .map_err(|e| ("archive session".to_string(), e))
@@ -1208,14 +1213,17 @@ async fn execute_one(
                 WorkspaceOperation::RenameWorkspace {
                     workspace_id,
                     title,
-                } => {
-                    workspace::rename_workspace(&client.http, &client.base, &workspace_id.0, &title)
-                        .await
-                        .map(|_| OpOutcome::Ack)
-                        .map_err(|e| ("rename workspace".to_string(), e))
-                }
+                } => workspace::rename_workspace(
+                    &client.http,
+                    &client.base,
+                    &workspace_id.get(),
+                    &title,
+                )
+                .await
+                .map(|_| OpOutcome::Ack)
+                .map_err(|e| ("rename workspace".to_string(), e)),
                 WorkspaceOperation::DeleteWorkspace { workspace_id } => {
-                    workspace::delete_workspace(&client.http, &client.base, &workspace_id.0)
+                    workspace::delete_workspace(&client.http, &client.base, &workspace_id.get())
                         .await
                         .map(|_| OpOutcome::Ack)
                         .map_err(|e| ("delete workspace".to_string(), e))
@@ -1226,8 +1234,8 @@ async fn execute_one(
                 } => workspace::insert_session_before(
                     &client.http,
                     &client.base,
-                    &target_workspace.0,
-                    &session_id.0,
+                    &target_workspace.get(),
+                    &session_id.get(),
                     None,
                 )
                 .await
@@ -1291,7 +1299,7 @@ async fn execute_one(
                 commands.extend(app.handle(event));
                 return;
             };
-            let sid = dshtui::api::types::SessionId(session_id.clone());
+            let sid = dshtui::api::types::SessionId::new(session_id.clone());
             match dshtui::api::session::fork(&client.http, &client.base, &sid, Some(at_seq)).await {
                 Ok(v) => commands.extend(app.handle(AppEvent::MessageBranchDone {
                     session_id: v.session_id,
@@ -1456,7 +1464,7 @@ async fn execute_one(
                 commands.extend(app.handle(event));
                 return;
             };
-            match dshtui::api::skills::list(&client.http, &client.base, &sid.0).await {
+            match dshtui::api::skills::list(&client.http, &client.base, &sid.get()).await {
                 Ok(value) => commands.extend(app.handle(AppEvent::SkillsListed { value })),
                 Err(error) => commands.extend(app.handle(AppEvent::SkillsListFailed { error })),
             }
@@ -1522,16 +1530,21 @@ async fn execute_one(
                             objective,
                             max_goal_rounds,
                         };
-                        dshtui::api::goals::create(&client.http, &client.base, &agent_id.0, &req)
-                            .await
-                            .map(|r| {
-                                Some(dshtui::api::types::GoalSnapshot {
-                                    id: r.id,
-                                    revision: r.revision,
-                                    ..Default::default()
-                                })
+                        dshtui::api::goals::create(
+                            &client.http,
+                            &client.base,
+                            &agent_id.get(),
+                            &req,
+                        )
+                        .await
+                        .map(|r| {
+                            Some(dshtui::api::types::GoalSnapshot {
+                                id: r.id,
+                                revision: r.revision,
+                                ..Default::default()
                             })
-                            .map_err(|e| ("create".into(), e))
+                        })
+                        .map_err(|e| ("create".into(), e))
                     }
                     GoalMutation::Edit { objective } => {
                         // goals/edit(agentId, ref, request)（typert 实读 0.1.2-rc.1：
@@ -1554,7 +1567,7 @@ async fn execute_one(
                         dshtui::api::goals::edit(
                             &client.http,
                             &client.base,
-                            &agent_id.0,
+                            &agent_id.get(),
                             &ref_,
                             &req,
                         )
@@ -1572,10 +1585,15 @@ async fn execute_one(
                                 .unwrap_or_default(),
                             revision: app.goals.sent_revision.unwrap_or(0),
                         };
-                        dshtui::api::goals::pause(&client.http, &client.base, &agent_id.0, &ref_)
-                            .await
-                            .map(Some)
-                            .map_err(|e| ("pause".into(), e))
+                        dshtui::api::goals::pause(
+                            &client.http,
+                            &client.base,
+                            &agent_id.get(),
+                            &ref_,
+                        )
+                        .await
+                        .map(Some)
+                        .map_err(|e| ("pause".into(), e))
                     }
                     GoalMutation::Resume => {
                         let ref_ = dshtui::api::types::GoalRef {
@@ -1587,10 +1605,15 @@ async fn execute_one(
                                 .unwrap_or_default(),
                             revision: app.goals.sent_revision.unwrap_or(0),
                         };
-                        dshtui::api::goals::resume(&client.http, &client.base, &agent_id.0, &ref_)
-                            .await
-                            .map(Some)
-                            .map_err(|e| ("resume".into(), e))
+                        dshtui::api::goals::resume(
+                            &client.http,
+                            &client.base,
+                            &agent_id.get(),
+                            &ref_,
+                        )
+                        .await
+                        .map(Some)
+                        .map_err(|e| ("resume".into(), e))
                     }
                     GoalMutation::Complete => {
                         let ref_ = dshtui::api::types::GoalRef {
@@ -1602,10 +1625,15 @@ async fn execute_one(
                                 .unwrap_or_default(),
                             revision: app.goals.sent_revision.unwrap_or(0),
                         };
-                        dshtui::api::goals::complete(&client.http, &client.base, &agent_id.0, &ref_)
-                            .await
-                            .map(Some)
-                            .map_err(|e| ("complete".into(), e))
+                        dshtui::api::goals::complete(
+                            &client.http,
+                            &client.base,
+                            &agent_id.get(),
+                            &ref_,
+                        )
+                        .await
+                        .map(Some)
+                        .map_err(|e| ("complete".into(), e))
                     }
                     GoalMutation::Clear => {
                         let ref_ = dshtui::api::types::GoalRef {
@@ -1617,10 +1645,15 @@ async fn execute_one(
                                 .unwrap_or_default(),
                             revision: app.goals.sent_revision.unwrap_or(0),
                         };
-                        dshtui::api::goals::clear(&client.http, &client.base, &agent_id.0, &ref_)
-                            .await
-                            .map(|_| None)
-                            .map_err(|e| ("clear".into(), e))
+                        dshtui::api::goals::clear(
+                            &client.http,
+                            &client.base,
+                            &agent_id.get(),
+                            &ref_,
+                        )
+                        .await
+                        .map(|_| None)
+                        .map_err(|e| ("clear".into(), e))
                     }
                 };
             let cleared = matches!(result, Ok(None));
@@ -1759,9 +1792,11 @@ async fn execute_one(
             let Some(session_id) = app.active_session.clone() else {
                 return;
             };
-            let (through_seq, before_seq) = match app.sessions.get(&session_id.0) {
+            let (through_seq, before_seq) = match app.sessions.get(&session_id.get()) {
                 Some(w) => (
-                    w.cursor().map(|c| SessionSeq(c.0)).unwrap_or(SessionSeq(0)),
+                    w.cursor()
+                        .map(|c| SessionSeq::new(c.get()))
+                        .unwrap_or(SessionSeq::new(0)),
                     w.head_seq(),
                 ),
                 None => {
@@ -1774,7 +1809,7 @@ async fn execute_one(
             let result = session::page(
                 &client.http,
                 &client.base,
-                &SessionAddress::session(&session_id.0),
+                &SessionAddress::session(&session_id.get()),
                 through_seq,
                 before_seq,
                 LOAD_THROUGH_PAGE_SIZE,

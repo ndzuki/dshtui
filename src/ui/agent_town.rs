@@ -482,7 +482,7 @@ mod tests {
         c.paint(&scene);
         let _ = c.take_emit();
         // 单 NPC 小位移 → 小脏矩形 → 不压缩（阈值 64KB 之下）。
-        if let Some(n) = scene.npc_mut(&crate::api::types::SessionId("session-s".into())) {
+        if let Some(n) = scene.npc_mut(&crate::api::types::SessionId::new("session-s".into())) {
             n.cx += 8.0;
             n.cy -= 4.0;
         }

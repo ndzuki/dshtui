@@ -178,7 +178,7 @@ async fn live_session_list_contract() {
     // 抽查第一条：typed meta 与 raw 官方字段一致（id←sessionId、updated←updatedAt）。
     let meta = meta_from_raw(page.raw_items[0].clone()).expect("官方形状第一条应能 meta_from_raw");
     assert_eq!(
-        meta.id.0,
+        meta.id.get(),
         first.get("sessionId").and_then(|v| v.as_str()).unwrap(),
         "meta.id 应来自官方 sessionId"
     );

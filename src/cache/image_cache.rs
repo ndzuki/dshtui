@@ -269,7 +269,7 @@ fn pop_evictable(inner: &mut CacheInner) -> Option<(AttachmentId, ImageCacheEntr
 }
 
 fn extension_for(media_type: &MediaType) -> &'static str {
-    match media_type.0.as_str() {
+    match media_type.get().as_str() {
         "image/png" => "png",
         "image/jpeg" => "jpg",
         "image/webp" => "webp",
@@ -291,8 +291,8 @@ mod tests {
         let path = dir.join(format!("{id}.png"));
         std::fs::write(&path, vec![0u8; bytes as usize]).unwrap();
         ImageCacheEntry {
-            attachment_id: AttachmentId(id.into()),
-            media_type: MediaType("image/png".into()),
+            attachment_id: AttachmentId::new(id.into()),
+            media_type: MediaType::new("image/png".into()),
             bytes,
             width: 1,
             height: 1,
@@ -306,16 +306,16 @@ mod tests {
         let cache = ImageCache::new(1_000);
         let dir = cache.temp_dir();
         assert_eq!(
-            cache.complete(&AttachmentId("a".into()), entry("a", 100, &dir)),
+            cache.complete(&AttachmentId::new("a".into()), entry("a", 100, &dir)),
             InsertOutcome::Cached
         );
         assert_eq!(
-            cache.complete(&AttachmentId("b".into()), entry("b", 100, &dir)),
+            cache.complete(&AttachmentId::new("b".into()), entry("b", 100, &dir)),
             InsertOutcome::Cached
         );
-        let got = cache.get(&AttachmentId("a".into())).expect("cached");
-        assert_eq!(got.attachment_id.0, "a");
-        assert_eq!(got.media_type.0, "image/png");
+        let got = cache.get(&AttachmentId::new("a".into())).expect("cached");
+        assert_eq!(got.attachment_id.get(), "a");
+        assert_eq!(got.media_type.get(), "image/png");
     }
 
     #[test]
@@ -323,20 +323,20 @@ mod tests {
         // 每条目账本 = bytes + 文件占用 = 200；预算 450 只容得下两条。
         let cache = ImageCache::new(450);
         let dir = cache.temp_dir();
-        cache.complete(&AttachmentId("old".into()), entry("old", 100, &dir));
-        cache.complete(&AttachmentId("mid".into()), entry("mid", 100, &dir));
-        cache.complete(&AttachmentId("new".into()), entry("new", 100, &dir));
+        cache.complete(&AttachmentId::new("old".into()), entry("old", 100, &dir));
+        cache.complete(&AttachmentId::new("mid".into()), entry("mid", 100, &dir));
+        cache.complete(&AttachmentId::new("new".into()), entry("new", 100, &dir));
         // 总账 3×200=600 > 450 → 驱逐最旧直到预算内。
         assert!(cache.used() <= 450, "used={}", cache.used());
         assert!(
-            cache.get(&AttachmentId("old".into())).is_none(),
+            cache.get(&AttachmentId::new("old".into())).is_none(),
             "最旧已驱逐"
         );
         assert!(!dir.join("old.png").exists(), "驱逐必须删除临时文件");
         // 后续 get(new) 触达后，mid 成为最旧。
-        assert!(cache.get(&AttachmentId("new".into())).is_some());
-        assert!(cache.get(&AttachmentId("mid".into())).is_some());
-        assert!(cache.get(&AttachmentId("old".into())).is_none());
+        assert!(cache.get(&AttachmentId::new("new".into())).is_some());
+        assert!(cache.get(&AttachmentId::new("mid".into())).is_some());
+        assert!(cache.get(&AttachmentId::new("old".into())).is_none());
     }
 
     #[test]
@@ -345,36 +345,36 @@ mod tests {
         // 同 id 再 complete 时不得替换/删除使用中的文件。
         let cache = ImageCache::new(450);
         let dir = cache.temp_dir();
-        cache.complete(&AttachmentId("old".into()), entry("old", 100, &dir));
-        cache.pin(&AttachmentId("old".into()));
-        cache.complete(&AttachmentId("mid".into()), entry("mid", 100, &dir));
-        cache.complete(&AttachmentId("new".into()), entry("new", 100, &dir));
+        cache.complete(&AttachmentId::new("old".into()), entry("old", 100, &dir));
+        cache.pin(&AttachmentId::new("old".into()));
+        cache.complete(&AttachmentId::new("mid".into()), entry("mid", 100, &dir));
+        cache.complete(&AttachmentId::new("new".into()), entry("new", 100, &dir));
         // 总账 3×200=600 > 450：逐出候选跳过 pinned old → 逐出 mid，总账 400。
         assert_eq!(cache.used(), 400, "used={}", cache.used());
         assert!(
-            cache.get(&AttachmentId("old".into())).is_some(),
+            cache.get(&AttachmentId::new("old".into())).is_some(),
             "pinned 条目不得被驱逐"
         );
         assert!(dir.join("old.png").exists(), "pinned 文件保留");
         assert!(
-            cache.get(&AttachmentId("mid".into())).is_none(),
+            cache.get(&AttachmentId::new("mid".into())).is_none(),
             "最旧未 pin 条目被驱逐"
         );
         assert!(!dir.join("mid.png").exists(), "被驱逐文件已删除");
-        assert!(cache.get(&AttachmentId("new".into())).is_some());
+        assert!(cache.get(&AttachmentId::new("new".into())).is_some());
 
         // 同 id 替换（重取）时 pin 仍在 → 保留原条目与原文件，丢弃新文件。
         let replacement = dir.join("old-v2.png");
         std::fs::write(&replacement, vec![0u8; 100]).unwrap();
         let mut e2 = entry("old", 100, &dir);
         e2.temp_file = replacement.clone();
-        cache.complete(&AttachmentId("old".into()), e2);
-        let got = cache.get(&AttachmentId("old".into())).unwrap();
+        cache.complete(&AttachmentId::new("old".into()), e2);
+        let got = cache.get(&AttachmentId::new("old".into())).unwrap();
         assert_eq!(got.temp_file, dir.join("old.png"), "pin 中不替换条目");
         assert!(!replacement.exists(), "替换文件被丢弃");
 
         // unpin 后收紧预算 → 恢复可驱逐。
-        cache.unpin(&AttachmentId("old".into()));
+        cache.unpin(&AttachmentId::new("old".into()));
         cache.set_budget(200);
         assert!(cache.used() <= 200, "used={}", cache.used());
     }
@@ -384,11 +384,11 @@ mod tests {
         let cache = ImageCache::new(100);
         let dir = cache.temp_dir();
         assert_eq!(
-            cache.complete(&AttachmentId("big".into()), entry("big", 300, &dir)),
+            cache.complete(&AttachmentId::new("big".into()), entry("big", 300, &dir)),
             InsertOutcome::NotCached
         );
         assert_eq!(cache.used(), 0);
-        assert!(cache.get(&AttachmentId("big".into())).is_none());
+        assert!(cache.get(&AttachmentId::new("big".into())).is_none());
         // 拉取即弃：调用方负责删除临时文件。
         std::fs::remove_file(dir.join("big.png")).unwrap();
     }
@@ -398,10 +398,10 @@ mod tests {
         let cache = ImageCache::new(0);
         let dir = cache.temp_dir();
         assert_eq!(
-            cache.complete(&AttachmentId("a".into()), entry("a", 10, &dir)),
+            cache.complete(&AttachmentId::new("a".into()), entry("a", 10, &dir)),
             InsertOutcome::NotCached
         );
-        assert!(cache.get(&AttachmentId("a".into())).is_none());
+        assert!(cache.get(&AttachmentId::new("a".into())).is_none());
         std::fs::remove_file(dir.join("a.png")).unwrap();
     }
 
@@ -410,7 +410,7 @@ mod tests {
         // AC-004-09：同 attachment_id 并发 acquire 仅一个 Started（单飞），
         // 其余 InFlight；complete 后全部 Cached；abort 后可重试（恢复路径）。
         let cache = Arc::new(ImageCache::new(10_000));
-        let id = Arc::new(AttachmentId("same".into()));
+        let id = Arc::new(AttachmentId::new("same".into()));
         let started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let inflight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut handles = Vec::new();
@@ -447,7 +447,7 @@ mod tests {
         let dir = cache.temp_dir();
         cache.complete(&id, entry("same", 100, &dir));
         match cache.acquire(&id) {
-            Acquire::Cached(e) => assert_eq!(e.attachment_id.0, "same"),
+            Acquire::Cached(e) => assert_eq!(e.attachment_id.get(), "same"),
             other => panic!("complete 后应命中缓存: {other:?}"),
         }
     }
@@ -464,7 +464,7 @@ mod tests {
             let dir = dir.clone();
             handles.push(thread::spawn(move || {
                 for i in 0..30u64 {
-                    let id = AttachmentId(format!("img-{}", (t * 100 + i) % 5));
+                    let id = AttachmentId::new(format!("img-{}", (t * 100 + i) % 5));
                     match cache.acquire(&id) {
                         Acquire::Started => {
                             let e = entry(&format!("img-{}", (t * 100 + i) % 5), 64, &dir);
@@ -493,7 +493,7 @@ mod tests {
             let cache = ImageCache::new(10_000);
             dir = cache.temp_dir();
             let path = cache
-                .write_temp_file(&MediaType("image/gif".into()), b"GIF89a".to_vec())
+                .write_temp_file(&MediaType::new("image/gif".into()), b"GIF89a".to_vec())
                 .unwrap();
             assert!(path.extension().unwrap() == "gif", "path={path:?}");
             assert!(path.exists());

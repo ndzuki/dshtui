@@ -98,13 +98,13 @@ mod tests {
         app.draft = Some(DraftState {
             text: "a".into(),
             cursor: 1,
-            bound_session: SessionId("s".into()),
+            bound_session: SessionId::new("s".into()),
         });
         assert_eq!(composer_height(&app), 3, "单行：1 内容 + 2 边框");
         app.draft = Some(DraftState {
             text: "a\nb\nc\nd\ne\nf\n".into(),
             cursor: 11,
-            bound_session: SessionId("s".into()),
+            bound_session: SessionId::new("s".into()),
         });
         assert_eq!(composer_height(&app), 8, "多行封顶 8");
     }
@@ -116,7 +116,7 @@ mod tests {
         app.draft = Some(DraftState {
             text: "ab".into(),
             cursor: 1,
-            bound_session: SessionId("s".into()),
+            bound_session: SessionId::new("s".into()),
         });
         let lines = composer_lines(&app);
         let line = lines[0]

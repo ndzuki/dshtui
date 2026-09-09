@@ -175,7 +175,7 @@ mod tests {
     use super::*;
 
     fn sid(n: &str) -> SessionId {
-        SessionId(n.into())
+        SessionId::new(n.into())
     }
 
     #[test]

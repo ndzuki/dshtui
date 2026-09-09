@@ -85,7 +85,7 @@ async fn agents_endpoint_parses_full_entries_and_finished_header() {
 
     // wire → 内部模型：16 字段族逐项断言（AC-009-02/04）。
     let e = AgentRosterEntry::from_wire(&resp.entries[0]);
-    assert_eq!(e.session_id.0, "session-abc");
+    assert_eq!(e.session_id.get(), "session-abc");
     assert_eq!(e.phase, "implementing");
     assert_eq!(e.task_first_line(), "修管线");
     assert_eq!(e.project, "release-manager");

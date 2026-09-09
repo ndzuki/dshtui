@@ -306,7 +306,7 @@ pub async fn select_model(
     reasoning_effort: Option<&str>,
 ) -> Result<super::types::WireModelSelection, ClientError> {
     let mut req = serde_json::json!({
-        "sessionId": session_id.0,
+        "sessionId": session_id.get(),
         "provider": provider,
         "model": model,
     });
@@ -336,7 +336,7 @@ pub async fn fork(
     session_id: &SessionId,
     at_seq: Option<u64>,
 ) -> Result<SessionForkValue, ClientError> {
-    let mut req = serde_json::json!({ "sessionId": session_id.0 });
+    let mut req = serde_json::json!({ "sessionId": session_id.get() });
     if let Some(seq) = at_seq {
         req["atSeq"] = serde_json::json!(seq);
     }
@@ -363,7 +363,7 @@ pub async fn rename(
         http,
         base,
         "session/rename",
-        serde_json::json!({ "request": { "sessionId": session_id.0, "title": title } }),
+        serde_json::json!({ "request": { "sessionId": session_id.get(), "title": title } }),
     )
     .await?;
     serde_json::from_value(value)

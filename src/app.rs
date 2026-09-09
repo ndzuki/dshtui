@@ -1722,7 +1722,7 @@ impl AppState {
     pub fn active_window(&self) -> Option<&crate::model::TranscriptWindow> {
         self.active_session
             .as_ref()
-            .and_then(|id| self.sessions.get(&id.0))
+            .and_then(|id| self.sessions.get(&id.get()))
     }
 
     pub fn active_running(&self) -> bool {
@@ -1807,7 +1807,7 @@ impl AppState {
         let mut store = crate::model::DraftStore::default();
         for sid in self.drafts.session_ids() {
             if let Some(d) = self.drafts.get(&sid) {
-                store.set(&sid.0, &d.text);
+                store.set(&sid.get(), &d.text);
             }
         }
         store
@@ -1821,7 +1821,7 @@ impl AppState {
                 self.drafts.set(DraftState {
                     text,
                     cursor: 0,
-                    bound_session: SessionId(sid),
+                    bound_session: SessionId::new(sid),
                 });
             }
         }
@@ -1886,7 +1886,7 @@ impl AppState {
         }
         let tmp = dir.join(format!(
             "edit-{}-{}.md",
-            sid.0,
+            sid.get(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis())
@@ -1936,9 +1936,9 @@ impl AppState {
             self.notice = Some("请先用 f/o 打开会话再查看子代理".into());
             return vec![];
         };
-        self.subagents.open(&sid.0);
+        self.subagents.open(&sid.get());
         self.mode = Mode::Subagent;
-        self.fetch_subagent_list(sid.0.clone())
+        self.fetch_subagent_list(sid.get())
     }
 
     /// AC-007-01：打开选中 child 会话——以 child id 为活动会话 + follow 走
@@ -1953,7 +1953,7 @@ impl AppState {
         let Some(parent) = self.subagents.immediate_parent_of(&id) else {
             return vec![];
         };
-        let child = SessionId(id.clone());
+        let child = SessionId::new(id.clone());
         // 关闭面板 + 走 open_session（返回 OpenFollow/OpenControl）。
         self.subagents.close();
         self.mode = Mode::Normal;
@@ -1970,7 +1970,7 @@ impl AppState {
                 max_messages,
             } = c
             {
-                let sid = session_id.0.clone();
+                let sid = session_id.get();
                 *c = Cmd::OpenFollowSubagent {
                     parent_id: parent.clone(),
                     child_id: sid,
@@ -1983,7 +1983,7 @@ impl AppState {
 
     /// 当前活动会话是否为已打开的 subagent child（发送路由 AC-007-01）。
     pub fn active_subagent_parent(&self) -> Option<(String, String)> {
-        let sid = self.active_session.as_ref()?.0.clone();
+        let sid = self.active_session.as_ref()?.get();
         let parent = self.subagent_parents.get(&sid)?.clone();
         Some((parent, sid))
     }
@@ -2614,8 +2614,8 @@ impl AppState {
             self.notice = Some("请先用 f/o 打开会话再导出".into());
             return vec![];
         };
-        let default = format!("dshtui-export-{}.zip", sid.0);
-        self.export.open(&sid.0, &default);
+        let default = format!("dshtui-export-{}.zip", sid.get());
+        self.export.open(&sid.get(), &default);
         self.mode = Mode::Export;
         vec![]
     }
@@ -2753,7 +2753,9 @@ impl AppState {
     /// （重建只写 header，防通过 seq 误伤）。
     fn session_latest_seq(&self, session_id: &str) -> Option<SessionSeq> {
         let w = self.sessions.get(session_id)?;
-        w.cursor().map(|c| SessionSeq(c.0)).or_else(|| w.tail_seq())
+        w.cursor()
+            .map(|c| SessionSeq::new(c.get()))
+            .or_else(|| w.tail_seq())
     }
 
     /// D-46：重建进度（已收集 records 数）。
@@ -2800,7 +2802,7 @@ impl AppState {
         let Some(block) = blocks.get(self.cursor_block) else {
             return vec![];
         };
-        let seq = block.seq().0;
+        let seq = block.seq().get();
         let running = self.active_running();
         // 是否为「静止轮次末条 user」：cursor 块是 user 且其后无 user。
         let is_last_user = match block {
@@ -2934,7 +2936,7 @@ impl AppState {
                 self.msg_action_target = None;
                 self.mode = Mode::Normal;
                 vec![Cmd::ForkAtSeq {
-                    session_id: target.session_id.0.clone(),
+                    session_id: target.session_id.get(),
                     at_seq: target.seq,
                 }]
             }
@@ -2952,10 +2954,10 @@ impl AppState {
                 self.msg_action_target = None;
                 self.mode = Mode::Normal;
                 // 乐观回显 + 重发 prompt（新 requestId，wire 校正：retry=重发）。
-                let request_id = SessionRequestId(crate::api::types::mint_request_id());
+                let request_id = SessionRequestId::new(crate::api::types::mint_request_id());
                 let sid = target.session_id.clone();
                 self.sessions
-                    .touch(&sid.0, self.window_cap)
+                    .touch(&sid.get(), self.window_cap)
                     .echo(request_id.clone(), &text);
                 self.notice = Some("已重发该消息（retry）".into());
                 let request = PromptRequest {
@@ -2987,7 +2989,7 @@ impl AppState {
                 // D-50：提交前登记在途 rating（回执分类用；菜单已 settle）。
                 self.message_action.set_pending_rating(rating.to_string());
                 vec![Cmd::FeedbackPut {
-                    session_id: target.session_id.0.clone(),
+                    session_id: target.session_id.get(),
                     message_id: mid,
                     rating: rating.to_string(),
                     note: None,
@@ -3001,7 +3003,7 @@ impl AppState {
         self.notice = Some(format!("已创建分支会话 {session_id}"));
         self.list_loaded = false;
         let mut cmds = vec![Cmd::LoadSessionList { cursor: None }];
-        cmds.extend(self.open_session(SessionId(session_id)));
+        cmds.extend(self.open_session(SessionId::new(session_id)));
         cmds
     }
 
@@ -3150,7 +3152,7 @@ impl AppState {
         let gen = self.mention.generation;
         vec![Cmd::FetchMentionCandidates {
             generation: gen,
-            agent_id: sid.0.clone(),
+            agent_id: sid.get(),
             query,
         }]
     }
@@ -3191,7 +3193,7 @@ impl AppState {
             self.draft = Some(DraftState {
                 text: text.to_string(),
                 cursor: text.chars().count(),
-                bound_session: sid.unwrap_or_else(|| SessionId(String::new())),
+                bound_session: sid.unwrap_or_else(|| SessionId::new(String::new())),
             });
             self.mode = Mode::Insert;
             self.composer.visible = true;
@@ -3293,11 +3295,11 @@ impl AppState {
                 // knowledge centralized in the api layer).
                 if let Some(items) = crate::api::workspace::extract_workspaces(&frame) {
                     for item in items {
-                        let wid = crate::api::types::WorkspaceId(item.id);
+                        let wid = crate::api::types::WorkspaceId::new(item.id);
                         self.workspaces.upsert_workspace(wid.clone(), item.title);
                         for session in item.session_ids {
                             self.workspaces
-                                .attach_session_to_workspace(&wid, &SessionId(session));
+                                .attach_session_to_workspace(&wid, &SessionId::new(session));
                         }
                     }
                 }
@@ -3359,7 +3361,7 @@ impl AppState {
                     }
                 }
                 let eff = {
-                    let w = self.sessions.touch(&session_id.0, self.window_cap);
+                    let w = self.sessions.touch(&session_id.get(), self.window_cap);
                     w.apply(Incoming::Snapshot {
                         cursor,
                         records: records.clone(),
@@ -3369,7 +3371,7 @@ impl AppState {
                 };
                 // REQ-005：同一快照喂独立轨迹投影（D-23，边界事件全保留）。
                 {
-                    let tw = self.traj_sessions.touch(&session_id.0, self.window_cap);
+                    let tw = self.traj_sessions.touch(&session_id.get(), self.window_cap);
                     tw.apply(TrajIncoming::Snapshot {
                         cursor,
                         records,
@@ -3390,14 +3392,14 @@ impl AppState {
             }
             AppEvent::FollowEvent { session_id, event } => {
                 let eff = {
-                    let Some(w) = self.sessions.get_mut(&session_id.0) else {
+                    let Some(w) = self.sessions.get_mut(&session_id.get()) else {
                         tracing::warn!(session = %session_id, "事件到达但窗口不存在，丢弃");
                         return vec![];
                     };
                     w.apply(Incoming::FollowEvent(event.clone()))
                 };
                 // REQ-005：同一事件喂轨迹投影（边界事件不丢，D-23）。
-                if let Some(tw) = self.traj_sessions.get_mut(&session_id.0) {
+                if let Some(tw) = self.traj_sessions.get_mut(&session_id.get()) {
                     tw.apply(TrajIncoming::FollowEvent(event));
                 }
                 self.adjust_viewport(&eff);
@@ -3406,12 +3408,12 @@ impl AppState {
             }
             AppEvent::FollowChunks { session_id, row } => {
                 let eff = {
-                    let Some(w) = self.sessions.get_mut(&session_id.0) else {
+                    let Some(w) = self.sessions.get_mut(&session_id.get()) else {
                         return vec![];
                     };
                     w.apply(Incoming::Chunks(row.clone()))
                 };
-                if let Some(tw) = self.traj_sessions.get_mut(&session_id.0) {
+                if let Some(tw) = self.traj_sessions.get_mut(&session_id.get()) {
                     tw.apply(TrajIncoming::Chunks(row));
                 }
                 self.adjust_viewport(&eff);
@@ -3443,7 +3445,7 @@ impl AppState {
                     return vec![];
                 }
                 self.page_guard.in_flight = false;
-                let eff = self.sessions.get_mut(&session_id.0).map(|w| {
+                let eff = self.sessions.get_mut(&session_id.get()).map(|w| {
                     w.apply(Incoming::Page {
                         records: records.clone(),
                         has_more,
@@ -3454,7 +3456,7 @@ impl AppState {
                     self.window_changed();
                 }
                 // REQ-005：同一页喂轨迹投影（前插合并无重复无空洞，AC-005-07）。
-                if let Some(tw) = self.traj_sessions.get_mut(&session_id.0) {
+                if let Some(tw) = self.traj_sessions.get_mut(&session_id.get()) {
                     tw.apply(TrajIncoming::Page { records, has_more });
                 }
                 vec![]
@@ -3481,7 +3483,7 @@ impl AppState {
                 // (official source of truth, AC-002-06).
                 // D-49：发送成功 → 弃在途草稿登记（注册表已在 submit 清空，
                 // 无需再清；失败才恢复）。
-                self.pending_prompt_texts.remove(&session_id.0);
+                self.pending_prompt_texts.remove(&session_id.get());
                 tracing::debug!(%session_id, %request_id, "session/prompt accepted");
                 vec![]
             }
@@ -3492,7 +3494,7 @@ impl AppState {
             } => {
                 let code = error.code();
                 let message = error.to_string();
-                if let Some(w) = self.sessions.get_mut(&session_id.0) {
+                if let Some(w) = self.sessions.get_mut(&session_id.get()) {
                     w.fail_echo(&request_id, &code, &message);
                 }
                 // D-49：任意失败都保留未发送草稿（draft 仅存未发送内容）——
@@ -3502,7 +3504,7 @@ impl AppState {
                 // 防覆盖（spec review）：回执到达前用户已重开 composer 输入
                 // 了新内容（非空且与登记全文不同）→ 不覆盖用户的在途新稿。
                 let mut restored_full_draft = false;
-                if let Some(text) = self.pending_prompt_texts.remove(&session_id.0) {
+                if let Some(text) = self.pending_prompt_texts.remove(&session_id.get()) {
                     let composer_has_newer = self.composer.active_session.as_ref()
                         == Some(&session_id)
                         && self
@@ -3527,7 +3529,7 @@ impl AppState {
                     if !restored_full_draft {
                         let echo_text = self
                             .sessions
-                            .get(&session_id.0)
+                            .get(&session_id.get())
                             .and_then(|w| w.echo_text(&request_id))
                             .map(str::to_string);
                         if let Some(text) = echo_text {
@@ -3827,7 +3829,7 @@ impl AppState {
                 // （AC-003-15）。
                 let eff = self
                     .sessions
-                    .get_mut(&session_id.0)
+                    .get_mut(&session_id.get())
                     .map(|w| w.apply(Incoming::Page { records, has_more }));
                 if let Some(eff) = eff {
                     self.adjust_viewport(&eff);
@@ -4058,7 +4060,7 @@ impl AppState {
                 match outcome {
                     OpOutcome::ForkCreated { session_id } => {
                         // fork 成功：打开新会话（web 列表经重拉一致）。
-                        let sid = SessionId(session_id.clone());
+                        let sid = SessionId::new(session_id.clone());
                         self.notice = Some(format!("已创建分支会话 {session_id}"));
                         self.list_loaded = false;
                         let mut cmds = vec![Cmd::LoadSessionList { cursor: None }];
@@ -4304,11 +4306,14 @@ impl AppState {
         // window.
         let through_seq = self
             .sessions
-            .get(&session_id.0)
+            .get(&session_id.get())
             .and_then(|w| w.cursor())
-            .map(|c| SessionSeq(c.0))
-            .unwrap_or(SessionSeq(0));
-        let before_seq = self.sessions.get(&session_id.0).and_then(|w| w.head_seq());
+            .map(|c| SessionSeq::new(c.get()))
+            .unwrap_or(SessionSeq::new(0));
+        let before_seq = self
+            .sessions
+            .get(&session_id.get())
+            .and_then(|w| w.head_seq());
         Cmd::RequestPage {
             session_id,
             generation: self.page_guard.generation,
@@ -4549,15 +4554,14 @@ impl AppState {
         self.composer.steer = false;
         self.composer.active_session = None;
         // D-49：发送在途前先登记原始草稿全文（供失败回填；成功即弃）。
-        self.pending_prompt_texts
-            .insert(sid.0.clone(), text.clone());
+        self.pending_prompt_texts.insert(sid.get(), text.clone());
         // 发送后清空该会话草稿（AC-003-11）+ 记入输入历史（AC-003-10）；
         // 失败时由 PromptFailed 回填（D-49：成功才清、失败可重发不丢）。
         self.drafts.clear(&sid);
         self.mark_drafts_dirty();
         self.history.push(&text);
         self.history.reset_nav();
-        let request_id = SessionRequestId(crate::api::types::mint_request_id());
+        let request_id = SessionRequestId::new(crate::api::types::mint_request_id());
         // Optimistic echo: visible within one frame, occupies no seq
         // (AC-002-02). 有图片时 echo 保留文本摘要（图片路径不展开）。
         let echo_text = if self.pending_image_attachments.is_empty() {
@@ -4580,13 +4584,13 @@ impl AppState {
             }
         };
         self.sessions
-            .touch(&sid.0, self.window_cap)
+            .touch(&sid.get(), self.window_cap)
             .echo(request_id.clone(), &echo_text);
         // content 顺序 `[image parts..., text]`（官方 web）。
         let mut content: Vec<PromptContentPart> = Vec::new();
         for att in std::mem::take(&mut self.pending_image_attachments) {
             content.push(PromptContentPart::Image {
-                media_type: att.media_type.0,
+                media_type: att.media_type.get(),
                 data: att.data_base64,
                 name: std::path::Path::new(&att.path)
                     .file_name()
@@ -4616,7 +4620,7 @@ impl AppState {
             return vec![Cmd::SendSubagentPrompt {
                 parent_id,
                 child_id,
-                request_id: request_id.0.clone(),
+                request_id: request_id.get(),
                 content,
             }];
         }
@@ -4753,7 +4757,7 @@ impl AppState {
         let (pager_total, pager_index) = self
             .active_window()
             .and_then(|w| {
-                crate::model::image::image_run_by_attachment(&w.block_snapshot(), &att_id.0)
+                crate::model::image::image_run_by_attachment(&w.block_snapshot(), &att_id.get())
                     .or_else(|| crate::model::image::image_run_of(&w.block_snapshot(), block.seq))
             })
             .map(|(_start, total, index)| (total, index))
@@ -4832,7 +4836,7 @@ impl AppState {
             return vec![];
         };
         let Some((start, total, index)) =
-            crate::model::image::image_run_by_attachment(&blocks, &cur_att.0)
+            crate::model::image::image_run_by_attachment(&blocks, &cur_att.get())
                 .or_else(|| crate::model::image::image_run_of(&blocks, cur_seq))
         else {
             return vec![];
@@ -4916,7 +4920,7 @@ impl AppState {
                     .image_meta
                     .get(&att_id)
                     .map(|m| m.media_type.clone())
-                    .unwrap_or_else(|| crate::api::types::MediaType("image/png".into()));
+                    .unwrap_or_else(|| crate::api::types::MediaType::new("image/png".into()));
                 (path, mt)
             }
         };
@@ -5540,7 +5544,7 @@ impl AppState {
                     .view_image_path()
                     .map(|p| p.to_string_lossy().into_owned())
                     .or_else(|| self.image_view.name.clone())
-                    .or_else(|| self.image_view.attachment_id.as_ref().map(|a| a.0.clone()));
+                    .or_else(|| self.image_view.attachment_id.as_ref().map(|a| a.get()));
                 match text {
                     Some(t) => vec![Cmd::CopyImageText { text: t }],
                     None => vec![],
@@ -5723,7 +5727,7 @@ impl AppState {
     fn active_traj_window(&self) -> Option<&crate::model::TrajectoryWindow> {
         self.active_session
             .as_ref()
-            .and_then(|id| self.traj_sessions.get(&id.0))
+            .and_then(|id| self.traj_sessions.get(&id.get()))
     }
 
     /// Trajectory 模式命令分派。返回 Some = 已处理（模态上下文语义，
@@ -6042,7 +6046,7 @@ impl AppState {
         self.focus = Focus::Center;
         // 活跃会话的轨迹窗口确保存在（触达：首帧渲染空、事件到达后填充）。
         if let Some(id) = self.active_session.clone() {
-            let _ = self.traj_sessions.touch(&id.0, self.window_cap);
+            let _ = self.traj_sessions.touch(&id.get(), self.window_cap);
         }
         self.traj.cursor = self.traj.cursor.min(self.traj_view_len().saturating_sub(1));
     }
@@ -6689,7 +6693,7 @@ impl AppState {
                 }
                 Some(WorkspaceOperation::MoveSession {
                     session_id,
-                    target_workspace: crate::api::types::WorkspaceId(text),
+                    target_workspace: crate::api::types::WorkspaceId::new(text),
                 })
             }
         };
@@ -7075,7 +7079,7 @@ impl AppState {
             .active_window()
             .and_then(|w| w.block(self.cursor_block))
             .map(|b| b.seq())
-            .unwrap_or(SessionSeq(0));
+            .unwrap_or(SessionSeq::new(0));
         // 当前轮 = 最后一个 seq <= 焦点 seq 的条目。
         let cur = outline
             .iter()
@@ -7242,7 +7246,7 @@ impl AppState {
         self.traj.detail = None;
         self.traj.detail_scroll = 0;
         self.traj.filter.open = false;
-        let _ = self.traj_sessions.touch(&sid.0, self.window_cap);
+        let _ = self.traj_sessions.touch(&sid.get(), self.window_cap);
         // 关掉内容 overlay（搜索/大纲），回到 NORMAL 内容浏览态。
         if self.mode == Mode::Search {
             self.close_search();
@@ -7309,13 +7313,13 @@ mod tests {
 
     fn snapshot(sid: &str, running: bool) -> AppEvent {
         AppEvent::FollowSnapshot {
-            session_id: SessionId(sid.into()),
-            cursor: Some(SessionLogOffset(10)),
+            session_id: SessionId::new(sid.into()),
+            cursor: Some(SessionLogOffset::new(10)),
             records: (1..=3)
                 .map(|s| SessionHistoryRecord::Event {
                     event: SessionWireEvent {
                         event_type: "user/message".into(),
-                        seq: Some(SessionSeq(s)),
+                        seq: Some(SessionSeq::new(s)),
                         time: None,
                         request_id: None,
                         ignorable: None,
@@ -7378,7 +7382,7 @@ mod tests {
             items: vec![],
             next_cursor: None,
         });
-        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle_command(C::OpenSession(SessionId::new("s1".into())));
         s.handle(snapshot("s1", false));
         let cmds = s.handle_command(C::GotoTop);
         assert_eq!(
@@ -7395,7 +7399,7 @@ mod tests {
         assert!(s.handle_command(C::GotoTop).is_empty());
         // A stale response is dropped.
         let cmds = s.handle(AppEvent::PageResult {
-            session_id: SessionId("s1".into()),
+            session_id: SessionId::new("s1".into()),
             generation: gen + 99,
             records: vec![],
             has_more: None,
@@ -7403,7 +7407,7 @@ mod tests {
         assert!(cmds.is_empty());
         // Normal completion releases the single-flight slot.
         s.handle(AppEvent::PageResult {
-            session_id: SessionId("s1".into()),
+            session_id: SessionId::new("s1".into()),
             generation: gen,
             records: vec![],
             has_more: Some(true),
@@ -7422,7 +7426,7 @@ mod tests {
     fn disconnected_shows_reconnecting_and_single_refollow() {
         let mut s = AppState::default();
         s.handle(AppEvent::Startup);
-        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle_command(C::OpenSession(SessionId::new("s1".into())));
         s.handle(snapshot("s1", false));
         let cmds = s.handle(AppEvent::Disconnected("eof".into()));
         assert!(s.is_reconnecting());
@@ -7520,7 +7524,7 @@ mod tests {
         assert_eq!(s.last_search_ms, None);
         // 注入词触发窗口内匹配重算（无需远程）。
         s.handle(AppEvent::Startup);
-        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle_command(C::OpenSession(SessionId::new("s1".into())));
         s.handle(snapshot("s1", false));
         // search.terms 需要 query；直接调私有方法同模块可见。
         s.search.query = "x".to_string();
@@ -7541,10 +7545,10 @@ mod tests {
     fn permission_error_does_not_reconnect() {
         let mut s = AppState::default();
         s.handle(AppEvent::Startup);
-        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle_command(C::OpenSession(SessionId::new("s1".into())));
         s.handle(snapshot("s1", false));
         let cmds = s.handle(AppEvent::FollowError {
-            session_id: SessionId("s1".into()),
+            session_id: SessionId::new("s1".into()),
             error: ClientError::Stream {
                 code: "PERMISSION_DENIED".into(),
                 message: "无权限".into(),
@@ -7560,7 +7564,7 @@ mod tests {
     fn quit_running_session_order_cancel_restore_exit() {
         let mut s = AppState::default();
         s.handle(AppEvent::Startup);
-        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle_command(C::OpenSession(SessionId::new("s1".into())));
         s.handle(snapshot("s1", true));
         // Running: the first quit asks for confirmation (FR-001-07) ...
         let cmds = s.handle_command(C::Quit);
@@ -7575,14 +7579,14 @@ mod tests {
         assert_eq!(
             cmds,
             vec![
-                Cmd::CancelSession(SessionId("s1".into())),
+                Cmd::CancelSession(SessionId::new("s1".into())),
                 Cmd::RestoreTerminal,
                 Cmd::Exit,
             ]
         );
         // Not running: no cancel, no confirmation.
         let mut s = AppState::default();
-        s.handle_command(C::OpenSession(SessionId("s2".into())));
+        s.handle_command(C::OpenSession(SessionId::new("s2".into())));
         s.handle(snapshot("s2", false));
         let cmds = s.handle_command(C::Quit);
         assert_eq!(cmds, vec![Cmd::RestoreTerminal, Cmd::Exit]);
@@ -7591,16 +7595,16 @@ mod tests {
     #[test]
     fn follow_event_tail_follow_and_browse_freeze() {
         let mut s = AppState::default();
-        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle_command(C::OpenSession(SessionId::new("s1".into())));
         s.handle(snapshot("s1", false));
         s.viewport.height = 2;
         // follow_tail: appended events stay stuck to the tail.
         for i in 4..=6 {
             s.handle(AppEvent::FollowEvent {
-                session_id: SessionId("s1".into()),
+                session_id: SessionId::new("s1".into()),
                 event: SessionWireEvent {
                     event_type: "assistant/message".into(),
-                    seq: Some(SessionSeq(i)),
+                    seq: Some(SessionSeq::new(i)),
                     time: None,
                     request_id: None,
                     ignorable: None,
@@ -7617,10 +7621,10 @@ mod tests {
         assert_eq!(s.viewport.offset, 0);
         // Appended events do not move the browsing position (anchor stable).
         s.handle(AppEvent::FollowEvent {
-            session_id: SessionId("s1".into()),
+            session_id: SessionId::new("s1".into()),
             event: SessionWireEvent {
                 event_type: "assistant/message".into(),
-                seq: Some(SessionSeq(50)),
+                seq: Some(SessionSeq::new(50)),
                 time: None,
                 request_id: None,
                 ignorable: None,
@@ -7636,7 +7640,7 @@ mod tests {
     fn stale_page_error_dropped() {
         let mut s = AppState::default();
         s.handle(AppEvent::Startup);
-        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle_command(C::OpenSession(SessionId::new("s1".into())));
         s.handle(snapshot("s1", false));
         let cmds = s.handle_command(C::GotoTop);
         let gen = match &cmds[0] {
@@ -7646,7 +7650,7 @@ mod tests {
         // An error from an old generation must not affect the current
         // single-flight request.
         let cmds = s.handle(AppEvent::PageError {
-            session_id: SessionId("s1".into()),
+            session_id: SessionId::new("s1".into()),
             generation: gen - 1,
             error: ClientError::Transport("x".into()),
         });
@@ -7691,7 +7695,7 @@ mod tests {
     #[test]
     fn esc_keeps_draft_per_session_and_switch_does_not_restore_ac002_04() {
         let mut s = AppState::default();
-        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle_command(C::OpenSession(SessionId::new("s1".into())));
         s.handle(snapshot("s1", false));
         s.handle_command(C::InsertMode);
         assert_eq!(s.mode, Mode::Insert);
@@ -7708,7 +7712,7 @@ mod tests {
         assert_eq!(s.draft.as_ref().map(|d| d.text.as_str()), Some("你好"));
         // 切换会话：新会话草稿为空（跨会话不恢复，D-11）。
         s.handle_command(C::ClosePicker);
-        s.handle_command(C::OpenSession(SessionId("s2".into())));
+        s.handle_command(C::OpenSession(SessionId::new("s2".into())));
         s.handle(snapshot("s2", false));
         s.handle_command(C::InsertMode);
         assert_eq!(
@@ -7717,7 +7721,7 @@ mod tests {
             "跨会话不恢复草稿"
         );
         assert_eq!(
-            s.draft.as_ref().map(|d| d.bound_session.0.as_str()),
+            s.draft.as_ref().map(|d| d.bound_session.get()).as_deref(),
             Some("s2")
         );
     }
@@ -7725,7 +7729,7 @@ mod tests {
     #[test]
     fn empty_enter_stays_insert_and_sends_nothing_ac002_03() {
         let mut s = AppState::default();
-        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle_command(C::OpenSession(SessionId::new("s1".into())));
         s.handle(snapshot("s1", false));
         s.handle_command(C::InsertMode);
         let cmds = s.handle_command(C::SubmitInput);
@@ -7742,7 +7746,7 @@ mod tests {
     #[test]
     fn nonempty_enter_closes_composer_back_to_normal_ac002_01() {
         let mut s = AppState::default();
-        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle_command(C::OpenSession(SessionId::new("s1".into())));
         s.handle(snapshot("s1", false));
         s.handle_command(C::InsertMode);
         s.handle_command(C::PickerInput("hi".into()));
@@ -7763,8 +7767,8 @@ mod tests {
     /// 空记录快照（不含 seed 记录，便于断言 pending/durable 计数）。
     fn empty_snapshot(sid: &str) -> AppEvent {
         AppEvent::FollowSnapshot {
-            session_id: SessionId(sid.into()),
-            cursor: Some(SessionLogOffset(0)),
+            session_id: SessionId::new(sid.into()),
+            cursor: Some(SessionLogOffset::new(0)),
             records: vec![],
             has_more: true,
             projections: Some(serde_json::json!({"running": false})),
@@ -7772,7 +7776,7 @@ mod tests {
     }
 
     fn submit_flow(s: &mut AppState, sid: &str, text: &str) -> Vec<Cmd> {
-        s.handle_command(C::OpenSession(SessionId(sid.into())));
+        s.handle_command(C::OpenSession(SessionId::new(sid.into())));
         s.handle(empty_snapshot(sid));
         s.handle_command(C::InsertMode);
         s.handle_command(C::PickerInput(text.into()));
@@ -7792,9 +7796,9 @@ mod tests {
         else {
             panic!("预期 SendPrompt，得到 {cmd:?}")
         };
-        assert_eq!(session_id, &SessionId("s1".into()));
+        assert_eq!(session_id, &SessionId::new("s1".into()));
         assert_eq!(request.mode, PromptMode::Queue, "V0.1 恒 queue（D-10）");
-        assert_eq!(request.session_id, SessionId("s1".into()));
+        assert_eq!(request.session_id, SessionId::new("s1".into()));
         assert_eq!(request.content.len(), 1);
         let crate::api::types::PromptContentPart::Text { text } = &request.content[0] else {
             panic!("V0.1 仅文本内容")
@@ -7815,7 +7819,7 @@ mod tests {
         let cmds = submit_flow(&mut s, "s1", "quick");
         assert_eq!(cmds.len(), 1);
         let rid = match &cmds[0] {
-            Cmd::SendPrompt { request, .. } => request.request_id.0.clone(),
+            Cmd::SendPrompt { request, .. } => request.request_id.get(),
             _ => panic!(),
         };
         // Enter 已触发、composer 已收起：再次提交不产生第二次调用。
@@ -7826,7 +7830,7 @@ mod tests {
         assert!(cmds3.is_empty(), "submit 入口幂等");
         let w = s.sessions.get("s1").unwrap();
         assert_eq!(w.pending().count(), 1, "同一 requestId 只回显一次");
-        assert_eq!(w.pending().next().unwrap().request_id.0, rid);
+        assert_eq!(w.pending().next().unwrap().request_id.get(), rid);
     }
 
     #[test]
@@ -7943,7 +7947,7 @@ mod tests {
         assert!(s.drafts.get(&session_id).is_none());
         assert_eq!(
             s.pending_prompt_texts
-                .get(&session_id.0)
+                .get(&session_id.get())
                 .map(String::as_str),
             Some("看图说话"),
             "在途全文已登记（D-49）"
@@ -8004,7 +8008,7 @@ mod tests {
         else {
             panic!("预期 SendPrompt，得到 {cmds:?}")
         };
-        assert_eq!(session_id, &SessionId("blank-1".into()));
+        assert_eq!(session_id, &SessionId::new("blank-1".into()));
         assert_eq!(request.mode, PromptMode::Queue);
         let w = s.sessions.get("blank-1").unwrap();
         assert_eq!(w.pending().count(), 1, "本地立即回显");
@@ -8075,9 +8079,9 @@ mod tests {
             session_id: session_id.clone(),
             event: SessionWireEvent {
                 event_type: "user/message".into(),
-                seq: Some(SessionSeq(11)),
+                seq: Some(SessionSeq::new(11)),
                 time: None,
-                request_id: Some(request_id.0.clone()),
+                request_id: Some(request_id.get()),
                 ignorable: None,
                 source_event_seqs: None,
                 surface_op: None,
@@ -8094,37 +8098,37 @@ mod tests {
     #[test]
     fn stop_first_press_single_cancel_and_idempotent_ac002_05_10() {
         let mut s = AppState::default();
-        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle_command(C::OpenSession(SessionId::new("s1".into())));
         s.handle(snapshot("s1", true)); // 官方投影 running
         let cmds = s.handle_command(C::StopRunning);
         assert_eq!(
             cmds,
-            vec![Cmd::CancelSession(SessionId("s1".into()))],
+            vec![Cmd::CancelSession(SessionId::new("s1".into()))],
             "首次 s 只发一次 cancel"
         );
-        assert_eq!(s.stop.requested_session, Some(SessionId("s1".into())));
+        assert_eq!(s.stop.requested_session, Some(SessionId::new("s1".into())));
         // 重复 s（同一会话）：幂等，不重复触发、不报错（AC-002-10）。
         assert!(s.handle_command(C::StopRunning).is_empty());
-        assert_eq!(s.stop.requested_session, Some(SessionId("s1".into())));
+        assert_eq!(s.stop.requested_session, Some(SessionId::new("s1".into())));
         // 未运行会话：s 无操作。
         let mut s2 = AppState::default();
-        s2.handle_command(C::OpenSession(SessionId("s2".into())));
+        s2.handle_command(C::OpenSession(SessionId::new("s2".into())));
         s2.handle(snapshot("s2", false));
         assert!(s2.handle_command(C::StopRunning).is_empty());
         assert_eq!(s2.stop.requested_session, None);
         // 另一运行中会话不受前一会话的停止转场阻断（per-session 语义）。
         let mut s3 = AppState::default();
-        s3.handle_command(C::OpenSession(SessionId("sA".into())));
+        s3.handle_command(C::OpenSession(SessionId::new("sA".into())));
         s3.handle(snapshot("sA", true));
-        s3.handle_command(C::OpenSession(SessionId("sB".into())));
+        s3.handle_command(C::OpenSession(SessionId::new("sB".into())));
         s3.handle(snapshot("sB", true));
-        s3.handle_command(C::OpenSession(SessionId("sA".into())));
+        s3.handle_command(C::OpenSession(SessionId::new("sA".into())));
         s3.handle_command(C::StopRunning);
-        assert_eq!(s3.stop.requested_session, Some(SessionId("sA".into())));
-        s3.handle_command(C::OpenSession(SessionId("sB".into())));
+        assert_eq!(s3.stop.requested_session, Some(SessionId::new("sA".into())));
+        s3.handle_command(C::OpenSession(SessionId::new("sB".into())));
         assert_eq!(
             s3.handle_command(C::StopRunning),
-            vec![Cmd::CancelSession(SessionId("sB".into()))],
+            vec![Cmd::CancelSession(SessionId::new("sB".into()))],
             "B 会话停止不被 A 的转场阻断"
         );
     }
@@ -8132,15 +8136,15 @@ mod tests {
     #[test]
     fn cancel_accepted_keeps_stopping_until_projection_flips() {
         let mut s = AppState::default();
-        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle_command(C::OpenSession(SessionId::new("s1".into())));
         s.handle(snapshot("s1", true));
         s.handle_command(C::StopRunning);
         // accepted：本地「停止中」保持，官方 running 不动（ADR-008）。
         let out = s.handle(AppEvent::CancelAccepted {
-            session_id: SessionId("s1".into()),
+            session_id: SessionId::new("s1".into()),
         });
         assert!(out.is_empty());
-        assert_eq!(s.stop.requested_session, Some(SessionId("s1".into())));
+        assert_eq!(s.stop.requested_session, Some(SessionId::new("s1".into())));
         assert!(s.active_running(), "官方投影仍 running");
         // 官方投影翻转 running=false → 转场结束（显示已停止）。
         s.handle(snapshot("s1", false));
@@ -8151,11 +8155,11 @@ mod tests {
     #[test]
     fn cancel_failed_shows_hint_no_crash_and_retry_works_ac002_09() {
         let mut s = AppState::default();
-        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle_command(C::OpenSession(SessionId::new("s1".into())));
         s.handle(snapshot("s1", true));
         s.handle_command(C::StopRunning);
         let out = s.handle(AppEvent::CancelFailed {
-            session_id: SessionId("s1".into()),
+            session_id: SessionId::new("s1".into()),
             error: ClientError::Remote {
                 code: "session/agent-busy".into(),
                 message: "忙".into(),
@@ -8172,7 +8176,7 @@ mod tests {
         // 恢复路径：失败后再次 s 必须能重新发起（不被旧失败状态污染）。
         assert_eq!(
             s.handle_command(C::StopRunning),
-            vec![Cmd::CancelSession(SessionId("s1".into()))],
+            vec![Cmd::CancelSession(SessionId::new("s1".into()))],
             "失败后可再次手动停止"
         );
         s.handle(snapshot("s1", false));
@@ -8182,28 +8186,28 @@ mod tests {
     #[test]
     fn stale_cancel_results_do_not_disturb_current_transition() {
         let mut s = AppState::default();
-        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle_command(C::OpenSession(SessionId::new("s1".into())));
         s.handle(snapshot("s1", true));
         s.handle_command(C::StopRunning);
         // 陈旧/非在途会话的结果：不 panic、不影响当前转场。
         s.handle(AppEvent::CancelAccepted {
-            session_id: SessionId("s-other".into()),
+            session_id: SessionId::new("s-other".into()),
         });
         s.handle(AppEvent::CancelFailed {
-            session_id: SessionId("s-other".into()),
+            session_id: SessionId::new("s-other".into()),
             error: ClientError::Transport("eof".into()),
         });
-        assert_eq!(s.stop.requested_session, Some(SessionId("s1".into())));
+        assert_eq!(s.stop.requested_session, Some(SessionId::new("s1".into())));
         assert!(s.last_error.is_none(), "非在途失败不覆盖状态条");
         // 在途会话失败后重试仍可用。
         s.handle(AppEvent::CancelFailed {
-            session_id: SessionId("s1".into()),
+            session_id: SessionId::new("s1".into()),
             error: ClientError::Transport("eof".into()),
         });
         assert_eq!(s.stop.requested_session, None);
         assert_eq!(
             s.handle_command(C::StopRunning),
-            vec![Cmd::CancelSession(SessionId("s1".into()))]
+            vec![Cmd::CancelSession(SessionId::new("s1".into()))]
         );
     }
 
@@ -8211,7 +8215,7 @@ mod tests {
     fn quit_while_stopping_keeps_first_stop_semantics_ac002_07() {
         // 运行中 + 已请求停止：Ctrl+c 首次仍只确认，二次 cancel→restore→exit。
         let mut s = AppState::default();
-        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle_command(C::OpenSession(SessionId::new("s1".into())));
         s.handle(snapshot("s1", true));
         s.handle_command(C::StopRunning);
         let cmds = s.handle_command(C::Quit);
@@ -8221,7 +8225,7 @@ mod tests {
         assert_eq!(
             cmds,
             vec![
-                Cmd::CancelSession(SessionId("s1".into())),
+                Cmd::CancelSession(SessionId::new("s1".into())),
                 Cmd::RestoreTerminal,
                 Cmd::Exit,
             ]
@@ -8237,7 +8241,7 @@ mod tests {
         let record = SessionHistoryRecord::Event {
             event: SessionWireEvent {
                 event_type: "assistant/message".into(),
-                seq: Some(SessionSeq(seq)),
+                seq: Some(SessionSeq::new(seq)),
                 time: None,
                 request_id: None,
                 ignorable: None,
@@ -8247,14 +8251,14 @@ mod tests {
             },
         };
         s.handle(AppEvent::FollowSnapshot {
-            session_id: SessionId(sid.into()),
-            cursor: Some(SessionLogOffset(seq)),
+            session_id: SessionId::new(sid.into()),
+            cursor: Some(SessionLogOffset::new(seq)),
             records: vec![record],
             has_more: true,
             projections: Some(serde_json::json!({"running": false})),
         });
         s.handle(AppEvent::FollowChunks {
-            session_id: SessionId(sid.into()),
+            session_id: SessionId::new(sid.into()),
             row: ChunkRow::TextChunks(crate::api::types::ChunkData {
                 texts: vec![md.to_string()],
                 ..Default::default()
@@ -8265,7 +8269,7 @@ mod tests {
     #[test]
     fn search_empty_query_never_sends_ac003_19() {
         let mut s = AppState::default();
-        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle_command(C::OpenSession(SessionId::new("s1".into())));
         assistant_md(&mut s, "s1", 1, "hello world");
         // 打开搜索：空查询不产生任何搜索命令（AC-003-19）。
         s.handle_command(C::StartSearch);
@@ -8288,7 +8292,7 @@ mod tests {
     #[test]
     fn search_debounce_keeps_only_latest_generation_ac003_14() {
         let mut s = AppState::default();
-        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle_command(C::OpenSession(SessionId::new("s1".into())));
         assistant_md(&mut s, "s1", 1, "alpha beta");
         s.handle_command(C::StartSearch);
         s.handle_command(C::PickerInput("a".into()));
@@ -8333,7 +8337,7 @@ mod tests {
     #[test]
     fn context_yank_code_block_copies_whole_block_ac003_03_12() {
         let mut s = AppState::default();
-        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle_command(C::OpenSession(SessionId::new("s1".into())));
         assistant_md(&mut s, "s1", 1, "```rust\nfn main() {}\n```\n\n其它文本");
         let cmds = s.handle_command(C::YankContext);
         assert_eq!(cmds.len(), 1);
@@ -8347,15 +8351,15 @@ mod tests {
     #[test]
     fn visual_selection_v_y_copies_blocks_ac003_12() {
         let mut s = AppState::default();
-        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle_command(C::OpenSession(SessionId::new("s1".into())));
         s.handle(AppEvent::FollowSnapshot {
-            session_id: SessionId("s1".into()),
-            cursor: Some(SessionLogOffset(3)),
+            session_id: SessionId::new("s1".into()),
+            cursor: Some(SessionLogOffset::new(3)),
             records: (1..=3)
                 .map(|n| SessionHistoryRecord::Event {
                     event: SessionWireEvent {
                         event_type: "user/message".into(),
-                        seq: Some(SessionSeq(n)),
+                        seq: Some(SessionSeq::new(n)),
                         time: None,
                         request_id: None,
                         ignorable: None,
@@ -8391,7 +8395,7 @@ mod tests {
     #[test]
     fn approval_arrives_forces_mode_replies_once_and_restores_ac003_07_17() {
         let mut s = AppState::default();
-        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle_command(C::OpenSession(SessionId::new("s1".into())));
         s.handle(snapshot("s1", false));
         let ev = ApprovalEvent {
             client_id: "c-1".into(),
@@ -8443,7 +8447,7 @@ mod tests {
     #[test]
     fn approval_q_esc_are_cancel_not_quit_ac003_07() {
         let mut s = AppState::default();
-        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle_command(C::OpenSession(SessionId::new("s1".into())));
         s.handle(snapshot("s1", true));
         s.handle(AppEvent::ApprovalRequest {
             event: ApprovalEvent {
@@ -8464,7 +8468,7 @@ mod tests {
     #[test]
     fn approval_reply_failure_fails_closed_with_waiting_hint_ac003_17_18() {
         let mut s = AppState::default();
-        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle_command(C::OpenSession(SessionId::new("s1".into())));
         s.handle(snapshot("s1", false));
         s.handle(AppEvent::ApprovalRequest {
             event: ApprovalEvent {
@@ -8502,7 +8506,7 @@ mod tests {
     #[test]
     fn steer_mode_reads_official_running_projection_ac003_06() {
         let mut s = AppState::default();
-        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle_command(C::OpenSession(SessionId::new("s1".into())));
         s.handle(snapshot("s1", true)); // 官方投影 running
         s.handle_command(C::InsertMode);
         assert!(s.composer.steer, "运行中 i → steer");
@@ -8515,7 +8519,7 @@ mod tests {
         assert_eq!(request.mode, PromptMode::Steer);
         // 未运行 → queue（REQ-002 原义）。
         let mut s2 = AppState::default();
-        s2.handle_command(C::OpenSession(SessionId("s1".into())));
+        s2.handle_command(C::OpenSession(SessionId::new("s1".into())));
         s2.handle(snapshot("s1", false));
         s2.handle_command(C::InsertMode);
         assert!(!s2.composer.steer);
@@ -8530,7 +8534,7 @@ mod tests {
     #[test]
     fn steer_unavailable_keeps_draft_and_hints_ac003_16() {
         let mut s = AppState::default();
-        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle_command(C::OpenSession(SessionId::new("s1".into())));
         s.handle(snapshot("s1", true));
         s.handle_command(C::InsertMode);
         s.handle_command(C::PickerInput("steer-me".into()));
@@ -8573,7 +8577,7 @@ mod tests {
         // **完整原稿**（含图片路径），不被回显摘要（[N 张图片]）覆盖。
         let (_dir, file) = temp_img("steer", b"abc");
         let mut s = AppState::default();
-        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle_command(C::OpenSession(SessionId::new("s1".into())));
         s.handle(snapshot("s1", true));
         s.handle_command(C::InsertMode);
         let full = format!("{}\n看图", file.to_string_lossy());
@@ -8606,15 +8610,15 @@ mod tests {
     #[test]
     fn draft_survives_session_switch_and_returns_ac003_11() {
         let mut s = AppState::default();
-        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle_command(C::OpenSession(SessionId::new("s1".into())));
         s.handle(snapshot("s1", false));
         s.handle_command(C::InsertMode);
         s.handle_command(C::PickerInput("s1 草稿".into()));
         s.handle_command(C::ClosePicker); // Esc 收起
                                           // 切到 s2 再切回 s1：草稿随 bound_session 保留（D-20）。
-        s.handle_command(C::OpenSession(SessionId("s2".into())));
+        s.handle_command(C::OpenSession(SessionId::new("s2".into())));
         s.handle(snapshot("s2", false));
-        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle_command(C::OpenSession(SessionId::new("s1".into())));
         s.handle_command(C::InsertMode);
         assert_eq!(
             s.draft.as_ref().map(|d| d.text.as_str()),
@@ -8622,7 +8626,7 @@ mod tests {
             "跨会话草稿恢复（仅内存）"
         );
         assert_eq!(
-            s.draft.as_ref().map(|d| d.bound_session.0.as_str()),
+            s.draft.as_ref().map(|d| d.bound_session.get()).as_deref(),
             Some("s1")
         );
     }
@@ -8630,7 +8634,7 @@ mod tests {
     #[test]
     fn input_history_up_down_ac003_10() {
         let mut s = AppState::default();
-        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle_command(C::OpenSession(SessionId::new("s1".into())));
         s.handle(snapshot("s1", false));
         // 发送两条进入历史。
         for text in ["第一条", "第二条"] {
@@ -8657,7 +8661,7 @@ mod tests {
     #[test]
     fn open_external_at_cursor_only_for_links_ac003_04_20() {
         let mut s = AppState::default();
-        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle_command(C::OpenSession(SessionId::new("s1".into())));
         assistant_md(&mut s, "s1", 1, "见 [文档](https://example.com/x) 部署");
         s.focus = Focus::Center;
         let cmds = s.handle_command(C::OpenSelected);
@@ -8668,7 +8672,7 @@ mod tests {
             }]
         );
         // 光标块不含链接 → no-op 提示（不误触发系统打开）。
-        s.handle_command(C::OpenSession(SessionId("s2".into())));
+        s.handle_command(C::OpenSession(SessionId::new("s2".into())));
         assistant_md(&mut s, "s2", 1, "没有链接的段落");
         s.focus = Focus::Center;
         let cmds = s.handle_command(C::OpenSelected);
@@ -8682,12 +8686,12 @@ mod tests {
     #[test]
     fn search_confirm_history_hit_opens_session_ac003_03() {
         let mut s = AppState::default();
-        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle_command(C::OpenSession(SessionId::new("s1".into())));
         assistant_md(&mut s, "s1", 1, "hello");
         s.handle_command(C::StartSearch);
         // 全历史命中另一会话 → Enter 打开该会话（D-17 收缩）。
         s.search.history_hits = vec![SearchHit {
-            session_id: SessionId("sess-9".into()),
+            session_id: SessionId::new("sess-9".into()),
             snippet: "deploy 排查 …".into(),
         }];
         let cmds = s.handle_command(C::PickerConfirm);
@@ -8698,7 +8702,10 @@ mod tests {
             1,
             "打开命中会话"
         );
-        assert_eq!(s.active_session.as_ref(), Some(&SessionId("sess-9".into())));
+        assert_eq!(
+            s.active_session.as_ref(),
+            Some(&SessionId::new("sess-9".into()))
+        );
         // snippet 二次窗口内定位：搜索 overlay 保持打开且 query = snippet
         // （截断省略号已去掉）。
         assert!(s.search.open, "搜索 overlay 保持打开（二次定位）");
@@ -8713,21 +8720,24 @@ mod tests {
         // Esc 关闭搜索，会话保持打开。
         s.handle_command(C::ClosePicker);
         assert!(!s.search.open);
-        assert_eq!(s.active_session.as_ref(), Some(&SessionId("sess-9".into())));
+        assert_eq!(
+            s.active_session.as_ref(),
+            Some(&SessionId::new("sess-9".into()))
+        );
     }
 
     #[test]
     fn outline_jump_turn_uses_load_through_when_not_loaded_ac003_09() {
         let mut s = AppState::default();
-        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle_command(C::OpenSession(SessionId::new("s1".into())));
         s.handle(AppEvent::FollowSnapshot {
-            session_id: SessionId("s1".into()),
-            cursor: Some(SessionLogOffset(50)),
+            session_id: SessionId::new("s1".into()),
+            cursor: Some(SessionLogOffset::new(50)),
             records: (41..=50)
                 .map(|n| SessionHistoryRecord::Event {
                     event: SessionWireEvent {
                         event_type: "assistant/message".into(),
-                        seq: Some(SessionSeq(n)),
+                        seq: Some(SessionSeq::new(n)),
                         time: None,
                         request_id: None,
                         ignorable: None,
@@ -8755,21 +8765,26 @@ mod tests {
         assert_eq!(
             s.cursor_block,
             s.active_window()
-                .and_then(|w| w.offset_of(SessionSeq(45)))
+                .and_then(|w| w.offset_of(SessionSeq::new(45)))
                 .unwrap()
         );
         // 目标 seq 5 未加载 → loadThrough 分页。
         let cmds = s.handle_command(C::PrevTurn);
-        assert_eq!(cmds, vec![Cmd::LoadThrough { seq: SessionSeq(5) }]);
+        assert_eq!(
+            cmds,
+            vec![Cmd::LoadThrough {
+                seq: SessionSeq::new(5)
+            }]
+        );
         // LoadThroughPage 合并后（seq 去重，REQ-001）窗口无重复无空洞。
         let before = s.active_window().unwrap().len();
         s.handle(AppEvent::LoadThroughPage {
-            session_id: SessionId("s1".into()),
+            session_id: SessionId::new("s1".into()),
             records: (1..=40)
                 .map(|n| SessionHistoryRecord::Event {
                     event: SessionWireEvent {
                         event_type: "assistant/message".into(),
-                        seq: Some(SessionSeq(n)),
+                        seq: Some(SessionSeq::new(n)),
                         time: None,
                         request_id: None,
                         ignorable: None,
@@ -8787,7 +8802,7 @@ mod tests {
         assert_eq!(
             s.cursor_block,
             s.active_window()
-                .and_then(|w| w.offset_of(SessionSeq(5)))
+                .and_then(|w| w.offset_of(SessionSeq::new(5)))
                 .unwrap(),
             "loadThrough 完成后按 seq 落位（AC-003-09）"
         );
@@ -8797,15 +8812,15 @@ mod tests {
     #[test]
     fn load_through_requeues_until_target_covered_ac003_09() {
         let mut s = AppState::default();
-        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle_command(C::OpenSession(SessionId::new("s1".into())));
         s.handle(AppEvent::FollowSnapshot {
-            session_id: SessionId("s1".into()),
-            cursor: Some(SessionLogOffset(100)),
+            session_id: SessionId::new("s1".into()),
+            cursor: Some(SessionLogOffset::new(100)),
             records: (81..=100)
                 .map(|n| SessionHistoryRecord::Event {
                     event: SessionWireEvent {
                         event_type: "user/message".into(),
-                        seq: Some(SessionSeq(n)),
+                        seq: Some(SessionSeq::new(n)),
                         time: None,
                         request_id: None,
                         ignorable: None,
@@ -8824,17 +8839,17 @@ mod tests {
         assert_eq!(
             cmds,
             vec![Cmd::LoadThrough {
-                seq: SessionSeq(10)
+                seq: SessionSeq::new(10)
             }]
         );
         // 第一页（seq 41..=80）未覆盖目标 10 且有更多历史 → reducer 续页。
         let cmds = s.handle(AppEvent::LoadThroughPage {
-            session_id: SessionId("s1".into()),
+            session_id: SessionId::new("s1".into()),
             records: (41..=80)
                 .map(|n| SessionHistoryRecord::Event {
                     event: SessionWireEvent {
                         event_type: "user/message".into(),
-                        seq: Some(SessionSeq(n)),
+                        seq: Some(SessionSeq::new(n)),
                         time: None,
                         request_id: None,
                         ignorable: None,
@@ -8849,19 +8864,19 @@ mod tests {
         assert_eq!(
             cmds,
             vec![Cmd::LoadThrough {
-                seq: SessionSeq(10)
+                seq: SessionSeq::new(10)
             }],
             "未覆盖且有更多历史 → 续页（逐页命令，不阻塞渲染）"
         );
         assert_eq!(s.load_through_pages, 1);
         // 第二页覆盖目标 → 落位并结束。
         let cmds = s.handle(AppEvent::LoadThroughPage {
-            session_id: SessionId("s1".into()),
+            session_id: SessionId::new("s1".into()),
             records: (1..=40)
                 .map(|n| SessionHistoryRecord::Event {
                     event: SessionWireEvent {
                         event_type: "user/message".into(),
-                        seq: Some(SessionSeq(n)),
+                        seq: Some(SessionSeq::new(n)),
                         time: None,
                         request_id: None,
                         ignorable: None,
@@ -8877,7 +8892,7 @@ mod tests {
         assert_eq!(
             s.cursor_block,
             s.active_window()
-                .and_then(|w| w.offset_of(SessionSeq(10)))
+                .and_then(|w| w.offset_of(SessionSeq::new(10)))
                 .unwrap()
         );
         assert!(s.load_through_target.is_none());
@@ -8888,10 +8903,10 @@ mod tests {
         // 目标版本不转发 approval/request：官方投影出现待审批信号 → 状态条
         // 等待审批（弹窗不出现、不阻塞）。
         let mut s = AppState::default();
-        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle_command(C::OpenSession(SessionId::new("s1".into())));
         s.handle(AppEvent::FollowSnapshot {
-            session_id: SessionId("s1".into()),
-            cursor: Some(SessionLogOffset(0)),
+            session_id: SessionId::new("s1".into()),
+            cursor: Some(SessionLogOffset::new(0)),
             records: vec![],
             has_more: false,
             projections: Some(serde_json::json!({"running": true, "awaitingApproval": true})),
@@ -8900,8 +8915,8 @@ mod tests {
         assert!(!s.approval.visible);
         // 投影清除 → hint 消失；弹窗事件路径不受影响。
         s.handle(AppEvent::FollowSnapshot {
-            session_id: SessionId("s1".into()),
-            cursor: Some(SessionLogOffset(0)),
+            session_id: SessionId::new("s1".into()),
+            cursor: Some(SessionLogOffset::new(0)),
             records: vec![],
             has_more: false,
             projections: Some(serde_json::json!({"running": false, "awaitingApproval": false})),
@@ -8951,7 +8966,7 @@ mod tests {
     #[test]
     fn approval_serial_queue_y_y_q_each_once_ac006_15() {
         let mut s = AppState::default();
-        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle_command(C::OpenSession(SessionId::new("s1".into())));
         s.handle(snapshot("s1", false));
         // 三条审批到达：首条 promote 显示，其余入队（不覆盖在途）。
         s.handle(AppEvent::ApprovalRequest {
@@ -9008,7 +9023,7 @@ mod tests {
     #[test]
     fn approval_partial_failure_keeps_item_retryable_others_continue_ac006_14() {
         let mut s = AppState::default();
-        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle_command(C::OpenSession(SessionId::new("s1".into())));
         s.handle(snapshot("s1", false));
         s.handle(AppEvent::ApprovalRequest {
             event: approval_ev("e1", false),
@@ -9051,7 +9066,7 @@ mod tests {
     #[test]
     fn approval_danger_ack_then_allow_still_allowed_once_ac006_16() {
         let mut s = AppState::default();
-        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle_command(C::OpenSession(SessionId::new("s1".into())));
         s.handle(snapshot("s1", false));
         s.handle(AppEvent::ApprovalRequest {
             event: approval_ev("d1", true),
@@ -9081,11 +9096,11 @@ mod tests {
     #[test]
     fn approval_policy_display_read_only_from_projection_ac006_17() {
         let mut s = AppState::default();
-        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle_command(C::OpenSession(SessionId::new("s1".into())));
         // projections 带 approval/policy=ask → 只读展示（不弹窗、无切换）。
         s.handle(AppEvent::FollowSnapshot {
-            session_id: SessionId("s1".into()),
-            cursor: Some(SessionLogOffset(0)),
+            session_id: SessionId::new("s1".into()),
+            cursor: Some(SessionLogOffset::new(0)),
             records: vec![],
             has_more: false,
             projections: Some(serde_json::json!({
@@ -9109,8 +9124,8 @@ mod tests {
         assert_eq!(s.approval.policy_display, Some("never"));
         // 未知/缺失 → None；never 无切换入口（handle_command 无对应命令）。
         s.handle(AppEvent::FollowSnapshot {
-            session_id: SessionId("s1".into()),
-            cursor: Some(SessionLogOffset(0)),
+            session_id: SessionId::new("s1".into()),
+            cursor: Some(SessionLogOffset::new(0)),
             records: vec![],
             has_more: false,
             projections: Some(serde_json::json!({"running": false})),
@@ -9121,7 +9136,7 @@ mod tests {
     #[test]
     fn approval_batch_allow_serial_pump_stops_at_danger_ac006_15_16() {
         let mut s = AppState::default();
-        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle_command(C::OpenSession(SessionId::new("s1".into())));
         s.handle(snapshot("s1", false));
         s.handle(AppEvent::ApprovalRequest {
             event: approval_ev("e1", false),
@@ -9158,7 +9173,7 @@ mod tests {
     #[test]
     fn search_permission_error_does_not_retry_window_search_unaffected_ac003_13() {
         let mut s = AppState::default();
-        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle_command(C::OpenSession(SessionId::new("s1".into())));
         assistant_md(&mut s, "s1", 1, "deploy the operator");
         s.handle_command(C::StartSearch);
         s.handle_command(C::PickerInput("deploy".into()));
@@ -9222,15 +9237,15 @@ mod tests {
     #[test]
     fn search_n_and_shift_n_cycle_matches_ac003_05() {
         let mut s = AppState::default();
-        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle_command(C::OpenSession(SessionId::new("s1".into())));
         s.handle(AppEvent::FollowSnapshot {
-            session_id: SessionId("s1".into()),
-            cursor: Some(SessionLogOffset(3)),
+            session_id: SessionId::new("s1".into()),
+            cursor: Some(SessionLogOffset::new(3)),
             records: (1..=3)
                 .map(|n| SessionHistoryRecord::Event {
                     event: SessionWireEvent {
                         event_type: "user/message".into(),
-                        seq: Some(SessionSeq(n)),
+                        seq: Some(SessionSeq::new(n)),
                         time: None,
                         request_id: None,
                         ignorable: None,
@@ -9275,7 +9290,7 @@ mod tests {
     #[test]
     fn search_yank_copies_current_match_text_ac003_03() {
         let mut s = AppState::default();
-        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle_command(C::OpenSession(SessionId::new("s1".into())));
         assistant_md(&mut s, "s1", 1, "```json\n{\"k\": \"v\"}\n```\n\n说明");
         s.handle_command(C::StartSearch);
         s.handle_command(C::PickerInput("k".into()));
@@ -9397,7 +9412,7 @@ mod tests {
     #[test]
     fn catalog_select_no_effort_success_updates_next_and_closes_ac006_08() {
         let mut s = AppState::default();
-        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle_command(C::OpenSession(SessionId::new("s1".into())));
         open_catalog_loaded(&mut s);
         // 选中无 efforts 的 v4-pro（本地过滤 + Enter）。
         s.handle_command(C::PickerInput("v4".into()));
@@ -9435,7 +9450,7 @@ mod tests {
     #[test]
     fn catalog_select_failure_keeps_current_and_shows_code_ac006_09() {
         let mut s = AppState::default();
-        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle_command(C::OpenSession(SessionId::new("s1".into())));
         open_catalog_loaded(&mut s);
         s.handle_command(C::PickerInput("v4".into()));
         s.handle_command(C::PickerConfirm);
@@ -9478,7 +9493,7 @@ mod tests {
     #[test]
     fn catalog_effort_subflow_uses_model_declared_efforts() {
         let mut s = AppState::default();
-        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle_command(C::OpenSession(SessionId::new("s1".into())));
         open_catalog_loaded(&mut s);
         // 选中带 efforts 的 deepseek-chat（默认 cursor 落在 defaultEffort=low）。
         s.handle_command(C::PickerInput("chat".into()));
@@ -9570,7 +9585,7 @@ mod tests {
         assert!(cmds.is_empty());
         // 打开会话后再开：发 FetchRemoteCommands。
         s.handle_command(C::ClosePicker);
-        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle_command(C::OpenSession(SessionId::new("s1".into())));
         let cmds = s.handle_command(C::OpenCommandPalette);
         assert!(matches!(cmds[0], Cmd::FetchRemoteCommands), "cmds={cmds:?}");
         // 远端命令到达 → 缓存并显示为候选。
@@ -9592,7 +9607,7 @@ mod tests {
     #[test]
     fn palette_confirm_remote_execute_and_failure_stays_open_ac006_13() {
         let mut s = AppState::default();
-        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle_command(C::OpenSession(SessionId::new("s1".into())));
         s.handle_command(C::OpenCommandPalette);
         s.handle(AppEvent::RemoteCommandsLoaded {
             commands: vec![crate::api::types::CommandDescriptor {
@@ -9742,7 +9757,7 @@ mod tests {
             .contains("无活动会话"));
         // 有活动会话 → fork 直接发（无参数）。
         s.handle_command(C::ClosePicker);
-        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle_command(C::OpenSession(SessionId::new("s1".into())));
         select_palette_item(&mut s, "fork session");
         let cmds = s.handle_command(C::PickerConfirm);
         let Cmd::WorkspaceOp { request_id, op } = &cmds[0] else {
@@ -9751,7 +9766,7 @@ mod tests {
         assert_eq!(
             op,
             &WorkspaceOperation::ForkSession {
-                session_id: SessionId("s1".into())
+                session_id: SessionId::new("s1".into())
             }
         );
         assert!(!request_id.is_empty());
@@ -9765,7 +9780,7 @@ mod tests {
     #[test]
     fn op_rename_session_input_stage_then_dispatch() {
         let mut s = AppState::default();
-        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle_command(C::OpenSession(SessionId::new("s1".into())));
         select_palette_item(&mut s, "rename session");
         assert!(s.handle_command(C::PickerConfirm).is_empty());
         // 进入输入子阶段。
@@ -9793,7 +9808,7 @@ mod tests {
         assert_eq!(
             op,
             &WorkspaceOperation::RenameSession {
-                session_id: SessionId("s1".into()),
+                session_id: SessionId::new("s1".into()),
                 title: "新标题".into()
             }
         );
@@ -9802,7 +9817,7 @@ mod tests {
     #[test]
     fn op_archive_danger_requires_confirm_then_sends_ac006_02() {
         let mut s = AppState::default();
-        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle_command(C::OpenSession(SessionId::new("s1".into())));
         select_palette_item(&mut s, "archive session");
         assert!(s.handle_command(C::PickerConfirm).is_empty());
         // 进入 ConfirmDanger（未发送）。
@@ -9823,7 +9838,7 @@ mod tests {
             panic!("确认后应发送, cmds={cmds:?}")
         };
         assert!(
-            matches!(op, WorkspaceOperation::ArchiveSession { session_id } if session_id.0 == "s1")
+            matches!(op, WorkspaceOperation::ArchiveSession { session_id } if session_id.get() == "s1")
         );
     }
 
@@ -9894,7 +9909,7 @@ mod tests {
         assert!(
             !matches!(
                 s.active_session.as_ref(),
-                Some(x) if x.0 == "s-new"
+                Some(x) if x.get() == "s-new"
             ),
             "迟到 fork 不打开新会话"
         );
@@ -9903,7 +9918,7 @@ mod tests {
     #[test]
     fn op_fork_success_opens_new_session() {
         let mut s = AppState::default();
-        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle_command(C::OpenSession(SessionId::new("s1".into())));
         s.command_palette.op_inflight = Some((String::from("req-9"), "fork session"));
         let cmds = s.handle(AppEvent::WorkspaceOpDone {
             request_id: "req-9".into(),
@@ -9912,10 +9927,10 @@ mod tests {
             },
         });
         assert!(cmds.iter().any(|c| {
-            matches!(c, Cmd::OpenFollow { session_id, .. } if session_id.0 == "s-fork")
+            matches!(c, Cmd::OpenFollow { session_id, .. } if session_id.get() == "s-fork")
         }));
         assert_eq!(
-            s.active_session.as_ref().map(|x| x.0.as_str()),
+            s.active_session.as_ref().map(|x| x.get()).as_deref(),
             Some("s-fork"),
             "fork 成功打开新会话"
         );
@@ -9927,7 +9942,7 @@ mod tests {
         let mut s = AppState::default();
         // 审批 granted 后事件重放（断线期间 pending，恢复后同事件重到）→
         // 队列 granted 去重集拒绝（AC-006-15/18：不重复授权）。
-        s.handle_command(C::OpenSession(SessionId("s1".into())));
+        s.handle_command(C::OpenSession(SessionId::new("s1".into())));
         let ev = ApprovalEvent {
             client_id: "c-1".into(),
             event_id: "e-1".into(),
@@ -10057,7 +10072,7 @@ mod tests {
         s.drafts.set(DraftState {
             text: "草稿A".into(),
             cursor: 3,
-            bound_session: SessionId("s1".into()),
+            bound_session: SessionId::new("s1".into()),
         });
         s.mark_drafts_dirty();
         assert!(s.take_draft_dirty(), "变更后 dirty 置位");
@@ -10072,7 +10087,7 @@ mod tests {
         s.drafts.set(DraftState {
             text: String::new(),
             cursor: 0,
-            bound_session: SessionId("s1".into()),
+            bound_session: SessionId::new("s1".into()),
         });
         let toml = s.draft_store_snapshot().to_toml().unwrap();
         assert!(crate::model::DraftStore::from_toml(&toml)
@@ -10097,8 +10112,11 @@ mod tests {
         store.set("s2", "草稿二");
         let mut s = AppState::default();
         s.seed_drafts_from_store(store);
-        assert!(s.drafts.get(&SessionId("s1".into())).is_some(), "启动恢复");
-        assert!(s.drafts.get(&SessionId("s2".into())).is_some());
+        assert!(
+            s.drafts.get(&SessionId::new("s1".into())).is_some(),
+            "启动恢复"
+        );
+        assert!(s.drafts.get(&SessionId::new("s2".into())).is_some());
         // clear：内存全清 + dirty。
         s.clear_all_drafts();
         assert!(s.drafts.is_empty());
@@ -10111,12 +10129,12 @@ mod tests {
         reg.set(DraftState {
             text: "a".into(),
             cursor: 0,
-            bound_session: SessionId("s1".into()),
+            bound_session: SessionId::new("s1".into()),
         });
         reg.set(DraftState {
             text: "b".into(),
             cursor: 0,
-            bound_session: SessionId("s2".into()),
+            bound_session: SessionId::new("s2".into()),
         });
         assert_eq!(reg.session_ids().len(), 2);
         reg.clear_all();
@@ -10143,7 +10161,7 @@ mod tests {
         std::env::remove_var("VISUAL");
         std::env::set_var("EDITOR", "/bin/true");
         let mut s = AppState::default();
-        let sid = SessionId("sess-e".into());
+        let sid = SessionId::new("sess-e".into());
         s.composer.visible = true;
         s.composer.active_session = Some(sid.clone());
         s.draft = Some(DraftState {
@@ -10213,7 +10231,7 @@ mod tests {
         let state_dir =
             std::env::temp_dir().join(format!("dshtui-edit-chain-{}", std::process::id()));
         std::env::set_var("XDG_STATE_HOME", &state_dir);
-        let sid = SessionId("sess-e2".into());
+        let sid = SessionId::new("sess-e2".into());
         // ① env 全缺 → config fallback。
         std::env::remove_var("EDITOR");
         std::env::remove_var("VISUAL");
@@ -10286,7 +10304,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let tmp = dir.join("draft.md");
         let mut s = AppState::default();
-        let sid = SessionId("sess-e".into());
+        let sid = SessionId::new("sess-e".into());
         s.composer.visible = false;
         s.draft = Some(DraftState {
             text: "old".into(),
@@ -10315,7 +10333,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let tmp = dir.join("draft.md");
         let mut s = AppState::default();
-        let sid = SessionId("sess-f".into());
+        let sid = SessionId::new("sess-f".into());
         s.composer.visible = false;
         s.draft = Some(DraftState {
             text: "原草稿".into(),
@@ -10343,7 +10361,7 @@ mod tests {
     #[test]
     fn mention_activated_on_at_in_insert_ac007_23() {
         let mut s = AppState::default();
-        let sid = SessionId("sess-m".into());
+        let sid = SessionId::new("sess-m".into());
         s.mode = Mode::Insert;
         s.composer.visible = true;
         s.composer.active_session = Some(sid.clone());
@@ -10372,7 +10390,7 @@ mod tests {
     #[test]
     fn mention_query_navigate_confirm_and_close_ac007_23() {
         let mut s = AppState::default();
-        let sid = SessionId("sess-m".into());
+        let sid = SessionId::new("sess-m".into());
         s.mode = Mode::Insert;
         s.composer.visible = true;
         s.composer.active_session = Some(sid.clone());
@@ -10423,7 +10441,7 @@ mod tests {
     #[test]
     fn mention_esc_closes_back_to_insert_ac007_23() {
         let mut s = AppState::default();
-        let sid = SessionId("sess-m".into());
+        let sid = SessionId::new("sess-m".into());
         s.mode = Mode::Insert;
         s.composer.visible = true;
         s.composer.active_session = Some(sid.clone());
@@ -10443,7 +10461,7 @@ mod tests {
     #[test]
     fn mention_fetch_failure_degrades_not_crash_ac007_23() {
         let mut s = AppState::default();
-        let sid = SessionId("sess-m".into());
+        let sid = SessionId::new("sess-m".into());
         s.mode = Mode::Insert;
         s.composer.visible = true;
         s.composer.active_session = Some(sid.clone());
@@ -10479,7 +10497,7 @@ mod tests {
         let (_dir, file) = temp_img("ok", b"\x89PNG-not-real-but-ok");
         let path = file.to_string_lossy().into_owned();
         let mut s = AppState::default();
-        let sid = SessionId("sess-i".into());
+        let sid = SessionId::new("sess-i".into());
         s.mode = Mode::Insert;
         s.composer.visible = true;
         s.composer.active_session = Some(sid.clone());
@@ -10531,7 +10549,7 @@ mod tests {
     #[test]
     fn submit_image_read_failure_keeps_draft_in_insert_ac007_24() {
         let mut s = AppState::default();
-        let sid = SessionId("sess-i".into());
+        let sid = SessionId::new("sess-i".into());
         s.mode = Mode::Insert;
         s.composer.visible = true;
         s.composer.active_session = Some(sid.clone());
@@ -10566,7 +10584,7 @@ mod tests {
         let (_dir, file) = temp_img("big", b"1234567890");
         let path = file.to_string_lossy().into_owned();
         let mut s = AppState::default();
-        let sid = SessionId("sess-i".into());
+        let sid = SessionId::new("sess-i".into());
         s.active_session = Some(sid.clone());
         s.mode = Mode::Insert;
         s.composer.visible = true;
@@ -10577,7 +10595,7 @@ mod tests {
             bound_session: sid.clone(),
         });
         // 造 imageLimits 投影：单张 ≤5 字节 → 超限。
-        let window = s.sessions.touch(&sid.0, 50);
+        let window = s.sessions.touch(&sid.get(), 50);
         let _ = window.apply(Incoming::Snapshot {
             cursor: None,
             records: vec![],
@@ -10603,7 +10621,7 @@ mod tests {
         // D-51：无官方 imageLimits 投影（本地兜底）——数量软上限拦截。
         let (_dir1, f1) = temp_img("cnt1", b"aaa");
         let (_dir2, f2) = temp_img("cnt2", b"bbb");
-        let sid = SessionId("sess-i".into());
+        let sid = SessionId::new("sess-i".into());
         let mut s = AppState {
             max_image_count: 1, // 本地上限 1 张
             mode: Mode::Insert,
@@ -10641,7 +10659,7 @@ mod tests {
     fn submit_local_soft_limit_per_image_bytes_blocks_d51() {
         // D-51：单张字节软上限拦截（本地兜底，per-image 语义）。
         let (_dir, file) = temp_img("byte", b"1234567890"); // 10 字节
-        let sid = SessionId("sess-i".into());
+        let sid = SessionId::new("sess-i".into());
         let mut s = AppState {
             max_image_bytes: 5, // 本地上限 5 字节
             mode: Mode::Insert,
@@ -10678,7 +10696,7 @@ mod tests {
     #[test]
     fn subagents_open_fetch_and_expand_ac007() {
         let mut s = AppState {
-            active_session: Some(SessionId("p1".into())),
+            active_session: Some(SessionId::new("p1".into())),
             ..Default::default()
         };
         // 打开面板 → fetch 父目录。
@@ -10736,7 +10754,7 @@ mod tests {
     #[test]
     fn subagents_interrupt_requires_confirm_and_emits_cmd_ac007_09() {
         let mut s = AppState {
-            active_session: Some(SessionId("p1".into())),
+            active_session: Some(SessionId::new("p1".into())),
             ..Default::default()
         };
         s.subagents.open("p1");
@@ -10776,7 +10794,7 @@ mod tests {
     #[test]
     fn subagents_interrupt_failure_surfaces_error_code_ac007_09() {
         let mut s = AppState {
-            active_session: Some(SessionId("p1".into())),
+            active_session: Some(SessionId::new("p1".into())),
             ..Default::default()
         };
         let _ = s.handle(AppEvent::SubagentInterruptDone {
@@ -10825,7 +10843,7 @@ mod tests {
     #[test]
     fn subagent_child_open_uses_subagent_address_follow_ac007_01() {
         let mut s = AppState {
-            active_session: Some(SessionId("p1".into())),
+            active_session: Some(SessionId::new("p1".into())),
             ..Default::default()
         };
         s.subagents.open("p1");
@@ -10847,7 +10865,10 @@ mod tests {
         let cmds = s.handle_command(crate::input::Command::OpenSelected);
         assert_eq!(s.mode, Mode::Normal, "关闭面板");
         assert!(!s.subagents.visible);
-        assert_eq!(s.active_session.as_ref().map(|s| s.0.as_str()), Some("c1"));
+        assert_eq!(
+            s.active_session.as_ref().map(|s| s.get()).as_deref(),
+            Some("c1")
+        );
         assert_eq!(
             s.pending_subagent_open
                 .as_ref()
@@ -10873,7 +10894,7 @@ mod tests {
         // parentSessionId 必须是直属父 c1（`subagents/list` 只列直属），
         // 不是 panel 根 p1——AC-007-01 嵌套语义。
         let mut s = AppState {
-            active_session: Some(SessionId("p1".into())),
+            active_session: Some(SessionId::new("p1".into())),
             ..Default::default()
         };
         s.subagents.open("p1");
@@ -10911,7 +10932,10 @@ mod tests {
         s.subagents.selected = 1;
         let cmds = s.handle_command(crate::input::Command::OpenSelected);
         assert_eq!(s.mode, Mode::Normal);
-        assert_eq!(s.active_session.as_ref().map(|s| s.0.as_str()), Some("gc1"));
+        assert_eq!(
+            s.active_session.as_ref().map(|s| s.get()).as_deref(),
+            Some("gc1")
+        );
         assert!(
             cmds.iter().any(
                 |c| matches!(c, Cmd::OpenFollowSubagent { parent_id, child_id, .. }
@@ -10928,7 +10952,7 @@ mod tests {
     #[test]
     fn subagents_list_failed_shows_code_panel_open_ac007_08() {
         let mut s = AppState {
-            active_session: Some(SessionId("p1".into())),
+            active_session: Some(SessionId::new("p1".into())),
             ..Default::default()
         };
         s.subagents.open("p1");
@@ -10955,10 +10979,10 @@ mod tests {
     #[test]
     fn goal_open_shows_projection_and_empty_state_ac007_11() {
         let mut s = AppState::default();
-        let sid = SessionId("sess-g".into());
+        let sid = SessionId::new("sess-g".into());
         s.active_session = Some(sid.clone());
         // 会话有 goal 投影。
-        let w = s.sessions.touch(&sid.0, 50);
+        let w = s.sessions.touch(&sid.get(), 50);
         let _ = w.apply(Incoming::Snapshot {
             cursor: None,
             records: vec![],
@@ -10990,7 +11014,7 @@ mod tests {
     #[test]
     fn goal_pause_sends_cas_op_and_stale_failure_recovers_ac007_12_14() {
         let mut s = AppState::default();
-        let sid = SessionId("sess-g".into());
+        let sid = SessionId::new("sess-g".into());
         s.active_session = Some(sid.clone());
         s.goals.open();
         s.goals.set_goal(
@@ -11047,9 +11071,9 @@ mod tests {
         // 不得解除 stale（否则陷入 STALE→重读→STALE 循环）；revision 前进
         // 才放行（GOAL_STALE_REVISION 对账）。
         let mut s = AppState::default();
-        let sid = SessionId("sess-g".into());
+        let sid = SessionId::new("sess-g".into());
         s.active_session = Some(sid.clone());
-        let w = s.sessions.touch(&sid.0, 50);
+        let w = s.sessions.touch(&sid.get(), 50);
         let proj = |rev: u64| {
             Some(serde_json::json!({
                 "goal": {"goal": {"id": "g1", "revision": rev, "objective": "交付",
@@ -11089,7 +11113,7 @@ mod tests {
         let cmds = s.handle_command(crate::input::Command::GoalResume);
         assert!(cmds.is_empty(), "stale 未解除时 resume 拒绝");
         // 对端投影前进到 6（follow 帧真实更新）→ 重读解除 stale → resume 放行。
-        let w = s.sessions.touch(&sid.0, 50);
+        let w = s.sessions.touch(&sid.get(), 50);
         let _ = w.apply(Incoming::Snapshot {
             cursor: None,
             records: vec![],
@@ -11108,7 +11132,7 @@ mod tests {
     #[test]
     fn goal_clear_double_confirm_and_create_input_ac007_14() {
         let mut s = AppState::default();
-        let sid = SessionId("sess-g".into());
+        let sid = SessionId::new("sess-g".into());
         s.active_session = Some(sid.clone());
         s.goals.open();
         s.goals.set_goal(
@@ -11160,7 +11184,7 @@ mod tests {
     #[test]
     fn goal_edit_prefills_objective_and_emits_edit_mutation_ac007_11() {
         let mut s = AppState::default();
-        let sid = SessionId("sess-g".into());
+        let sid = SessionId::new("sess-g".into());
         s.active_session = Some(sid.clone());
         s.goals.open();
         s.goals.set_goal(
@@ -11196,7 +11220,7 @@ mod tests {
     #[test]
     fn jobs_control_frames_maintain_readonly_mirror_ac007_13() {
         let mut s = AppState::default();
-        let sid = SessionId("sess-j".into());
+        let sid = SessionId::new("sess-j".into());
         // baseline.jobs per-session 数组。
         let item = ControlItem::Baseline {
             queues: serde_json::json!([]),
@@ -11425,7 +11449,7 @@ mod tests {
     #[test]
     fn skills_open_list_copy_ref_and_close_ac007_18() {
         let mut s = AppState::default();
-        let sid = SessionId("sess-sk".into());
+        let sid = SessionId::new("sess-sk".into());
         s.active_session = Some(sid.clone());
         s.open_skills_panel();
         assert_eq!(s.mode, Mode::Skills);
@@ -11469,7 +11493,7 @@ mod tests {
     #[test]
     fn export_open_edit_path_and_start_download_ac007_17() {
         let mut s = AppState {
-            active_session: Some(SessionId("sess-x".into())),
+            active_session: Some(SessionId::new("sess-x".into())),
             ..Default::default()
         };
         let _ = s.handle_command(crate::input::Command::OpenCommandPalette);
@@ -11517,7 +11541,7 @@ mod tests {
     #[test]
     fn export_failure_surfaces_code_and_can_retry_ac007_17() {
         let mut s = AppState {
-            active_session: Some(SessionId("sess-x".into())),
+            active_session: Some(SessionId::new("sess-x".into())),
             ..Default::default()
         };
         s.export.open("sess-x", "out.zip");
@@ -11578,12 +11602,12 @@ mod tests {
         // D-46：官方导出路由 404 → export_failed 自动转 Rebuilding 并 emit
         // Cmd::ExportRebuild（with session latest seq）。
         let mut s = AppState::default();
-        let sid = SessionId("sess-r".into());
+        let sid = SessionId::new("sess-r".into());
         s.active_session = Some(sid.clone());
         // 会话窗口带 follow 游标（page through_seq 锚点）。
-        let w = s.sessions.touch(&sid.0, 50);
+        let w = s.sessions.touch(&sid.get(), 50);
         let _ = w.apply(crate::model::Incoming::Snapshot {
-            cursor: Some(crate::api::types::SessionLogOffset(12)),
+            cursor: Some(crate::api::types::SessionLogOffset::new(12)),
             records: vec![],
             has_more: false,
             projections: None,
@@ -11608,7 +11632,7 @@ mod tests {
                     session_id,
                     through_seq: Some(seq),
                     ..
-                } if session_id == "sess-r" && seq.0 == 12
+                } if session_id == "sess-r" && seq.get() == 12
             )),
             "emit ExportRebuild with through_seq=12, cmds={cmds:?}"
         );
@@ -11618,7 +11642,7 @@ mod tests {
     fn export_403_and_remote_permission_never_fall_back_ac007_17() {
         // D-46：401/403/权限 Remote → Failed 展示 code，不降级不自动重试。
         let mut s = AppState {
-            active_session: Some(SessionId("sess-p".into())),
+            active_session: Some(SessionId::new("sess-p".into())),
             ..Default::default()
         };
         s.export.open("sess-p", "out.zip");
@@ -11641,11 +11665,11 @@ mod tests {
     fn export_transport_error_triggers_rebuild_fallback_ac007_17() {
         // D-46：transport（路由不可达）也走 page 重建兜底（可恢复路径）。
         let mut s = AppState::default();
-        let sid = SessionId("sess-t".into());
+        let sid = SessionId::new("sess-t".into());
         s.active_session = Some(sid.clone());
-        let w = s.sessions.touch(&sid.0, 50);
+        let w = s.sessions.touch(&sid.get(), 50);
         let _ = w.apply(crate::model::Incoming::Snapshot {
-            cursor: Some(crate::api::types::SessionLogOffset(3)),
+            cursor: Some(crate::api::types::SessionLogOffset::new(3)),
             records: vec![],
             has_more: false,
             projections: None,
@@ -11674,7 +11698,7 @@ mod tests {
     #[test]
     fn export_rebuild_progress_done_failed_round_trip_ac007_17() {
         let mut s = AppState {
-            active_session: Some(SessionId("sess-d".into())),
+            active_session: Some(SessionId::new("sess-d".into())),
             ..Default::default()
         };
         s.export.open("sess-d", "out.jsonl");
@@ -11757,9 +11781,9 @@ mod tests {
     ) -> (AppState, SessionId) {
         // rows: (seq, "user/message"|"assistant/message", content/message_id)
         let mut s = AppState::default();
-        let sid = SessionId("sess-ma".into());
+        let sid = SessionId::new("sess-ma".into());
         s.active_session = Some(sid.clone());
-        let w = s.sessions.touch(&sid.0, 50);
+        let w = s.sessions.touch(&sid.get(), 50);
         let mut records = Vec::new();
         for (seq, typ, payload) in rows {
             let data = if typ == "user/message" {
@@ -11770,7 +11794,7 @@ mod tests {
             records.push(SessionHistoryRecord::Event {
                 event: SessionWireEvent {
                     event_type: typ.into(),
-                    seq: Some(SessionSeq(seq)),
+                    seq: Some(SessionSeq::new(seq)),
                     time: None,
                     request_id: None,
                     ignorable: None,
@@ -11829,7 +11853,7 @@ mod tests {
         assert!(
             cmds.iter()
                 .any(|c| matches!(c, Cmd::ForkAtSeq { session_id, at_seq }
-                if session_id == &sid.0 && *at_seq == 6)),
+                if session_id == &sid.get() && *at_seq == 6)),
             "branch fork atSeq=6"
         );
     }
@@ -11996,7 +12020,7 @@ mod tests {
     #[test]
     fn message_action_branch_failure_shows_code_ac007_27() {
         let mut s = AppState {
-            active_session: Some(SessionId("sess-x".into())),
+            active_session: Some(SessionId::new("sess-x".into())),
             ..Default::default()
         };
         let _ = s.handle(AppEvent::MessageActionFailed {
@@ -12022,15 +12046,15 @@ mod tests {
             kitty_capable: true, // ImageView pager 仅 Kitty 路径
             ..Default::default()
         };
-        let sid = SessionId("sess-img".into());
+        let sid = SessionId::new("sess-img".into());
         s.active_session = Some(sid.clone());
         // 会话窗口：连续 3 图（seq 10/11/12）。
-        let w = s.sessions.touch(&sid.0, 50);
+        let w = s.sessions.touch(&sid.get(), 50);
         let records = (10u64..=12)
             .map(|seq| SessionHistoryRecord::Event {
                 event: SessionWireEvent {
                     event_type: "image".into(),
-                    seq: Some(SessionSeq(seq)),
+                    seq: Some(SessionSeq::new(seq)),
                     time: None,
                     request_id: None,
                     ignorable: None,
@@ -12051,7 +12075,7 @@ mod tests {
         });
         // 打开中间图（seq 11）——直接置 view（fetch 路径由 execute_one 驱动，
         // 这里仅验证 run/pager 计算与步进命令）。
-        s.image_cache.abort(&AttachmentId("a11".into()));
+        s.image_cache.abort(&AttachmentId::new("a11".into()));
         let blocks = s.active_window().unwrap().block_snapshot();
         assert_eq!(blocks.len(), 3, "窗口 3 块: {blocks:?}");
         assert!(
@@ -12061,34 +12085,50 @@ mod tests {
             "全为 Image: {blocks:?}"
         );
         let (start, total, index) =
-            crate::model::image::image_run_of(&blocks, SessionSeq(11)).unwrap();
+            crate::model::image::image_run_of(&blocks, SessionSeq::new(11)).unwrap();
         assert_eq!((start, total, index), (0, 3, 1), "连续 3 图 run");
-        s.image_view
-            .open_view(SessionSeq(11), AttachmentId("a11".into()), None, None);
+        s.image_view.open_view(
+            SessionSeq::new(11),
+            AttachmentId::new("a11".into()),
+            None,
+            None,
+        );
         s.image_view.set_pager(total, index);
         s.mode = Mode::ImageView;
         // `]` → 步进到 seq 12。
         let cmds = s.handle_command(crate::input::Command::ImageViewPager { delta: 1 });
-        assert_eq!(s.image_view.block_seq, Some(SessionSeq(12)), "步进到下一图");
+        assert_eq!(
+            s.image_view.block_seq,
+            Some(SessionSeq::new(12)),
+            "步进到下一图"
+        );
         assert_eq!(s.image_view.pager.as_ref().map(|p| p.index), Some(2));
         // `[` → 回 seq 11。
         let back_cmds = s.handle_command(crate::input::Command::ImageViewPager { delta: -1 });
         assert_eq!(
             s.image_view.block_seq,
-            Some(SessionSeq(11)),
+            Some(SessionSeq::new(11)),
             "回 seq11 (cmds={back_cmds:?})"
         );
         // 真实循环中离开后 on_attachment_ready 对非目标会 abort+清 loading；
         // 单测无 fetch 完成，模拟该清理再步进 12。
-        s.image_cache.abort(&AttachmentId("a12".into()));
-        s.image_loading.remove(&AttachmentId("a12".into()));
+        s.image_cache.abort(&AttachmentId::new("a12".into()));
+        s.image_loading.remove(&AttachmentId::new("a12".into()));
         let _ = s.handle_command(crate::input::Command::ImageViewPager { delta: 1 });
-        assert_eq!(s.image_view.block_seq, Some(SessionSeq(12)), "再次步进 12");
+        assert_eq!(
+            s.image_view.block_seq,
+            Some(SessionSeq::new(12)),
+            "再次步进 12"
+        );
         // 组边界停留（seq 12 再 ] 不动）。
-        s.image_cache.abort(&AttachmentId("a11".into()));
-        s.image_loading.remove(&AttachmentId("a11".into()));
+        s.image_cache.abort(&AttachmentId::new("a11".into()));
+        s.image_loading.remove(&AttachmentId::new("a11".into()));
         let _ = s.handle_command(crate::input::Command::ImageViewPager { delta: 1 });
-        assert_eq!(s.image_view.block_seq, Some(SessionSeq(12)), "组尾停留");
+        assert_eq!(
+            s.image_view.block_seq,
+            Some(SessionSeq::new(12)),
+            "组尾停留"
+        );
         let _cmds = cmds;
         let _ = back_cmds;
     }
@@ -12096,8 +12136,12 @@ mod tests {
     #[test]
     fn image_pager_closed_and_no_pager_when_single_image() {
         let mut s = AppState::default();
-        s.image_view
-            .open_view(SessionSeq(1), AttachmentId("a1".into()), None, None);
+        s.image_view.open_view(
+            SessionSeq::new(1),
+            AttachmentId::new("a1".into()),
+            None,
+            None,
+        );
         s.image_view.set_pager(1, 0);
         assert!(s.image_view.pager.is_none() || s.image_view.pager.as_ref().unwrap().total == 1);
         s.image_view.close();
@@ -12114,15 +12158,15 @@ mod tests {
         let path = s
             .image_cache
             .write_temp_file(
-                &crate::api::types::MediaType("image/png".into()),
+                &crate::api::types::MediaType::new("image/png".into()),
                 vec![1, 2, 3],
             )
             .unwrap();
         let _ = s.image_cache.complete(
-            &AttachmentId(att.into()),
+            &AttachmentId::new(att.into()),
             crate::model::ImageCacheEntry {
-                attachment_id: AttachmentId(att.into()),
-                media_type: crate::api::types::MediaType("image/png".into()),
+                attachment_id: AttachmentId::new(att.into()),
+                media_type: crate::api::types::MediaType::new("image/png".into()),
                 bytes: 3,
                 width: 64,
                 height: 64,
@@ -12130,9 +12174,13 @@ mod tests {
                 last_used: 0,
             },
         );
-        s.image_cache.pin(&AttachmentId(att.into()));
-        s.image_view
-            .open_view(SessionSeq(seq), AttachmentId(att.into()), None, None);
+        s.image_cache.pin(&AttachmentId::new(att.into()));
+        s.image_view.open_view(
+            SessionSeq::new(seq),
+            AttachmentId::new(att.into()),
+            None,
+            None,
+        );
         s.image_view.mark_rendered();
         s.mode = Mode::ImageView;
     }
@@ -12143,7 +12191,7 @@ mod tests {
             kitty_capable: true, // ImageView zoom 仅 Kitty 路径
             ..Default::default()
         };
-        let sid = SessionId("sess-z".into());
+        let sid = SessionId::new("sess-z".into());
         zoom_ready_view(&mut s, &sid, "za", 7);
         // `+`：zoom 变档 + 发重编码命令（带 zoom scale）。
         let cmds = s.handle_command(crate::input::Command::ImageViewZoomIn);
@@ -12155,7 +12203,7 @@ mod tests {
                     attachment_id,
                     zoom,
                     ..
-                } if attachment_id.0 == "za" && (*zoom - 1.25).abs() < 1e-6
+                } if attachment_id.get() == "za" && (*zoom - 1.25).abs() < 1e-6
             )),
             "cmds={cmds:?}"
         );
@@ -12168,11 +12216,11 @@ mod tests {
         let sid2 = sid.clone();
         let cmds3 = s.handle(AppEvent::AttachmentReady {
             session_id: sid2,
-            attachment_id: AttachmentId("za".into()),
-            block_seq: SessionSeq(7),
+            attachment_id: AttachmentId::new("za".into()),
+            block_seq: SessionSeq::new(7),
             meta: crate::model::AttachmentRef {
-                attachment_id: AttachmentId("za".into()),
-                media_type: crate::api::types::MediaType("image/png".into()),
+                attachment_id: AttachmentId::new("za".into()),
+                media_type: crate::api::types::MediaType::new("image/png".into()),
                 bytes: 1,
                 width: 64,
                 height: 64,
@@ -12181,8 +12229,8 @@ mod tests {
             },
             frame: None,
             entry: crate::model::ImageCacheEntry {
-                attachment_id: AttachmentId("za".into()),
-                media_type: crate::api::types::MediaType("image/png".into()),
+                attachment_id: AttachmentId::new("za".into()),
+                media_type: crate::api::types::MediaType::new("image/png".into()),
                 bytes: 1,
                 width: 64,
                 height: 64,
@@ -12205,7 +12253,7 @@ mod tests {
     #[test]
     fn image_zoom_reset_and_close_cancel_inflight_ac007_06() {
         let mut s = AppState::default();
-        let sid = SessionId("sess-z2".into());
+        let sid = SessionId::new("sess-z2".into());
         zoom_ready_view(&mut s, &sid, "zb", 8);
         // 0：重置 1.0 + 发重编码（当前已是 1.0，仍发以便与 fit 一致）。
         let cmds = s.handle_command(crate::input::Command::ImageViewZoomReset);
@@ -12232,10 +12280,14 @@ mod tests {
         assert_eq!(s.image_view.zoom, 1.0);
         // ImageView 但 Loading（无帧可重编码）：只更新状态 + 登记在途编码
         // zoom=1.0（打开路径帧到达时补发重编码）——不发命令（无 temp_file）。
-        let sid = SessionId("sess-z3".into());
+        let sid = SessionId::new("sess-z3".into());
         s.active_session = Some(sid.clone());
-        s.image_view
-            .open_view(SessionSeq(1), AttachmentId("zc".into()), None, None);
+        s.image_view.open_view(
+            SessionSeq::new(1),
+            AttachmentId::new("zc".into()),
+            None,
+            None,
+        );
         s.mode = Mode::ImageView;
         assert_eq!(s.image_view.phase, crate::model::ImageViewPhase::Loading);
         let cmds2 = s.handle_command(crate::input::Command::ImageViewZoomIn);
@@ -12261,11 +12313,15 @@ mod tests {
             kitty_capable: true,
             ..Default::default()
         };
-        let sid = SessionId("sess-zl".into());
+        let sid = SessionId::new("sess-zl".into());
         zoom_ready_view(&mut s, &sid, "zl", 7); // 缓存就绪（补发源文件）
                                                 // 回到 Loading 形态：重新 open 复位 zoom=1.0 + inflight=false。
-        s.image_view
-            .open_view(SessionSeq(8), AttachmentId("zl".into()), None, None);
+        s.image_view.open_view(
+            SessionSeq::new(8),
+            AttachmentId::new("zl".into()),
+            None,
+            None,
+        );
         assert_eq!(s.image_view.phase, crate::model::ImageViewPhase::Loading);
         // Loading 期按 `+`：状态 1.25，登记在途编码 zoom=1.0，不发命令。
         let cmds = s.handle_command(crate::input::Command::ImageViewZoomIn);
@@ -12275,11 +12331,11 @@ mod tests {
         // 打开路径帧（zoom=1.0 编码）到达 → finish 发现 zoom 已变 → 补发。
         let cmds = s.handle(AppEvent::AttachmentReady {
             session_id: sid,
-            attachment_id: AttachmentId("zl".into()),
-            block_seq: SessionSeq(8),
+            attachment_id: AttachmentId::new("zl".into()),
+            block_seq: SessionSeq::new(8),
             meta: crate::model::AttachmentRef {
-                attachment_id: AttachmentId("zl".into()),
-                media_type: crate::api::types::MediaType("image/png".into()),
+                attachment_id: AttachmentId::new("zl".into()),
+                media_type: crate::api::types::MediaType::new("image/png".into()),
                 bytes: 3,
                 width: 64,
                 height: 64,
@@ -12288,8 +12344,8 @@ mod tests {
             },
             frame: None,
             entry: crate::model::ImageCacheEntry {
-                attachment_id: AttachmentId("zl".into()),
-                media_type: crate::api::types::MediaType("image/png".into()),
+                attachment_id: AttachmentId::new("zl".into()),
+                media_type: crate::api::types::MediaType::new("image/png".into()),
                 bytes: 3,
                 width: 64,
                 height: 64,
@@ -12314,7 +12370,7 @@ mod tests {
     #[test]
     fn subagent_child_submit_routes_to_subagents_prompt_ac007_01_10() {
         let mut s = AppState::default();
-        let child = SessionId("c1".into());
+        let child = SessionId::new("c1".into());
         s.active_session = Some(child.clone());
         s.composer.visible = true;
         s.composer.active_session = Some(child.clone());
@@ -12343,7 +12399,7 @@ mod tests {
         );
         // 普通会话仍走 SendPrompt。
         let mut s2 = AppState::default();
-        let sid = SessionId("sess-n".into());
+        let sid = SessionId::new("sess-n".into());
         s2.active_session = Some(sid.clone());
         s2.composer.visible = true;
         s2.composer.active_session = Some(sid.clone());
@@ -12362,7 +12418,7 @@ mod tests {
         // child 打开态断线重连：follow 仍走 subagent address、不退回普通
         // session/control（与首次打开语义一致，避免 address 漂移）。
         let mut s = AppState::default();
-        let sid = SessionId("c1".into());
+        let sid = SessionId::new("c1".into());
         s.active_session = Some(sid.clone());
         s.subagent_parents.insert("c1".into(), "p1".into());
         let cmds = s.handle(AppEvent::Reconnected);
@@ -12390,7 +12446,7 @@ mod tests {
         );
         // 普通会话重连仍发 OpenFollow+OpenControl（回归）。
         let mut s2 = AppState::default();
-        let sid2 = SessionId("s1".into());
+        let sid2 = SessionId::new("s1".into());
         s2.active_session = Some(sid2.clone());
         let cmds2 = s2.handle(AppEvent::Reconnected);
         assert_eq!(

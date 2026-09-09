@@ -17,11 +17,20 @@ macro_rules! newtype {
             Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, Default,
         )]
         #[serde(transparent)]
-        pub struct $name(pub $inner);
+        // 字段私有：tuple 构造/`.0` 直读只在定义模块内可行（含 Display 的
+        // self.0 与 child `tests` 模块）；跨模块一律走 new()/get()。这是
+        // 编译期边界（REQ-008 D-66 / AC-008-16 newtype 冻结），无运行时断言。
+        pub struct $name($inner);
 
         impl $name {
             pub fn new(v: $inner) -> Self {
                 Self(v)
+            }
+
+            /// 读取内部裸值（owned 拷贝；Copy 内层无运行时开销）。跨模块禁止
+            /// 直接读私有字段 `.0`，一律经此访问器取值。
+            pub fn get(&self) -> $inner {
+                self.0.clone()
             }
         }
 
@@ -713,7 +722,7 @@ pub fn meta_from_raw(raw: ListItemRaw) -> Option<SessionMeta> {
     });
 
     Some(SessionMeta {
-        id: SessionId(raw.id),
+        id: SessionId::new(raw.id),
         title: get_str(&["title"]).or(raw.title.clone()),
         cwd: get_str(&["cwd"]).or(raw.cwd.clone()),
         updated_at_ms,
@@ -727,8 +736,8 @@ pub fn meta_from_raw(raw: ListItemRaw) -> Option<SessionMeta> {
             .or(raw.blank)
             .unwrap_or(false),
         origin: raw.origin.clone(),
-        parent_id: raw.parent_id.map(SessionId),
-        workspace: raw.workspace.map(WorkspaceId),
+        parent_id: raw.parent_id.map(SessionId::new),
+        workspace: raw.workspace.map(WorkspaceId::new),
         last_turn_preview,
     })
 }
@@ -1041,12 +1050,39 @@ mod tests {
 
     #[test]
     fn newtype_serde_roundtrip() {
-        let seq: SessionSeq = serde_json::from_str("42").unwrap();
-        assert_eq!(seq, SessionSeq(42));
-        assert_eq!(serde_json::to_string(&seq).unwrap(), "42");
+        // D-66 焦点类型 SessionSeq / SessionLogOffset：JSON 形状保持裸数字，
+        // 可仅凭裸值 roundtrip 并回写；String 内层类型同理（transparent）。
+        for v in [0u64, 1, 42, u64::MAX] {
+            let seq: SessionSeq = serde_json::from_str(&v.to_string()).unwrap();
+            assert_eq!(serde_json::to_string(&seq).unwrap(), v.to_string());
+            let offset: SessionLogOffset = serde_json::from_str(&v.to_string()).unwrap();
+            assert_eq!(serde_json::to_string(&offset).unwrap(), v.to_string());
+        }
         let sid: SessionId = serde_json::from_str("\"s1\"").unwrap();
-        assert_eq!(sid.0, "s1");
+        assert_eq!(serde_json::to_string(&sid).unwrap(), "\"s1\"");
+    }
+
+    #[test]
+    fn newtype_new_get_display_bare_value() {
+        // new()/get()/Display 对新类型保持「裸值进出」（D-66 冻结公共 API）。
+        let seq = SessionSeq::new(42);
+        assert_eq!(seq.get(), 42);
+        assert_eq!(seq.to_string(), "42");
+        let offset = SessionLogOffset::new(7);
+        assert_eq!(offset.get(), 7);
+        assert_eq!(offset.to_string(), "7");
+        let sid = SessionId::new("s1".into());
+        assert_eq!(sid.get(), "s1");
         assert_eq!(sid.to_string(), "s1");
+        // 反序列化等价性：裸值 roundtrip 与 new() 构造一致。
+        assert_eq!(
+            serde_json::from_str::<SessionSeq>("42").unwrap(),
+            SessionSeq::new(42)
+        );
+        assert_eq!(
+            serde_json::from_str::<SessionLogOffset>("7").unwrap(),
+            SessionLogOffset::new(7)
+        );
     }
 
     #[test]
@@ -1058,7 +1094,7 @@ mod tests {
         match r {
             SessionHistoryRecord::Event { event } => {
                 assert_eq!(event.event_type, "user/message");
-                assert_eq!(event.seq, Some(SessionSeq(3)));
+                assert_eq!(event.seq, Some(SessionSeq::new(3)));
                 assert_eq!(event.request_id.as_deref(), Some("req-1"));
                 assert_eq!(event.data.unwrap()["content"], "hi");
             }
@@ -1072,7 +1108,7 @@ mod tests {
         .unwrap();
         match r {
             SessionHistoryRecord::Event { event } => {
-                assert_eq!(event.seq, Some(SessionSeq(4)));
+                assert_eq!(event.seq, Some(SessionSeq::new(4)));
                 assert_eq!(event.request_id, None);
             }
             _ => panic!("wrong variant"),
@@ -1148,14 +1184,14 @@ mod tests {
         assert_eq!(raw.blank, Some(false));
 
         let m = meta_from_raw(raw).unwrap();
-        assert_eq!(m.id, SessionId("sess-9".into()));
+        assert_eq!(m.id, SessionId::new("sess-9".into()));
         assert_eq!(m.title.as_deref(), Some("部署排查"));
         assert_eq!(m.cwd.as_deref(), Some("/home/nd"));
         assert_eq!(m.updated_at_ms, 1788864117943);
         assert!(!m.running);
         assert!(!m.blank);
         assert_eq!(m.origin.as_deref(), Some("subagent"));
-        assert_eq!(m.parent_id, Some(SessionId("parent-1".into())));
+        assert_eq!(m.parent_id, Some(SessionId::new("parent-1".into())));
         assert_eq!(m.workspace, None);
         assert_eq!(m.last_turn_preview.as_deref(), Some("r2"));
     }
@@ -1183,7 +1219,7 @@ mod tests {
         )
         .unwrap();
         let m = meta_from_raw(raw).unwrap();
-        assert_eq!(m.id, SessionId("sess-7".into()));
+        assert_eq!(m.id, SessionId::new("sess-7".into()));
         assert_eq!(m.title.as_deref(), Some("部署排查"));
         assert_eq!(m.cwd.as_deref(), Some("/home/nd"));
         assert_eq!(m.updated_at_ms, 2000, "顶层 updatedAt 应为 updated_at 主源");
@@ -1199,7 +1235,7 @@ mod tests {
         // 字段可整体省略）→ 除 id 外全空但可解析。
         let raw: ListItemRaw = serde_json::from_str(r#"{"sessionId":"sess-8"}"#).unwrap();
         let m = meta_from_raw(raw).unwrap();
-        assert_eq!(m.id, SessionId("sess-8".into()));
+        assert_eq!(m.id, SessionId::new("sess-8".into()));
         assert_eq!(m.title, None);
         assert_eq!(m.cwd, None);
         assert_eq!(m.updated_at_ms, 0);
@@ -1226,10 +1262,10 @@ mod tests {
         assert_eq!(raw.updated_at_ms, Some(123));
         assert_eq!(raw.parent_id.as_deref(), Some("p8"));
         let m = meta_from_raw(raw).unwrap();
-        assert_eq!(m.id, SessionId("sess-8".into()));
+        assert_eq!(m.id, SessionId::new("sess-8".into()));
         assert_eq!(m.updated_at_ms, 123);
-        assert_eq!(m.parent_id, Some(SessionId("p8".into())));
-        assert_eq!(m.workspace, Some(WorkspaceId("ws-1".into())));
+        assert_eq!(m.parent_id, Some(SessionId::new("p8".into())));
+        assert_eq!(m.workspace, Some(WorkspaceId::new("ws-1".into())));
         assert_eq!(m.title, None);
         // camel 自然键（updatedAtMs/parentId）也可用。
         let raw: ListItemRaw =
@@ -1258,7 +1294,7 @@ mod tests {
                 projections,
                 ..
             } => {
-                assert_eq!(cursor, Some(SessionLogOffset(10)));
+                assert_eq!(cursor, Some(SessionLogOffset::new(10)));
                 assert_eq!(has_more, Some(false));
                 assert_eq!(projections.unwrap()["values"]["title"], "t");
             }
@@ -1268,6 +1304,8 @@ mod tests {
             r#"{"type":"event","event":{"type":"turn/end","seq":11,"requestId":"r9"}}"#,
         )
         .unwrap();
-        assert!(matches!(f, FollowFrame::Event { event } if event.seq == Some(SessionSeq(11))));
+        assert!(
+            matches!(f, FollowFrame::Event { event } if event.seq == Some(SessionSeq::new(11)))
+        );
     }
 }

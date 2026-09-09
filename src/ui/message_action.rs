@@ -157,7 +157,7 @@ mod tests {
         app.message_action.open_menu(6);
         // user 末条静止：retry+branch。
         app.msg_action_target = Some(crate::app::MessageActionTarget {
-            session_id: crate::api::types::SessionId("s1".into()),
+            session_id: crate::api::types::SessionId::new("s1".into()),
             seq: 6,
             kind: MsgTargetKind::User,
             user_text: Some("再来一次".into()),
@@ -178,7 +178,7 @@ mod tests {
         app.message_action = MessageActionState::default();
         app.message_action.open_menu(5);
         app.msg_action_target = Some(crate::app::MessageActionTarget {
-            session_id: crate::api::types::SessionId("s1".into()),
+            session_id: crate::api::types::SessionId::new("s1".into()),
             seq: 5,
             kind: MsgTargetKind::Assistant,
             user_text: None,

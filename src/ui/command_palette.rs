@@ -287,7 +287,7 @@ mod tests {
         app.command_palette.stage = Some(crate::app::PaletteStage::ConfirmDanger {
             label: "archive session".into(),
             op: crate::app::WorkspaceOperation::ArchiveSession {
-                session_id: crate::api::types::SessionId("s1".into()),
+                session_id: crate::api::types::SessionId::new("s1".into()),
             },
         });
         let backend = TestBackend::new(120, 22);

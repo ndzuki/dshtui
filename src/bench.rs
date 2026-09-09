@@ -576,7 +576,7 @@ fn seed_sessions(app: &mut AppState, n: usize, window_cap: usize) {
     for i in 0..n {
         let id = format!("sess-{:06}", i);
         app.workspaces.upsert_session(SessionMeta {
-            id: SessionId(id.clone()),
+            id: SessionId::new(id.clone()),
             title: Some(format!("seed session {i}")),
             cwd: Some("/tmp/proj".into()),
             updated_at_ms: 1_700_000_000_000 + i as i64,
@@ -598,7 +598,7 @@ fn seed_sessions(app: &mut AppState, n: usize, window_cap: usize) {
 /// 搜索索引），置为活动会话（Center 焦点，滚动浏览态）。走公开 reducer
 /// `AppState::handle(AppEvent::FollowSnapshot)`（不经私有字段）。
 fn seed_long_session(app: &mut AppState, scale: &Scale) {
-    let sid = SessionId("bench-long-session".into());
+    let sid = SessionId::new("bench-long-session".into());
     app.conn = ConnState::Ready;
     app.active_session = Some(sid.clone());
     app.focus = Focus::Center;
@@ -698,7 +698,7 @@ fn push_event(
     out.push(SessionHistoryRecord::Event {
         event: SessionWireEvent {
             event_type: event_type.to_string(),
-            seq: Some(SessionSeq(*seq)),
+            seq: Some(SessionSeq::new(*seq)),
             time: Some(1_700_000_000_000 + *seq as i64),
             request_id: None,
             ignorable: None,
@@ -748,13 +748,13 @@ fn seed_image_cache(app: &mut AppState) {
     let cache = std::sync::Arc::clone(&app.image_cache);
     cache.set_budget(IMAGE_BUDGET_BYTES);
     for i in 0..(IMAGE_BUDGET_BYTES / IMAGE_ENTRY_BYTES * 4) {
-        let id = AttachmentId(format!("bench-img-{i:05}"));
+        let id = AttachmentId::new(format!("bench-img-{i:05}"));
         if cache.acquire(&id) == crate::cache::image_cache::Acquire::Started {
             let _ = cache.complete(
                 &id,
                 ImageCacheEntry {
                     attachment_id: id.clone(),
-                    media_type: MediaType("image/png".to_string()),
+                    media_type: MediaType::new("image/png".to_string()),
                     bytes: IMAGE_ENTRY_BYTES,
                     width: 800,
                     height: 600,
@@ -885,7 +885,7 @@ mod tests {
             app.workspaces
                 .sessions_sorted()
                 .into_iter()
-                .map(|m| m.id.0.clone())
+                .map(|m| m.id.get())
                 .collect()
         };
         assert_eq!(ids(&a), ids(&b), "会话序确定性");

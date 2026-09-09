@@ -19,7 +19,7 @@ use super::format_hhmm;
 fn traj_window(app: &AppState) -> Option<&TrajectoryWindow> {
     app.active_session
         .as_ref()
-        .and_then(|id| app.traj_sessions.get(&id.0))
+        .and_then(|id| app.traj_sessions.get(&id.get()))
 }
 
 /// 折叠标记：turn/assistant 组首行前缀（▸ 折叠可展开 / ▾ 展开可折叠）。

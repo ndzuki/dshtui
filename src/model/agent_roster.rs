@@ -117,7 +117,7 @@ impl AgentRosterEntry {
                 task.to_string()
             };
         }
-        short_session(&self.session_id.0)
+        short_session(&self.session_id.get())
     }
 
     /// 任务标题首行（chat 首问 kbQuery / 详情归属任务用）。
@@ -592,7 +592,7 @@ mod tests {
     #[test]
     fn from_wire_maps_all_fields() {
         let e = AgentRosterEntry::from_wire(&wire("session-x", "implementing", "x", "working"));
-        assert_eq!(e.session_id.0, "session-x");
+        assert_eq!(e.session_id.get(), "session-x");
         assert_eq!(e.status, AgentStatus::Working);
         assert_eq!(e.kind, AgentKind::Subagent);
         assert_eq!(e.elapsed_sec, 3661);
@@ -688,7 +688,7 @@ mod tests {
         w1.seq = 9;
         let (add, upd, rem) = snap.merge(&[w1, wire("s2", "", "", "idle")], 3);
         assert_eq!((add, upd, rem), (0, 1, 0));
-        assert_eq!(snap.ordered()[0].session_id.0, "s1");
+        assert_eq!(snap.ordered()[0].session_id.get(), "s1");
         assert_eq!(snap.ordered()[0].seq, 9);
         assert_eq!(snap.finished, 3);
 

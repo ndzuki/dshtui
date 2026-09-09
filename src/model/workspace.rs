@@ -296,11 +296,15 @@ impl WorkspaceStore {
         let mut scored: Vec<(u32, &SessionMeta)> = sorted
             .into_iter()
             .filter_map(|meta| {
+                // id/workspace 为私有 newtype 字段，需先经 get() 取 owned 值再借；
+                // 其余 Option<String> 字段仍直接 borrow meta（无额外拷贝）。
+                let id = meta.id.get();
+                let ws = meta.workspace.as_ref().map(|w| w.get());
                 let fields = [
-                    meta.id.0.as_str(),
+                    id.as_str(),
                     meta.title.as_deref().unwrap_or(""),
                     meta.cwd.as_deref().unwrap_or(""),
-                    meta.workspace.as_ref().map(|w| w.0.as_str()).unwrap_or(""),
+                    ws.as_deref().unwrap_or(""),
                     meta.last_turn_preview.as_deref().unwrap_or(""),
                 ];
                 let best = fields
@@ -328,7 +332,7 @@ mod tests {
 
     fn meta(id: &str, updated: i64, ws: Option<&str>) -> SessionMeta {
         SessionMeta {
-            id: SessionId(id.into()),
+            id: SessionId::new(id.into()),
             title: Some(format!("t-{id}")),
             cwd: None,
             updated_at_ms: updated,
@@ -336,7 +340,7 @@ mod tests {
             blank: false,
             origin: None,
             parent_id: None,
-            workspace: ws.map(|s| WorkspaceId(s.into())),
+            workspace: ws.map(|s| WorkspaceId::new(s.into())),
             last_turn_preview: None,
         }
     }
@@ -351,7 +355,7 @@ mod tests {
         store.upsert_session(meta("a", 9, None));
         store.upsert_session(meta("c", 3, None));
         assert_eq!(store.session_count(), 3);
-        assert_eq!(store.sessions[&SessionId("a".into())].updated_at_ms, 9);
+        assert_eq!(store.sessions[&SessionId::new("a".into())].updated_at_ms, 9);
     }
 
     #[test]
@@ -361,22 +365,31 @@ mod tests {
         store.upsert_session(meta("new", 100, None));
         store.upsert_session(meta("mid", 50, None));
         let sorted = store.sessions_sorted();
-        assert_eq!(sorted[0].id, SessionId("new".into()));
-        assert_eq!(sorted[2].id, SessionId("old".into()));
+        assert_eq!(sorted[0].id, SessionId::new("new".into()));
+        assert_eq!(sorted[2].id, SessionId::new("old".into()));
     }
 
     #[test]
     fn workspace_attach_and_upsert() {
         let mut store = WorkspaceStore::new();
-        store.upsert_workspace(WorkspaceId("ws1".into()), Some("项目A".into()));
+        store.upsert_workspace(WorkspaceId::new("ws1".into()), Some("项目A".into()));
         store.upsert_session(meta("s1", 1, Some("ws1")));
-        store.attach_session_to_workspace(&WorkspaceId("ws1".into()), &SessionId("s1".into()));
+        store.attach_session_to_workspace(
+            &WorkspaceId::new("ws1".into()),
+            &SessionId::new("s1".into()),
+        );
         // Duplicate attach produces no duplicate members.
-        store.attach_session_to_workspace(&WorkspaceId("ws1".into()), &SessionId("s1".into()));
+        store.attach_session_to_workspace(
+            &WorkspaceId::new("ws1".into()),
+            &SessionId::new("s1".into()),
+        );
         assert_eq!(store.workspaces.len(), 1);
         assert_eq!(store.workspaces[0].session_ids.len(), 1);
         // Attach to an unknown workspace is safely ignored.
-        store.attach_session_to_workspace(&WorkspaceId("nope".into()), &SessionId("s1".into()));
+        store.attach_session_to_workspace(
+            &WorkspaceId::new("nope".into()),
+            &SessionId::new("s1".into()),
+        );
         // Reconnect: clear, then rebuild.
         store.clear_workspaces();
         assert!(store.workspaces.is_empty());
@@ -390,7 +403,7 @@ mod tests {
         store.upsert_session(meta("new", 100, None));
         store.upsert_session(meta("mid", 50, None));
         let matched = store.match_sessions("  ");
-        let ids: Vec<&str> = matched.iter().map(|m| m.id.0.as_str()).collect();
+        let ids: Vec<String> = matched.iter().map(|m| m.id.get()).collect();
         assert_eq!(ids, vec!["new", "mid", "old"]);
     }
 
@@ -410,13 +423,13 @@ mod tests {
         // Broad query hits several fields; every hit must stay, non-hits go.
         let matched = store.match_sessions("deploy");
         assert!(!matched.is_empty());
-        assert!(!matched.iter().any(|m| m.id == SessionId("s-1".into())));
+        assert!(!matched.iter().any(|m| m.id == SessionId::new("s-1".into())));
         assert!(matched.len() >= 2, "s-2 preview and s-3 cwd both match");
 
         // Specific query only matches the s-3 cwd token (deterministic single hit).
         let specific = store.match_sessions("deploy-target");
         assert_eq!(specific.len(), 1);
-        assert_eq!(specific[0].id, SessionId("s-3".into()));
+        assert_eq!(specific[0].id, SessionId::new("s-3".into()));
     }
 
     #[test]
@@ -451,14 +464,18 @@ mod tests {
         }
         assert_eq!(store.session_count(), 5_000);
         // The newest (highest updated_at_ms) survives, the oldest does not.
-        assert!(store.sessions.contains_key(&SessionId("s20000".into())));
-        assert!(!store.sessions.contains_key(&SessionId("s00000".into())));
+        assert!(store
+            .sessions
+            .contains_key(&SessionId::new("s20000".into())));
+        assert!(!store
+            .sessions
+            .contains_key(&SessionId::new("s00000".into())));
     }
 
     // ---------- REQ-006 视图态（FR-006-02 / D-034） ----------
 
     fn ws(store: &mut WorkspaceStore, id: &str) -> WorkspaceId {
-        let wid = WorkspaceId(id.into());
+        let wid = WorkspaceId::new(id.into());
         store.upsert_workspace(wid.clone(), Some(format!("项目{id}")));
         wid
     }
@@ -467,7 +484,7 @@ mod tests {
         rows.iter()
             .map(|r| match r {
                 SidebarRow::WorkspaceHeader { id, .. } => format!("[{id}]"),
-                SidebarRow::Session(id) => id.0.clone(),
+                SidebarRow::Session(id) => id.get(),
             })
             .collect()
     }
@@ -501,7 +518,7 @@ mod tests {
         store.upsert_session(meta("c", 50, None));
         store.upsert_session(meta("free", 999, None)); // 未分组
         for sid in ["b", "a", "c"] {
-            store.attach_session_to_workspace(&ws1, &SessionId(sid.into()));
+            store.attach_session_to_workspace(&ws1, &SessionId::new(sid.into()));
         }
         // manual：按 session_ids 顺序 [b, a, c]。
         let view = WorkspaceViewState {
@@ -547,7 +564,7 @@ mod tests {
         let ws1 = ws(&mut store, "ws1");
         store.upsert_session(meta("old", 1, None));
         store.upsert_session(meta("new", 100, None));
-        store.attach_session_to_workspace(&ws1, &SessionId("old".into()));
+        store.attach_session_to_workspace(&ws1, &SessionId::new("old".into()));
         let view = WorkspaceViewState {
             group_by: GroupBy::Flat,
             order_by: OrderBy::Updated,

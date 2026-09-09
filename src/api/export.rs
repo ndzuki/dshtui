@@ -129,13 +129,13 @@ where
             on_progress(records.len() as u64);
             // 游标推进（防死循环：无 seq 页/无推进/空页 → 停）。
             let (next_before, stop) = crate::model::export::rebuild_next_cursor(
-                before_seq.map(|s| s.0),
+                before_seq.map(|s| s.get()),
                 &records[records.len() - page_len..],
                 page.has_more,
                 pages,
                 REBUILD_MAX_PAGES,
             );
-            before_seq = next_before.map(super::types::SessionSeq);
+            before_seq = next_before.map(super::types::SessionSeq::new);
             if stop {
                 break;
             }

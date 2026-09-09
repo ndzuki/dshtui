@@ -73,8 +73,8 @@ pub fn parse_response(value: &Value) -> Result<AttachmentData, ClientError> {
         ClientError::Protocol(format!("session/attachment data base64 解码失败: {e}"))
     })?;
     Ok(AttachmentData {
-        attachment_id: AttachmentId(wire.attachment_id),
-        media_type: MediaType(wire.media_type),
+        attachment_id: AttachmentId::new(wire.attachment_id),
+        media_type: MediaType::new(wire.media_type),
         bytes: wire.bytes,
         width: wire.width,
         height: wire.height,
@@ -97,8 +97,8 @@ pub async fn fetch(
     // （SessionAttachmentRequest{sessionId,attachmentId}）。
     let args = serde_json::json!({
         "request": {
-            "sessionId": session_id.0,
-            "attachmentId": attachment_id.0,
+            "sessionId": session_id.get(),
+            "attachmentId": attachment_id.get(),
         }
     });
     let value = unary(http, base, "session/attachment", args).await?;
@@ -125,8 +125,8 @@ mod tests {
             "data": "AQIDBA=="
         });
         let parsed = parse_response(&value).unwrap();
-        assert_eq!(parsed.attachment_id.0, "att-1");
-        assert_eq!(parsed.media_type.0, "image/png");
+        assert_eq!(parsed.attachment_id.get(), "att-1");
+        assert_eq!(parsed.media_type.get(), "image/png");
         assert_eq!(parsed.bytes, 4);
         assert_eq!(parsed.width, 10);
         assert_eq!(parsed.name.as_deref(), Some("a.png"));
@@ -141,7 +141,7 @@ mod tests {
             "futureField": {"anything": true}
         });
         let parsed = parse_response(&value).unwrap();
-        assert_eq!(parsed.attachment_id.0, "att-2");
+        assert_eq!(parsed.attachment_id.get(), "att-2");
         assert!(parsed.name.is_none());
         assert!(parsed.original_dimensions.is_none());
         assert!(parsed.image_bytes.is_empty());

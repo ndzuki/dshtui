@@ -110,7 +110,7 @@ fn render_body(frame: &mut Frame<'_>, body: Rect, app: &MonitorAppState) {
             .title(" Agent Town（文本 roster 降级 · 非 Kitty 终端） ");
         let mut lines: Vec<Line<'static>> = Vec::new();
         for e in app.filtered_roster() {
-            lines.push(roster_line(e, e.session_id.0 == focused_sid(app)));
+            lines.push(roster_line(e, e.session_id.get() == focused_sid(app)));
         }
         if lines.is_empty() {
             lines.push(Line::from("🌆 小镇空闲 — 等待 agent 上工…"));
@@ -129,7 +129,7 @@ fn render_body(frame: &mut Frame<'_>, body: Rect, app: &MonitorAppState) {
 
 fn focused_sid(app: &MonitorAppState) -> String {
     app.focused_entry()
-        .map(|e| e.session_id.0.clone())
+        .map(|e| e.session_id.get())
         .unwrap_or_default()
 }
 
@@ -215,7 +215,7 @@ fn render_roster(frame: &mut Frame<'_>, area: Rect, app: &MonitorAppState) {
                 .skip(scroll)
                 .take(h)
                 .map(|e| {
-                    let is_focus = e.session_id.0 == focused;
+                    let is_focus = e.session_id.get() == focused;
                     // 加油颜色脉冲：cheering 中的 agent 行粉底（FR-009-04）。
                     let cheering = app.scene.npc(&e.session_id).is_some_and(|n| n.cheering);
                     let style = if cheering {
@@ -298,7 +298,7 @@ fn render_detail(
             app.roster
                 .ordered()
                 .iter()
-                .find(|e| e.session_id.0 == pid)
+                .find(|e| e.session_id.get() == pid)
                 .map(|p| p.display_name())
                 .unwrap_or_else(|| short_session(pid))
         })
@@ -421,13 +421,13 @@ fn render_chat(frame: &mut Frame<'_>, area: Rect, app: &MonitorAppState) {
         .chat
         .target
         .as_ref()
-        .map(|s| s.0.clone())
+        .map(|s| s.get())
         .unwrap_or_default();
     let entry = app
         .roster
         .ordered()
         .iter()
-        .find(|e| e.session_id.0 == target)
+        .find(|e| e.session_id.get() == target)
         .cloned();
     let title = match (&entry, &app.chat.session_id) {
         (Some(e), Some(_)) => format!(

@@ -163,7 +163,7 @@ mod tests {
 
     fn assistant(seq: u64, md: &str) -> Block {
         Block::AssistantMessage {
-            seq: SessionSeq(seq),
+            seq: SessionSeq::new(seq),
             chunks: PackedChunks {
                 rows: vec![ChunkRow::TextChunks(ChunkData {
                     texts: vec![md.to_string()],
@@ -185,7 +185,7 @@ mod tests {
     #[test]
     fn tool_result_yanks_result_text() {
         let b = Block::ToolResult {
-            seq: SessionSeq(2),
+            seq: SessionSeq::new(2),
             call_id: None,
             content: "✓ 12ms\noutput".into(),
             is_error: false,
@@ -202,7 +202,7 @@ mod tests {
         // AC-003-12 清单不含工具调用（上下文 yank → None；视觉选择仍可
         // 按可见文本复制）。
         let b = Block::ToolCall {
-            seq: SessionSeq(3),
+            seq: SessionSeq::new(3),
             call_id: Some("c1".into()),
             name: Some("bash".into()),
             args_raw: Some(serde_json::json!({"command": "ls"})),
@@ -214,7 +214,7 @@ mod tests {
     #[test]
     fn image_yanks_name() {
         let b = Block::Image {
-            seq: SessionSeq(4),
+            seq: SessionSeq::new(4),
             attachment_id: Some("a1".into()),
             name: Some("design.png".into()),
             dims: None,
@@ -229,17 +229,17 @@ mod tests {
     fn selection_char_mode_single_block_line_mode_joins() {
         let blocks = vec![
             Block::UserMessage {
-                seq: SessionSeq(1),
+                seq: SessionSeq::new(1),
                 content: "第一行".into(),
                 time: None,
             },
             Block::UserMessage {
-                seq: SessionSeq(2),
+                seq: SessionSeq::new(2),
                 content: "第二行".into(),
                 time: None,
             },
             Block::UserMessage {
-                seq: SessionSeq(3),
+                seq: SessionSeq::new(3),
                 content: "第三行".into(),
                 time: None,
             },

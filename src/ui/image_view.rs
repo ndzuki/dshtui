@@ -128,8 +128,8 @@ mod tests {
     fn loading_state_shows_transition_and_title() {
         let mut view = ImageViewState::default();
         view.open_view(
-            SessionSeq(7),
-            AttachmentId("att-1".into()),
+            SessionSeq::new(7),
+            AttachmentId::new("att-1".into()),
             Some("design.png".into()),
             Some("640x480".into()),
         );
@@ -144,7 +144,12 @@ mod tests {
     #[test]
     fn failed_state_shows_error_placeholder_without_crash() {
         let mut view = ImageViewState::default();
-        view.open_view(SessionSeq(7), AttachmentId("att-1".into()), None, None);
+        view.open_view(
+            SessionSeq::new(7),
+            AttachmentId::new("att-1".into()),
+            None,
+            None,
+        );
         view.mark_failed("decode/unsupported".into(), "不支持的媒体类型".into());
         let backend = TestBackend::new(80, 20);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -157,7 +162,12 @@ mod tests {
     #[test]
     fn rendered_without_frame_falls_back_without_panic() {
         let mut view = ImageViewState::default();
-        view.open_view(SessionSeq(7), AttachmentId("att-1".into()), None, None);
+        view.open_view(
+            SessionSeq::new(7),
+            AttachmentId::new("att-1".into()),
+            None,
+            None,
+        );
         view.mark_rendered();
         let backend = TestBackend::new(80, 20);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -175,8 +185,8 @@ mod tests {
         // REQ-007 D-45：zoom != 1.0 时标题显示百分比；1.0 不显示。
         let mut view = ImageViewState::default();
         view.open_view(
-            SessionSeq(7),
-            AttachmentId("att-1".into()),
+            SessionSeq::new(7),
+            AttachmentId::new("att-1".into()),
             Some("a.png".into()),
             None,
         );

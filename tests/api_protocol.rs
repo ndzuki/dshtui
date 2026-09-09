@@ -51,8 +51,8 @@ async fn write_json_response(socket: &mut tokio::net::TcpStream, resp: Value) {
 
 fn queue_prompt_request() -> PromptRequest {
     PromptRequest {
-        request_id: SessionRequestId("client-minted-1".into()),
-        session_id: SessionId("sess-1".into()),
+        request_id: SessionRequestId::new("client-minted-1".into()),
+        session_id: SessionId::new("sess-1".into()),
         mode: PromptMode::Queue,
         content: vec![PromptContentPart::Text {
             text: "你好 draft".into(),
@@ -150,7 +150,7 @@ fn typed_follow_frame_accepts_snapshot_and_event_shapes() {
             projections,
             ..
         } => {
-            assert_eq!(cursor.map(|v| v.0), Some(41));
+            assert_eq!(cursor.map(|v| v.get()), Some(41));
             assert_eq!(has_more, Some(true));
             assert_eq!(projections.unwrap()["running"], false);
         }
@@ -164,7 +164,7 @@ fn typed_follow_frame_accepts_snapshot_and_event_shapes() {
     .unwrap();
     assert!(matches!(
         event,
-        FollowFrame::Event { event } if event.seq == Some(SessionSeq(42))
+        FollowFrame::Event { event } if event.seq == Some(SessionSeq::new(42))
             && event.request_id.as_deref() == Some("req-42")
     ));
 }
@@ -579,7 +579,7 @@ async fn search_unary_posts_query_and_parses_session_level_hits() {
     .await
     .unwrap();
     assert_eq!(result.items.len(), 1);
-    assert_eq!(result.items[0].session_id, SessionId("sess-9".into()));
+    assert_eq!(result.items[0].session_id, SessionId::new("sess-9".into()));
     assert_eq!(result.items[0].snippet, "deploy 排查 …");
     assert!(result.has_more);
     server.await.unwrap();
@@ -834,13 +834,13 @@ async fn attachment_fetch_sends_envelope_and_decodes_base64_data() {
     let got = attachment::fetch(
         &http,
         &base,
-        &SessionId("sess-1".into()),
-        &AttachmentId("att-9".into()),
+        &SessionId::new("sess-1".into()),
+        &AttachmentId::new("att-9".into()),
     )
     .await
     .unwrap();
-    assert_eq!(got.attachment_id.0, "att-9");
-    assert_eq!(got.media_type.0, "image/png");
+    assert_eq!(got.attachment_id.get(), "att-9");
+    assert_eq!(got.media_type.get(), "image/png");
     assert_eq!(got.bytes, 8);
     assert_eq!(got.width, 640);
     assert_eq!(got.height, 480);
@@ -879,8 +879,8 @@ async fn attachment_fetch_error_envelope_classifies_by_code() {
     let err = attachment::fetch(
         &http,
         &format!("http://{addr}"),
-        &SessionId("sess-1".into()),
-        &AttachmentId("att-9".into()),
+        &SessionId::new("sess-1".into()),
+        &AttachmentId::new("att-9".into()),
     )
     .await
     .unwrap_err();
@@ -1052,7 +1052,7 @@ async fn select_model_nests_request_and_parses_selected_ac006_08() {
     let sel = dshtui::api::session::select_model(
         &http,
         &format!("http://{addr}"),
-        &SessionId("sess-1".into()),
+        &SessionId::new("sess-1".into()),
         "deepseek_official",
         "deepseek-chat",
         Some("low"),
@@ -1103,13 +1103,14 @@ async fn session_fork_rename_create_nest_request_and_parse_typed_values() {
 
     let http = reqwest::Client::new();
     let base = format!("http://{addr}");
-    let fork = dshtui::api::session::fork(&http, &base, &SessionId("sess-1".into()), Some(7))
+    let fork = dshtui::api::session::fork(&http, &base, &SessionId::new("sess-1".into()), Some(7))
         .await
         .unwrap();
     assert_eq!(fork.session_id, "new-fork-1");
-    let rename = dshtui::api::session::rename(&http, &base, &SessionId("sess-1".into()), "新标题")
-        .await
-        .unwrap();
+    let rename =
+        dshtui::api::session::rename(&http, &base, &SessionId::new("sess-1".into()), "新标题")
+            .await
+            .unwrap();
     assert_eq!(rename.title, "新标题");
     assert_eq!(rename.seq, 42);
     let created = dshtui::api::session::create(&http, &base, Some("ws-1"), None)
