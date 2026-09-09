@@ -2085,6 +2085,9 @@ pub struct TownNpc {
     pub hair_color: usize,
     pub pants_color: usize,
     pub shoe_color: usize,
+    pub last_x: f64,
+    pub last_y: f64,
+    pub stall_t: f64,
 }
 
 /// 装饰角色类型。
@@ -2126,6 +2129,10 @@ pub struct Passer {
     pub chat_with: Option<usize>,
     pub clothes: usize,
     pub hair: usize,
+    pub last_x: f64,
+    pub last_y: f64,
+    pub stall_t: f64,
+    pub seq: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2208,6 +2215,7 @@ impl TownScene {
     /// 7 小精灵/动物 + 3 鸟 + 1 猫 = 18）。
     fn spawn_passers(&mut self) {
         self.passers.clear();
+        let mut seq = 0usize;
         let humans: [(&'static str, &'static str, &'static str, f64); 7] = [
             ("human", "adult", "木匠阿良", 26.0),
             ("human", "adult", "花匠小满", 24.0),
@@ -2246,10 +2254,15 @@ impl TownScene {
                 chat_with: None,
                 clothes: self.rng.usize(VILLAGER_PALETTES.len()),
                 hair: self.rng.usize(HAIR_COLORS.len()),
+                last_x: start.0,
+                last_y: start.1,
+                stall_t: 0.0,
+                seq,
             };
             let _ = kind;
             p.state_t = 1.0 + self.rng.f64() * 2.0;
             self.passers.push(p);
+            seq += 1;
         }
         for (ptype, name) in spirits {
             let start = self.pick_town_point();
@@ -2271,7 +2284,12 @@ impl TownScene {
                 chat_with: None,
                 clothes: 0,
                 hair: 0,
+                last_x: start.0,
+                last_y: start.1,
+                stall_t: 0.0,
+                seq,
             });
+            seq += 1;
         }
         for i in 0..3 {
             self.passers.push(Passer {
@@ -2292,7 +2310,12 @@ impl TownScene {
                 chat_with: None,
                 clothes: 0,
                 hair: 0,
+                last_x: -20.0,
+                last_y: 10.0 + i as f64 * 12.0,
+                stall_t: 0.0,
+                seq,
             });
+            seq += 1;
         }
     }
 
@@ -2343,6 +2366,9 @@ impl TownScene {
                         hair_color: self.rng.usize(HAIR_COLORS.len()),
                         pants_color: self.rng.usize(PANTS_COLORS.len()),
                         shoe_color: self.rng.usize(SHOE_COLORS.len()),
+                        last_x: 480.0,
+                        last_y: 300.0,
+                        stall_t: 0.0,
                     };
                     self.npcs.push(npc);
                     self.npcs.last_mut().unwrap()
@@ -2494,7 +2520,8 @@ impl TownScene {
                         }
                         continue;
                     }
-                    // 跟随最近的人类/真实 agent（70px 半径）。
+                    p.state_t -= dt;
+                    // 优先跟随最近的人类/真实 agent（70px 半径）；空闲超时后改为独立随机游走。
                     let mut near: Option<(f64, f64)> = None;
                     let mut near_d = 70.0f64;
                     for (k, _st, x, y) in others.iter() {
@@ -2514,34 +2541,84 @@ impl TownScene {
                             near_d = d;
                         }
                     }
+                    if p.state == PasserState::Follow && near.is_none() {
+                        p.state = PasserState::Idle;
+                        p.state_t = 0.5 + rng.f64() * 1.5;
+                    }
+                    // 跟随停止距离带抖动：多只小精灵不再叠在同一点。
+                    let stop_dist = 18.0 + (p.seq % 12) as f64;
                     if let Some((nx, ny)) = near {
-                        let dx = nx - p.cx;
-                        let dy = ny - p.cy;
-                        let dist = (dx * dx + dy * dy).sqrt();
-                        if dist > 18.0 {
-                            let step = (p.speed * 2.0).min(dist) * dt;
-                            p.cx += (dx / dist) * step;
-                            p.cy += (dy / dist) * step;
-                            p.frame += dt * 6.0;
-                            p.dir = if dx >= 0.0 { 1.0 } else { -1.0 };
-                            p.state = PasserState::Follow;
-                        } else {
-                            p.state = PasserState::Idle;
-                            p.frame += dt * 4.0;
-                        }
-                    } else {
-                        p.state_t -= dt;
-                        if p.state_t <= 0.0 {
-                            p.state_t = 1.0 + rng.f64() * 2.0;
-                            p.state = PasserState::Hop;
-                            p.hop_t = 0.35;
-                        }
-                        if p.state == PasserState::Hop {
-                            p.hop_t -= dt;
-                            if p.hop_t <= 0.0 {
+                        if p.state != PasserState::Walk {
+                            let dx = nx - p.cx;
+                            let dy = ny - p.cy;
+                            let dist = (dx * dx + dy * dy).sqrt();
+                            if dist > stop_dist {
+                                let step = (p.speed * 2.0).min(dist) * dt;
+                                p.cx += (dx / dist) * step;
+                                p.cy += (dy / dist) * step;
+                                p.frame += dt * 6.0;
+                                p.dir = if dx >= 0.0 { 1.0 } else { -1.0 };
+                                p.state = PasserState::Follow;
+                            } else {
                                 p.state = PasserState::Idle;
+                                p.frame += dt * 4.0;
                             }
                         }
+                    }
+                    if p.state == PasserState::Walk {
+                        move_along_path_passer(p, dt, p.speed);
+                        if p.path.is_empty() {
+                            p.state = PasserState::Idle;
+                            p.state_t = 1.5 + rng.f64() * 3.0;
+                        }
+                    } else if p.state == PasserState::Idle && p.state_t <= 0.0 {
+                        let target = Self::pick_town_point_static(grid, rng);
+                        let path = find_path(grid, p.cx, p.cy, target.0, target.1);
+                        if !path.is_empty() {
+                            p.state = PasserState::Walk;
+                            p.state_t = 4.0 + rng.f64() * 5.0;
+                            p.tx = target.0;
+                            p.ty = target.1;
+                            p.path = path;
+                        } else {
+                            p.state_t = 1.0 + rng.f64() * 2.0;
+                        }
+                    } else if p.state == PasserState::Hop {
+                        p.hop_t -= dt;
+                        if p.hop_t <= 0.0 {
+                            p.state = PasserState::Idle;
+                            p.state_t = 0.5 + rng.f64() * 1.5;
+                        }
+                    }
+                }
+            }
+            if p.kind != PasserKind::Bird {
+                // 卡住兜底：非聊天/挥手/闪烁状态下长时间几乎不动 → 重新随机游走。
+                let moved = ((p.cx - p.last_x).powi(2) + (p.cy - p.last_y).powi(2)).sqrt();
+                if moved < 1.0
+                    && p.state != PasserState::Chat
+                    && p.state != PasserState::Wave
+                    && p.state != PasserState::Sparkle
+                {
+                    p.stall_t += dt;
+                } else {
+                    p.stall_t = 0.0;
+                }
+                p.last_x = p.cx;
+                p.last_y = p.cy;
+                if p.stall_t > 5.0 {
+                    p.stall_t = 0.0;
+                    let target = Self::pick_town_point_static(grid, rng);
+                    let path = find_path(grid, p.cx, p.cy, target.0, target.1);
+                    if !path.is_empty() {
+                        p.state = PasserState::Walk;
+                        p.state_t = 4.0 + rng.f64() * 5.0;
+                        p.tx = target.0;
+                        p.ty = target.1;
+                        p.path = path;
+                    } else {
+                        p.state = PasserState::Idle;
+                        p.state_t = 1.0 + rng.f64() * 2.0;
                     }
                 }
             }
@@ -2606,6 +2683,31 @@ impl TownScene {
                     } else {
                         npc.state = NpcState::Idle;
                         npc.state_t = 1.5 + rng.f64() * 3.0;
+                    }
+                }
+            }
+            if !npc.working {
+                // 卡住兜底：空闲 agent 长时间几乎不动 → 重新随机游走。
+                let moved = ((npc.cx - npc.last_x).powi(2) + (npc.cy - npc.last_y).powi(2)).sqrt();
+                if moved < 1.0 {
+                    npc.stall_t += dt;
+                } else {
+                    npc.stall_t = 0.0;
+                }
+                npc.last_x = npc.cx;
+                npc.last_y = npc.cy;
+                if npc.stall_t > 5.0 {
+                    npc.stall_t = 0.0;
+                    let target = Self::pick_town_point_static(grid, rng);
+                    npc.path = find_path(grid, npc.cx, npc.cy, target.0, target.1);
+                    if !npc.path.is_empty() {
+                        npc.state = NpcState::Walk;
+                        npc.state_t = 5.0 + rng.f64() * 4.0;
+                        npc.tx = target.0;
+                        npc.ty = target.1;
+                    } else {
+                        npc.state = NpcState::Idle;
+                        npc.state_t = 1.0 + rng.f64() * 2.0;
                     }
                 }
             }
@@ -2773,7 +2875,7 @@ fn separate(e: &mut TownNpc, grid: &[u8], qx: f64, qy: f64) {
     let dy = e.cy - qy;
     let d = (dx * dx + dy * dy).sqrt();
     if d > 0.0 && d < 14.0 {
-        let f = (14.0 - d) * 0.45;
+        let f = (14.0 - d) * 0.5;
         let mut nx = e.cx + dx / d * f;
         let mut ny = e.cy + dy / d * f;
         if !is_walk_px(grid, nx as i32, ny as i32) {
@@ -2792,7 +2894,7 @@ fn separate_pass(e: &mut Passer, grid: &[u8], qx: f64, qy: f64) {
     let dy = e.cy - qy;
     let d = (dx * dx + dy * dy).sqrt();
     if d > 0.0 && d < 14.0 {
-        let f = (14.0 - d) * 0.45;
+        let f = (14.0 - d) * 0.5;
         let mut nx = e.cx + dx / d * f;
         let mut ny = e.cy + dy / d * f;
         if !is_walk_px(grid, nx as i32, ny as i32) {
@@ -3170,6 +3272,33 @@ mod tests {
         for (x, y) in &npc.path {
             assert!(is_walk_px(&scene.walk_grid, *x as i32, *y as i32));
         }
+    }
+
+    #[test]
+    fn pokemon_wander_when_idle_timeout_expires() {
+        // 回归：小精灵周围没有任何人类/agent 时，空闲超时后应沿 A* 独立随机游走，
+        // 而不是像旧实现那样永久原地 hop（进而长期吸附静止目标形成扎堆）。
+        let mut scene = TownScene::new(23, 0.0);
+        scene.npcs.clear();
+        scene.passers.retain(|p| p.kind == PasserKind::Pokemon);
+        let start = (100.0, 265.0); // 横主街，已知可走（static_scene_key_pixels 锚点）。
+        let p = &mut scene.passers[0];
+        p.cx = start.0;
+        p.cy = start.1;
+        p.tx = start.0;
+        p.ty = start.1;
+        p.state = PasserState::Idle;
+        p.state_t = 0.0;
+        p.path.clear();
+        for ms in (0..5000).step_by(50) {
+            scene.advance(ms as f64);
+        }
+        let p = &scene.passers[0];
+        let moved = ((p.cx - start.0).powi(2) + (p.cy - start.1).powi(2)).sqrt();
+        assert!(
+            moved > 5.0,
+            "空闲小精灵应离开原地独立游走，实际仅移动 {moved}px"
+        );
     }
 
     #[test]
