@@ -13,18 +13,45 @@
 # （认证失败/收集为空/解析失败）→ exit 1。DSH_TOKEN 未设置 → skip exit 0。
 #
 # 用法:
-#   DSH_TOKEN=... scripts/live-export-lock.sh
+#   DSH_TOKEN=... scripts/live-export-lock.sh            # live 对比冒烟
+#   DSH_TOKEN=... scripts/live-export-lock.sh --golden   # 同上 + golden 复核/再生成
+#
+# D-65（Step B）：export JSONL 锁 live-first + committed golden 离线兜底。
+# --golden 在本脚本 live 对比通过后：
+#   - 若当前官方版本的 golden fixture 尚不存在（fixtures/export-golden/v<ver>/），
+#     用本次刚下载的官方导出调 scripts/export-golden-check.sh --capture 再生成；
+#   - 然后对该 fixture 跑 --check 离线校验（已入库版本 → 只校验不覆盖）。
+# 脱敏器只实现在 export-golden-check.sh 一处，本脚本不复制逻辑。
+#
 # 环境:
 #   DSH_TOKEN            必填（live 部分）；缺省跳过
 #   DSHTUI_LIVE_BASE     官方 base URL（默认 http://127.0.0.1:3080）
 #   DSHTUI_LIVE_SESSION  目标会话 id（默认 REQ-008 证据会话
 #                        session-25536e2c-f8b9-4bcf-a16b-0baa085fa362）
+#   DSHTUI_GOLDEN_OFFICIAL_VERSION  golden 官方版本标签（默认 0.1.2-rc.1）
+#   DSHTUI_GOLDEN_FIXTURE           显式 golden fixture 目录（默认同 export-golden-check.sh）
 # 前置: curl + python3（JSONL/zip 分析）
 set -euo pipefail
 
 BASE="${DSHTUI_LIVE_BASE:-http://127.0.0.1:3080}"
 SESSION="${DSHTUI_LIVE_SESSION:-session-25536e2c-f8b9-4bcf-a16b-0baa085fa362}"
 PAGE_SIZE="${DSHTUI_LIVE_PAGE_SIZE:-500}"
+
+# --golden 模式（可选首个参数）；无参行为保持原样
+GOLDEN=0
+if [ "${1:-}" = "--golden" ]; then
+  GOLDEN=1
+  shift
+fi
+
+# golden fixture 目录解析（与 scripts/export-golden-check.sh 同约定）
+GOLDEN_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/export-golden-check.sh"
+GOLDEN_VERSION="${DSHTUI_GOLDEN_OFFICIAL_VERSION:-0.1.2-rc.1}"
+case "$GOLDEN_VERSION" in
+  v*) GOLDEN_DIRVER="$GOLDEN_VERSION" ;;
+  *)  GOLDEN_DIRVER="v$GOLDEN_VERSION" ;;
+esac
+GOLDEN_FIXDIR="${DSHTUI_GOLDEN_FIXTURE:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/fixtures/export-golden/$GOLDEN_DIRVER}"
 
 if [ -z "${DSH_TOKEN:-}" ]; then
   echo "[skip] DSH_TOKEN 未设置——跳过 live 部分（CI 默认跳过）"
@@ -196,4 +223,17 @@ if ! run; then
   echo "[fail] live-export-lock 冒烟失败" >&2
   exit 1
 fi
+
+if [ "$GOLDEN" = "1" ]; then
+  # live 对比已通过 → golden 复核/再生成（D-65 离线兜底）
+  if [ ! -f "$GOLDEN_FIXDIR/session.jsonl" ]; then
+    echo "[golden] fixture 缺失，用本次官方导出 capture: $GOLDEN_FIXDIR"
+    "$GOLDEN_SCRIPT" --capture "$TMP/export.zip" "$GOLDEN_FIXDIR"
+  else
+    echo "[golden] fixture 已存在（只校验不覆盖）: $GOLDEN_FIXDIR"
+  fi
+  echo "[golden] 离线校验 golden fixture"
+  "$GOLDEN_SCRIPT" --check "$GOLDEN_FIXDIR"
+fi
+
 echo "[ok] exit 0"
