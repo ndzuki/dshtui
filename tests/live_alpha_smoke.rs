@@ -175,10 +175,7 @@ async fn alpha_page_missing_session_typed_error() {
         .error
         .as_ref()
         .unwrap_or_else(|| panic!("ok=false 时应携带 error: {raw}"));
-    assert!(
-        !err.code.is_empty(),
-        "错误信封 error.code 不应为空: {raw}"
-    );
+    assert!(!err.code.is_empty(), "错误信封 error.code 不应为空: {raw}");
     assert!(
         err.code.contains("not-found") || err.code.contains("not_found"),
         "错误码应表达会话不存在（session/not-found 或同类），实际 code={}",

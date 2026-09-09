@@ -62,14 +62,16 @@ async fn main() -> ExitCode {
             return ExitCode::SUCCESS;
         }
         // REQ-008 FR-008-01：`dshtui bench` 性能基准独立分发——不加载
-        // config/token/日志（seed 默认无网络依赖），exit 码 0/1/2 直映射。
+        // config/token/日志（seed 默认无网络依赖；live/auto 由 bench 自读
+        // DSH_TOKEN env），exit 码 0/1/2 直映射。
         CliAction::Bench {
             report,
+            report_md,
             fixture,
             scenario,
         } => {
             let fixture_mode = match fixture.as_deref() {
-                None => FixtureMode::Seed,
+                None => FixtureMode::Auto,
                 Some(s) => match FixtureMode::parse(s) {
                     Ok(m) => m,
                     Err(e) => {
@@ -78,10 +80,24 @@ async fn main() -> ExitCode {
                     }
                 },
             };
+            let report_path = report
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(dshtui::bench::DEFAULT_REPORT_PATH));
+            // markdown 默认路径 = JSON 报告 `.json → .md` 派生（--report-md 显式
+            // 覆盖；空 = 跳过 md 写，D-60）。
+            let report_md_path = match report_md {
+                Some(p) => PathBuf::from(p),
+                None => {
+                    let mut derived = report_path.clone();
+                    if !report_path.as_os_str().is_empty() {
+                        derived.set_extension("md");
+                    }
+                    derived
+                }
+            };
             let cfg = BenchConfig {
-                report_path: report
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| PathBuf::from(dshtui::bench::DEFAULT_REPORT_PATH)),
+                report_path,
+                report_md_path,
                 fixture: fixture_mode,
                 scenario,
             };
@@ -89,6 +105,9 @@ async fn main() -> ExitCode {
             print!("{}", dshtui::bench::format_summary(&report));
             if !cfg.report_path.as_os_str().is_empty() {
                 println!("报告: {}", cfg.report_path.display());
+            }
+            if !cfg.report_md_path.as_os_str().is_empty() {
+                println!("markdown 报告: {}", cfg.report_md_path.display());
             }
             return ExitCode::from(code.clamp(0, 2) as u8);
         }

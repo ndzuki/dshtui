@@ -33,10 +33,11 @@ pub enum CliAction {
     Monitor {
         addr: Option<String>,
     },
-    /// `dshtui bench [--report …] [--fixture …] [--scenario …]`（REQ-008
-    /// FR-008-01 性能基准；V1）。
+    /// `dshtui bench [--report …] [--report-md …] [--fixture …] [--scenario …]`
+    /// （REQ-008 FR-008-01 性能基准；V1，D-58/D-60）。
     Bench {
         report: Option<String>,
+        report_md: Option<String>,
         fixture: Option<String>,
         scenario: Option<String>,
     },
@@ -650,6 +651,7 @@ pub fn parse_cli<I: IntoIterator<Item = String>>(args: I) -> Result<Cli, String>
     if it.peek().is_some_and(|a| a == "bench") {
         it.next();
         let mut report: Option<String> = None;
+        let mut report_md: Option<String> = None;
         let mut fixture: Option<String> = None;
         let mut scenario: Option<String> = None;
         while let Some(arg) = it.next() {
@@ -661,6 +663,12 @@ pub fn parse_cli<I: IntoIterator<Item = String>>(args: I) -> Result<Cli, String>
                         .next()
                         .ok_or_else(|| "--report 需要一个路径参数".to_string())?;
                     report = Some(v);
+                }
+                "--report-md" => {
+                    let v = it
+                        .next()
+                        .ok_or_else(|| "--report-md 需要一个路径参数".to_string())?;
+                    report_md = Some(v);
                 }
                 "--fixture" => {
                     let v = it
@@ -688,6 +696,7 @@ pub fn parse_cli<I: IntoIterator<Item = String>>(args: I) -> Result<Cli, String>
         }
         cli.action = CliAction::Bench {
             report,
+            report_md,
             fixture,
             scenario,
         };
@@ -778,7 +787,7 @@ dshtui {version} — 官方 dsh web Remote API 的 Rust TUI 客户端
 
 用法: dshtui [--url <url>] [--token <env-name>] [--log <file>] [--help] [--version]
       dshtui monitor [--addr <agent-server>] [--log <file>]
-      dshtui bench [--report <path>] [--fixture auto|live|seed] [--scenario <name>]
+      dshtui bench [--report <path>] [--report-md <path>] [--fixture auto|live|seed] [--scenario <name>]
 
 选项:
   --url <url>       dsh web 地址（默认 http://127.0.0.1:3080）
@@ -791,14 +800,21 @@ dshtui {version} — 官方 dsh web Remote API 的 Rust TUI 客户端
   monitor           Agent Town 监控面板（REQ-009 V0.3）：直连本机 OTR agent-server，
                     2s 轮询 /agents、30s 轮询 /kb-stats，kitty 终端渲染像素小镇。
     --addr <url>    agent-server 地址（默认 {monitor_addr}）
-  bench             性能基准（REQ-008 FR-008-01）：进程内 headless 测量 7 项
-                    AC-008 指标（startup/first_screen/search/scroll p99 + RSS
-                    三档），报告 JSON 原子写；退出码 0=全 PASS / 1=有 FAIL /
-                    2=全 skip（under-scale）。
-    --report <path> 报告路径（默认 {bench_report}；空 = 只打印摘要）
-    --fixture <m>   auto|live|seed（默认 seed：确定性、无网络；live/auto 需
-                    本机 3080 只读可达，不可达标 skip 退出 2）
-    --scenario <n>  只跑单个场景（默认全量；如 --scenario scroll_frame_p99_ms）
+  bench             性能基准（REQ-008 FR-008-01/AC-008-01~08，D-58/D-60）：进程内
+                    headless 测量 11 项指标（startup/first_screen/search/scroll p99 +
+                    fps/page_flip + 10k 列表搜索·首屏 + RSS 三档），产物双份原子写：
+                    JSON（机器 schema）+ markdown（人类可读表）；退出码 0=全 PASS /
+                    1=有 FAIL / 2=全 skip（under-scale）。
+    --report <path> JSON 报告路径（默认 {bench_report}；空 = 只打印摘要）
+    --report-md <p> markdown 报告路径（默认由 JSON 报告 .md 派生 {bench_report_md}；
+                    空 = 跳过 md；JSON/md 任一写失败都 exit 1 fail-closed）
+    --fixture <m>   auto|live|seed（默认 auto：本机 3080 可达 + DSH_TOKEN 已设 →
+                    live verified 读真实 session/list 侧栏；否则确定性 seed 兜底
+                    标 seed-fallback，不失败。CI 用 seed 强制复现）
+    --scenario <n>  只跑单个场景（默认全量；场景名 = startup_ms | first_screen_ms |
+                    search_ms | scroll_frame_p99_ms | scroll_fps | page_flip_ms |
+                    list_10k_search_ms | list_10k_first_screen_ms | idle_rss_mb |
+                    stream_rss_mb | image_rss_mb）
 
 kitty 快捷键（可选，写入 ~/.config/kitty/kitty.conf）:
   map ctrl+shift+a new_tab_with_cwd
@@ -809,7 +825,8 @@ token 来源优先级: --token <env> > 环境变量 {token_env} > 配置文件 >
         version = env!("CARGO_PKG_VERSION"),
         token_env = DEFAULT_TOKEN_ENV,
         monitor_addr = DEFAULT_MONITOR_ADDR,
-        bench_report = crate::bench::DEFAULT_REPORT_PATH
+        bench_report = crate::bench::DEFAULT_REPORT_PATH,
+        bench_report_md = crate::bench::DEFAULT_REPORT_MD_PATH
     )
 }
 

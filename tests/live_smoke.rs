@@ -351,8 +351,8 @@ async fn live_session_follow_contract() {
         .expect("follow 首帧应在超时内到达")
         .expect("follow 流不应空")
         .expect("follow 首帧不应是错误");
-    let parsed = dshtui::api::session::parse_follow_item(&first)
-        .expect("首帧应能 parse_follow_item");
+    let parsed =
+        dshtui::api::session::parse_follow_item(&first).expect("首帧应能 parse_follow_item");
     match parsed {
         dshtui::api::session::FollowItem::Snapshot {
             cursor,
@@ -392,9 +392,11 @@ async fn live_projections_and_attachment_scan() {
     let list = session::list(&client.http, &client.base, None)
         .await
         .expect("session::list 应 Ok");
-    let target = list.raw_items.iter().find(|r| r.id == session_id).unwrap_or_else(|| {
-        panic!("目标会话 {session_id} 不在 list（DSHTUI_LIVE_SESSION 有误？）")
-    });
+    let target = list
+        .raw_items
+        .iter()
+        .find(|r| r.id == session_id)
+        .unwrap_or_else(|| panic!("目标会话 {session_id} 不在 list（DSHTUI_LIVE_SESSION 有误？）"));
     let proj = target
         .projections
         .as_ref()
@@ -412,7 +414,10 @@ async fn live_projections_and_attachment_scan() {
 
     // (b) attachment 探测：page 尾部原始记录扫描 attachment 型记录
     // （page_raw 返回原始 JSON Value 供字符串级扫描；typed records 不序列化）。
-    let cursor = proj.pointer("/asOfSeq").and_then(|v| v.as_u64()).unwrap_or(0);
+    let cursor = proj
+        .pointer("/asOfSeq")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
     let address = SessionAddress::session(&session_id);
     let page = session::page_raw(
         &client.http,
