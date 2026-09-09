@@ -220,7 +220,8 @@ async fn mux_open_stream_routes_item_and_end_frames() {
         let first = ws.next().await.unwrap().unwrap();
         let frame: Value = serde_json::from_str(first.to_text().unwrap()).unwrap();
         opened_tx.send(frame.clone()).unwrap();
-        let stream_id = frame["streamId"].as_u64().unwrap();
+        // streamId 为客户端铸币字符串（官方协议要求；mock 回显同一字符串）。
+        let stream_id = frame["streamId"].as_str().unwrap().to_string();
 
         ws.send(Message::Text(
             json!({"type": "item", "streamId": stream_id, "value": {"answer": 42}}).to_string(),
@@ -665,7 +666,8 @@ async fn mux_pushes_streamless_frames_to_bypass_and_routes_streams() {
         let first = ws.next().await.unwrap().unwrap();
         let frame: Value = serde_json::from_str(first.to_text().unwrap()).unwrap();
         opened_tx.send(frame.clone()).unwrap();
-        let stream_id = frame["streamId"].as_u64().unwrap();
+        // streamId 为客户端铸币字符串（官方协议要求；mock 回显同一字符串）。
+        let stream_id = frame["streamId"].as_str().unwrap().to_string();
 
         ws.send(Message::Text(
             json!({
