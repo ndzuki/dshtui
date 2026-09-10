@@ -681,7 +681,9 @@ async fn load_live_sessions_async(token: &str) -> Result<Vec<SessionMeta>, Strin
 
 /// 场景过滤：None=全量；Some(metric)=是否命中该场景。
 fn wants(filter: Option<&str>, metric: &str) -> bool {
-    filter.is_none() || filter == Some(metric)
+    filter.is_none()
+        || filter == Some(metric)
+        || (filter == Some("list_10k") && metric.starts_with("list_10k_"))
 }
 
 /// 测量全部场景（fixture gate 之外的场景选择；filter 单场景/全量）。
@@ -1250,12 +1252,14 @@ fn seed_image_cache(app: &mut AppState) {
 fn measure_seed_sessions(filter: Option<&str>, scale: Scale) -> usize {
     if matches!(
         filter,
-        None | Some("first_screen_ms" | "list_10k_search_ms" | "list_10k_first_screen_ms")
+        None | Some(
+            "first_screen_ms" | "list_10k" | "list_10k_search_ms" | "list_10k_first_screen_ms"
+        )
     ) {
         // 全量含 10k 场景时侧栏最大规模 = 10k；first_screen 单场景 = 1042。
         if matches!(
             filter,
-            Some("list_10k_search_ms" | "list_10k_first_screen_ms")
+            Some("list_10k" | "list_10k_search_ms" | "list_10k_first_screen_ms")
         ) {
             scale.ten_k_sessions
         } else {
@@ -1525,6 +1529,18 @@ mod tests {
         assert_eq!(s.name, "page_flip_ms");
         assert!(s.measured.is_some(), "page_flip 应测得值");
         assert!(s.measured.unwrap() >= 0.0);
+    }
+
+    #[test]
+    fn list_10k_scenario_alias_produces_both_metrics() {
+        let scenarios = measure_scenarios(Some("list_10k"), &tiny_scale(), None);
+        let names: Vec<&str> = scenarios.iter().map(|s| s.name).collect();
+        assert_eq!(
+            names,
+            vec!["list_10k_search_ms", "list_10k_first_screen_ms"]
+        );
+        assert!(scenarios.iter().all(|s| s.measured.is_some()));
+        assert_eq!(measure_seed_sessions(Some("list_10k"), tiny_scale()), 8);
     }
 
     #[test]

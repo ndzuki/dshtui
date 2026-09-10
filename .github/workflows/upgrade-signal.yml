@@ -39,6 +39,9 @@ on:
         required: false
         default: false
 
+permissions:
+  contents: read
+
 concurrency:
   group: upgrade-signal-${{ github.ref }}
   cancel-in-progress: false
@@ -80,20 +83,21 @@ jobs:
         id: compare
         run: |
           LATEST="$LATEST_VAL"
-          BASELINE="${{ github.event.inputs.last_known_good || '0.1.2-rc.1' }}"
+          BASELINE="$BASELINE_VAL"
           echo "baseline=$BASELINE" >> "$GITHUB_OUTPUT"
           if [ -z "$LATEST" ]; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          if [ $? -eq 0 ]; then
+          if [ "$LATEST" != "$BASELINE" ]; then
             echo "changed=true" >> "$GITHUB_OUTPUT"
           else
             echo "changed=false" >> "$GITHUB_OUTPUT"
           fi
         env:
           LATEST_VAL: ${{ steps.latest.outputs.value }}
+          BASELINE_VAL: ${{ github.event.inputs.last_known_good || '0.1.2-rc.1' }}
 
   # ---------------------------------------------------------------------------
   # tracking issue + 契约冒烟（仅新 alpha）
@@ -158,9 +162,9 @@ jobs:
 
       - name: 契约冒烟（对该 alpha 版本，无 secret）
         if: ${{ !github.event.inputs.skip_smoke }}
-        run: |
-          DSHTUI_ALPHA_VERSION="${{ needs.detect.outputs.latest }}" \
-            bash scripts/ci-live-smoke.sh
+        env:
+          VERSION: ${{ needs.detect.outputs.latest }}
+        run: DSHTUI_ALPHA_VERSION="$VERSION" bash scripts/ci-live-smoke.sh
 
   # ---------------------------------------------------------------------------
   # 无新 alpha → no-op（保留 job 以便查看 status）
@@ -171,4 +175,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - run: echo "官方 alpha 未变化（${{ needs.detect.outputs.latest }}），本次无操作"
+      - name: 记录无升级结果
+        env:
+          LATEST: ${{ needs.detect.outputs.latest }}
+        run: echo "官方 alpha 未变化（$LATEST），本次无操作"
