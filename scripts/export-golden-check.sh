@@ -287,7 +287,11 @@ def cmd_capture(src, outdir):
     if src.endswith(".zip"):
         try:
             with zipfile.ZipFile(src) as z:
-                data = z.read("session.jsonl").decode("utf-8")
+                jsonl_names = [n for n in z.namelist() if n.endswith(".jsonl")]
+                if not jsonl_names:
+                    err("[fail] --capture: ZIP 内没有 .jsonl 文件（实际: %s）" % z.namelist()[:10])
+                    return 1
+                data = z.read(jsonl_names[0]).decode("utf-8")
         except Exception as e:
             err("[fail] --capture: cannot read %s: %s" % (src, e))
             return 1

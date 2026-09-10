@@ -83,7 +83,7 @@ r = sh("curl", "-s", "-c", cj, "-o", "/dev/null", "-w", "%{http_code}",
 if r.stdout.strip() not in ("303", "200"):
     print(f"[fail] 认证失败 http={r.stdout.strip()}", file=sys.stderr); sys.exit(1)
 
-# 2) 官方导出 ZIP → session.jsonl
+# 2) 官方导出 ZIP → 其中的 *.jsonl（官方当前为 session.v3.jsonl；早期为 session.jsonl）
 zpath = os.path.join(tmp, "export.zip")
 r = sh("curl", "-s", "-b", cj, "-m", "120", "-o", zpath, "-w", "%{http_code}",
        f"{base}/api/session.export?sessionId={session}&includeDescendants=true")
@@ -91,10 +91,14 @@ if r.stdout.strip() != "200":
     print(f"[fail] 官方导出 http={r.stdout.strip()}", file=sys.stderr); sys.exit(1)
 out_dir = os.path.join(tmp, "zip")
 with zipfile.ZipFile(zpath) as z:
-    z.extract("session.jsonl", out_dir)
-official = [json.loads(l) for l in open(os.path.join(out_dir, "session.jsonl"), encoding="utf-8")]
+    jsonl_names = [n for n in z.namelist() if n.endswith(".jsonl")]
+    if not jsonl_names:
+        print(f"[fail] ZIP 内没有 .jsonl 文件（实际文件: {z.namelist()[:10]}）", file=sys.stderr); sys.exit(1)
+    z.extract(jsonl_names[0], out_dir)
+official_path = os.path.join(out_dir, jsonl_names[0])
+official = [json.loads(l) for l in open(official_path, encoding="utf-8")]
 if not official:
-    print("[fail] 官方 session.jsonl 为空", file=sys.stderr); sys.exit(1)
+    print(f"[fail] 官方 {jsonl_names[0]} 为空", file=sys.stderr); sys.exit(1)
 
 def line_seq(o):
     return o.get("seq", o.get("seq0"))
