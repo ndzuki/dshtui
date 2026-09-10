@@ -428,7 +428,7 @@ mod tests {
 
     fn assistant_md(seq: u64, md: &str) -> Block {
         Block::AssistantMessage {
-            seq: SessionSeq(seq),
+            seq: SessionSeq::new(seq),
             chunks: PackedChunks {
                 rows: vec![ChunkRow::TextChunks(ChunkData {
                     texts: vec![md.to_string()],

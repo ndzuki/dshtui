@@ -41,7 +41,7 @@ fn build_items(app: &AppState) -> Vec<ListItem<'static>> {
                     .iter()
                     .find(|w| w.id == id)
                     .and_then(|w| w.title.clone())
-                    .unwrap_or_else(|| id.0.clone());
+                    .unwrap_or_else(|| id.get());
                 let symbol = if collapsed { "▸" } else { "▾" };
                 items.push(ListItem::new(Line::from(vec![Span::styled(
                     format!("{symbol} {title}"),
@@ -121,7 +121,7 @@ mod tests {
 
     fn meta_titled(id: &str, title: &str) -> SessionMeta {
         SessionMeta {
-            id: SessionId(id.into()),
+            id: SessionId::new(id.into()),
             title: Some(title.into()),
             cwd: Some("/tmp/project".into()),
             updated_at_ms: 1,
@@ -172,12 +172,12 @@ mod tests {
         b.updated_at_ms = 100;
         app.workspaces.upsert_session(a);
         app.workspaces.upsert_session(b);
-        app.active_session = Some(SessionId("s2".into()));
+        app.active_session = Some(SessionId::new("s2".into()));
         // 行模型：flat 平铺 + 光标索引即会话行序。
         let rows = sidebar_rows(&app.sidebar_view, &app.workspaces);
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].session_id(), Some(&SessionId("s1".into())));
-        assert_eq!(rows[1].session_id(), Some(&SessionId("s2".into())));
+        assert_eq!(rows[0].session_id(), Some(&SessionId::new("s1".into())));
+        assert_eq!(rows[1].session_id(), Some(&SessionId::new("s2".into())));
         app.sidebar.cursor = 1;
         // render 高亮光标行（List state select）。
         let backend = TestBackend::new(40, 6);
@@ -193,22 +193,26 @@ mod tests {
     fn grouped_mode_renders_headers_rows_and_ungrouped() {
         let mut app = AppState::default();
         app.workspaces
-            .upsert_workspace(WorkspaceId("ws1".into()), Some("项目A".into()));
+            .upsert_workspace(WorkspaceId::new("ws1".into()), Some("项目A".into()));
         app.workspaces.upsert_session(meta("s1"));
         app.workspaces.upsert_session(meta("s2"));
-        app.workspaces
-            .attach_session_to_workspace(&WorkspaceId("ws1".into()), &SessionId("s1".into()));
-        app.workspaces
-            .attach_session_to_workspace(&WorkspaceId("ws1".into()), &SessionId("s2".into()));
+        app.workspaces.attach_session_to_workspace(
+            &WorkspaceId::new("ws1".into()),
+            &SessionId::new("s1".into()),
+        );
+        app.workspaces.attach_session_to_workspace(
+            &WorkspaceId::new("ws1".into()),
+            &SessionId::new("s2".into()),
+        );
         app.workspaces
             .upsert_session(meta_titled("s3", "Ungrouped"));
         // 行序：ws1 header(0), s1(1), s2(2), s3(3)。
         let rows = sidebar_rows(&app.sidebar_view, &app.workspaces);
         assert_eq!(rows.len(), 4);
-        assert!(matches!(&rows[0], SidebarRow::WorkspaceHeader { id, .. } if id.0 == "ws1"));
-        assert_eq!(rows[1].session_id(), Some(&SessionId("s1".into())));
-        assert_eq!(rows[2].session_id(), Some(&SessionId("s2".into())));
-        assert_eq!(rows[3].session_id(), Some(&SessionId("s3".into())));
+        assert!(matches!(&rows[0], SidebarRow::WorkspaceHeader { id, .. } if id.get() == "ws1"));
+        assert_eq!(rows[1].session_id(), Some(&SessionId::new("s1".into())));
+        assert_eq!(rows[2].session_id(), Some(&SessionId::new("s2".into())));
+        assert_eq!(rows[3].session_id(), Some(&SessionId::new("s3".into())));
 
         let backend = TestBackend::new(40, 8);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -223,7 +227,7 @@ mod tests {
     #[test]
     fn collapsed_workspace_uses_arrow_and_skips_sessions() {
         let mut app = AppState::default();
-        let ws1 = WorkspaceId("ws1".into());
+        let ws1 = WorkspaceId::new("ws1".into());
         app.workspaces
             .upsert_workspace(ws1.clone(), Some("项目A".into()));
         app.workspaces
@@ -231,9 +235,9 @@ mod tests {
         app.workspaces
             .upsert_session(meta_titled("s2", "Hidden Two"));
         app.workspaces
-            .attach_session_to_workspace(&ws1, &SessionId("s1".into()));
+            .attach_session_to_workspace(&ws1, &SessionId::new("s1".into()));
         app.workspaces
-            .attach_session_to_workspace(&ws1, &SessionId("s2".into()));
+            .attach_session_to_workspace(&ws1, &SessionId::new("s2".into()));
         app.sidebar_view.collapsed.insert(ws1);
         let rows = sidebar_rows(&app.sidebar_view, &app.workspaces);
         assert_eq!(rows.len(), 1, "折叠 workspace 只留标题行");
@@ -274,13 +278,15 @@ mod tests {
         // group=flat：即使 workspace 折叠标记存在也全量平铺（无 header）。
         let mut app = AppState::default();
         app.sidebar_view.group_by = crate::model::GroupBy::Flat;
-        app.sidebar_view.collapsed.insert(WorkspaceId("ws1".into()));
+        app.sidebar_view
+            .collapsed
+            .insert(WorkspaceId::new("ws1".into()));
         let mut m = meta("s1");
-        m.workspace = Some(WorkspaceId("ws1".into()));
+        m.workspace = Some(WorkspaceId::new("ws1".into()));
         app.workspaces.upsert_session(m);
         let rows = sidebar_rows(&app.sidebar_view, &app.workspaces);
         assert_eq!(rows.len(), 1, "flat 平铺不折叠");
-        assert_eq!(rows[0].session_id(), Some(&SessionId("s1".into())));
+        assert_eq!(rows[0].session_id(), Some(&SessionId::new("s1".into())));
     }
 
     #[test]

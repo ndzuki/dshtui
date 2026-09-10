@@ -33,11 +33,18 @@ type Sink = futures_util::stream::SplitSink<
 type WsStream = tokio_tungstenite::WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
 /// Per-stream response channel registry.
-type StreamMap = HashMap<u64, mpsc::Sender<Result<Value, ClientError>>>;
+///
+/// Key = client-minted stream id **string**。官方 0.1.2-rc.1 的
+/// `stream-server.js` `validId()` 要求 `streamId` 为非空字符串（官方 client 用
+/// `randomUUID()`）；数字会被 `parseRemoteStreamClientMessage` 拒绝并关闭整个
+/// mux（Step E live 实证：数字 streamId → `invalid Remote stream request` +
+/// socket 断开；字符串 → item 帧正常回流）。mock 曾用数字 id 且不校验，
+/// 掩盖了该 wire 漂移。
+type StreamMap = HashMap<String, mpsc::Sender<Result<Value, ClientError>>>;
 
 /// Receive end of one mux stream.
 pub struct StreamHandle {
-    pub id: u64,
+    pub id: String,
     rx: mpsc::Receiver<Result<Value, ClientError>>,
 }
 
@@ -65,7 +72,7 @@ struct ServerFrame {
     #[serde(rename = "type")]
     kind: String,
     #[serde(default)]
-    stream_id: u64,
+    stream_id: Option<String>,
     #[serde(default)]
     value: Option<Value>,
     #[serde(default)]
@@ -129,22 +136,22 @@ impl Mux {
                             }
                         };
                         let mut guard = streams2.lock().await;
-                        match frame.kind.as_str() {
-                            "item" if frame.stream_id != 0 => {
-                                if let Some(tx) = guard.get(&frame.stream_id) {
+                        match (frame.kind.as_str(), frame.stream_id.as_deref()) {
+                            ("item", Some(id)) => {
+                                if let Some(tx) = guard.get(id) {
                                     if tx
                                         .send(Ok(frame.value.unwrap_or(Value::Null)))
                                         .await
                                         .is_err()
                                     {
-                                        guard.remove(&frame.stream_id);
+                                        guard.remove(id);
                                     }
                                 }
                             }
-                            "end" if frame.stream_id != 0 => {
-                                guard.remove(&frame.stream_id); // drop sender → recv None
+                            ("end", Some(id)) => {
+                                guard.remove(id); // drop sender → recv None
                             }
-                            "error" if frame.stream_id != 0 => {
+                            ("error", Some(id)) => {
                                 let err = frame.error.unwrap_or(super::envelope::RpcError {
                                     code: "stream/error".into(),
                                     message: None,
@@ -155,7 +162,7 @@ impl Mux {
                                     message: err.message.clone().unwrap_or_else(|| "流错误".into()),
                                     class: ErrorClass::from_code(&err.code),
                                 };
-                                if let Some(tx) = guard.remove(&frame.stream_id) {
+                                if let Some(tx) = guard.remove(id) {
                                     let _ = tx.send(Err(e)).await;
                                 }
                             }
@@ -182,7 +189,7 @@ impl Mux {
             // streams (the upper layer reconnects uniformly). The push channel
             // dies with the mux (all senders dropped → subscribers see Closed).
             let mut guard = streams2.lock().await;
-            let ids = guard.keys().copied().collect::<Vec<_>>();
+            let ids = guard.keys().cloned().collect::<Vec<_>>();
             for id in ids {
                 if let Some(tx) = guard.remove(&id) {
                     let _ = tx
@@ -202,14 +209,20 @@ impl Mux {
     }
 
     /// Open a stream (open frame), returning the receive handle.
+    ///
+    /// streamId 客户端铸币为**非空字符串**（官方 0.1.2-rc.1 协议要求，官方
+    /// client 用 `randomUUID()`；数字会被服务端 `validId` 拒绝并断开整个
+    /// mux——Step E live 实证）。内部计数器只保证单 mux 内唯一，前缀
+    /// `dshtui-` + 计数即可（无需 uuid crate）。
     pub async fn open_stream(
         &self,
         endpoint: &str,
         args: Value,
     ) -> Result<StreamHandle, ClientError> {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let n = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let id = format!("dshtui-{n}");
         let (tx, rx) = mpsc::channel(256);
-        self.streams.lock().await.insert(id, tx);
+        self.streams.lock().await.insert(id.clone(), tx);
         let frame = serde_json::json!({
             "type": "open",
             "streamId": id,
@@ -224,17 +237,17 @@ impl Mux {
                 "open {endpoint} 发送失败: {e}"
             )));
         }
-        tracing::debug!(stream_id = id, %endpoint, "mux stream 已打开");
+        tracing::debug!(stream_id = %id, %endpoint, "mux stream 已打开");
         Ok(StreamHandle { id, rx })
     }
 
     /// Cancel a stream (cancel frame + registry removal; later in-flight
     /// frames are dropped).
-    pub async fn cancel_stream(&self, id: u64) {
+    pub async fn cancel_stream(&self, id: &str) {
         let frame = serde_json::json!({"type": "cancel", "streamId": id});
         let _ = self.send(&frame).await;
-        self.streams.lock().await.remove(&id);
-        tracing::debug!(stream_id = id, "mux stream 已取消");
+        self.streams.lock().await.remove(id);
+        tracing::debug!(stream_id = %id, "mux stream 已取消");
     }
 
     async fn send(&self, frame: &Value) -> Result<(), String> {
@@ -253,28 +266,30 @@ mod tests {
     #[test]
     fn server_frame_parses_item_end_error() {
         let f: ServerFrame =
-            serde_json::from_str(r#"{"type":"item","streamId":3,"value":{"hello":1}}"#).unwrap();
+            serde_json::from_str(r#"{"type":"item","streamId":"dshtui-3","value":{"hello":1}}"#)
+                .unwrap();
         assert_eq!(f.kind, "item");
-        assert_eq!(f.stream_id, 3);
+        assert_eq!(f.stream_id.as_deref(), Some("dshtui-3"));
         assert_eq!(f.value.unwrap()["hello"], 1);
 
-        let f: ServerFrame = serde_json::from_str(r#"{"type":"end","streamId":3}"#).unwrap();
+        let f: ServerFrame =
+            serde_json::from_str(r#"{"type":"end","streamId":"dshtui-3"}"#).unwrap();
         assert!(f.value.is_none());
 
         let f: ServerFrame = serde_json::from_str(
-            r#"{"type":"error","streamId":3,"error":{"code":"PERMISSION_DENIED","message":"x"}}"#,
+            r#"{"type":"error","streamId":"dshtui-3","error":{"code":"PERMISSION_DENIED","message":"x"}}"#,
         )
         .unwrap();
         assert_eq!(f.error.unwrap().code, "PERMISSION_DENIED");
     }
 
     #[test]
-    fn server_frame_without_stream_id_defaults_to_zero() {
+    fn server_frame_without_stream_id_defaults_to_none() {
         // Server-pushed frames (approval/request) carry no streamId; serde
-        // default gives 0, which the read loop routes to the push bypass.
+        // default gives None, which the read loop routes to the push bypass.
         let f: ServerFrame =
             serde_json::from_str(r#"{"type":"approval/request","clientId":"c1"}"#).unwrap();
         assert_eq!(f.kind, "approval/request");
-        assert_eq!(f.stream_id, 0);
+        assert_eq!(f.stream_id, None);
     }
 }

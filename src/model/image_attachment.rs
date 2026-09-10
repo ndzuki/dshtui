@@ -58,12 +58,12 @@ impl ImageAttachmentState {
             }
         }
         for a in &self.pending {
-            if !is_supported_image(&a.media_type.0) {
-                return Err(format!("不支持的图片类型：{}", a.media_type.0));
+            if !is_supported_image(&a.media_type.get()) {
+                return Err(format!("不支持的图片类型：{}", a.media_type.get()));
             }
             if let Some(allowed) = allowed_media_types {
-                if !allowed.iter().any(|t| t == &a.media_type.0) {
-                    return Err(format!("服务端不允许的图片类型：{}", a.media_type.0));
+                if !allowed.iter().any(|t| t == &a.media_type.get()) {
+                    return Err(format!("服务端不允许的图片类型：{}", a.media_type.get()));
                 }
             }
         }
@@ -107,7 +107,7 @@ pub fn media_type_from_path(path: &str) -> Result<MediaType, String> {
             ))
         }
     };
-    Ok(MediaType(mt.to_string()))
+    Ok(MediaType::new(mt.to_string()))
 }
 
 /// Does this trimmed text look like a LOCAL path (never a remote URL)?
@@ -150,7 +150,7 @@ mod tests {
     fn png(bytes: usize) -> ImageAttachment {
         ImageAttachment {
             path: "/a.png".into(),
-            media_type: MediaType("image/png".into()),
+            media_type: MediaType::new("image/png".into()),
             data_base64: "x".into(),
             bytes,
         }
@@ -158,8 +158,8 @@ mod tests {
 
     #[test]
     fn media_type_inference_and_rejection() {
-        assert_eq!(media_type_from_path("x.PNG").unwrap().0, "image/png");
-        assert_eq!(media_type_from_path("y.jpeg").unwrap().0, "image/jpeg");
+        assert_eq!(media_type_from_path("x.PNG").unwrap().get(), "image/png");
+        assert_eq!(media_type_from_path("y.jpeg").unwrap().get(), "image/jpeg");
         assert!(media_type_from_path("z.gif").is_ok());
         assert!(media_type_from_path("z.bmp").is_err());
         assert!(media_type_from_path("noext").is_err());

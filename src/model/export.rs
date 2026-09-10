@@ -4,10 +4,41 @@
 //! (byte-identical, D-41). Fallback (D-46 HARD contract): when the official
 //! route is unavailable/fails (404/5xx/transport), rebuild a JSONL export from
 //! `session/page` full-history records. 401/403 (permission) NEVER falls back
-//! and is never auto-retried. The fallback's byte-level line format is
-//! `[验证]` (no local contract evidence; REQ-008 live smoke locks it); the
-//! measurable acceptance is records/key-event count vs the official export.
-//! One export per session is single-flight (requestId idempotent).
+//! and is never auto-retried. One export per session is single-flight
+//! (requestId idempotent).
+//!
+//! # REQ-008 live 锁定结论（AC-008-15, D-54；2026-09-08 对官方 0.1.2-rc.1
+//! session-25536e2c-f8b9-4bcf-a16b-0baa085fa362 实测，证据 scripts/
+//! live-export-lock.sh + scratch 报告）
+//!
+//! 官方 `session.jsonl`（ZIP 内）与 `session/page` 是同一会话的两种粒度视图：
+//! 官方行 = 原始逐 delta 日志（每 delta 一条 `assistant/chunk` + 周期性
+//! `*-chunks` flush 段，8527 行/样本），page = 聚合历史视图（事件 + 每
+//! (turn,step,index) 一条 packed chunkrow，1269 records/样本）。page 数据无法
+//! 还原官方逐 delta 行，故「锁定」的是 page 可及子集的 **逐行格式契约**：
+//!
+//! 1. **header**：`{"type":"session","version":0,"id":<sessionId>}`（官方
+//!    首行同形态）。createdAt/cwd/delegationDepth/agentPreset 为官方可选字段，
+//!    host 导出时由会话元数据填充；page 重建无可靠来源 → 省略（同官方
+//!    dsh-session-persistence-jsonl toHeaderLine 规则：可选字段缺省省略，
+//!    不造假值）。移除旧自造 `source:"page-rebuild"` 标记。
+//! 2. **解包**：page record `{"type":"event"|"chunks","event":X}` → 输出 X
+//!    本身（type/seq/time/data 平铺顶层）。实证：非 chunk 事件 + meta
+//!    assistant/chunk（block-start/end/usage/finish）与官方同 seq 行 JSON
+//!    语义一致；assistant/message 的 sourceEventSeqs 官方为压缩区间对
+//!    `[[a,b]]`、page 为展开列表（语义等价，字节不同）。
+//! 3. **chunk 行**：`chunkrow/*-chunks` → 官方 `*-chunks`（reasoning-chunks/
+//!    text-chunks/tool-call-chunks），`seq`/`time` → `seq0`/`time0`（官方
+//!    flush 行字段名；实证同 seq/time 同位）。data 保持 page 聚合粒度（官方
+//!    为逐 flush 段）——结构性已接受差异。
+//! 4. **顺序**：官方顺时（seq 升序）。page 响应页内升序、跨页（beforeSeq 走
+//!    旧）整体逆序 → 收集全量后按 seq 升序稳定排序输出（见
+//!    `rebuild_sort_chronological`）。
+//!
+//! 行内容用 serde_json 规范 compact 序列化（键按字典序）→ TUI 重建自身字节
+//! 稳定、可逐行回读；与官方逐字节差异限于键序与上述数据源粒度，JSON 语义
+//! 一致。可测口径 = records 数 + header 行数对账、逐行 schema 回读、
+//! 关键事件（type/seq/time/data）与官方同 seq 行一致。
 
 /// Export phases.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -107,12 +138,18 @@ impl ExportState {
     }
 }
 
-/// D-46 page 重建 JSONL header 行（会话 meta；`[验证]` 格式待 REQ-008）。
+/// D-46 page 重建 JSONL header 行（会话 meta）。
+///
+/// REQ-008 live 锁定（AC-008-15）：与官方 `session.jsonl` 首行同形态——
+/// `{"type":"session","version":0,"id":<sessionId>}`。官方可选字段 createdAt/
+/// cwd/delegationDepth/agentPreset 由 host 会话元数据填充（toHeaderLine 同
+/// 规则：可选字段来源不可得时省略）；page 重建无这些元数据的可靠来源 →
+/// 省略（不造假值）。不再带自造 `source` 标记。
 pub fn rebuild_header_line(session_id: &str) -> String {
     let header = serde_json::json!({
-        "type": "session-meta",
-        "sessionId": session_id,
-        "source": "page-rebuild",
+        "type": "session",
+        "version": 0,
+        "id": session_id,
     });
     let mut out = serde_json::to_string(&header).unwrap_or_else(|_| "{}".into());
     out.push('\n');
@@ -120,19 +157,86 @@ pub fn rebuild_header_line(session_id: &str) -> String {
 }
 
 /// D-46 page 重建 JSONL 单条 record 行（compact；损坏值以 `{}` 行兜底）。
+///
+/// REQ-008 live 锁定（AC-008-15）行格式映射：
+///   - `{type:"event", event:X}` → 输出 X（type/seq/time/data 平铺顶层）；
+///   - `{type:"chunks", event:X}` → 输出 X 并映射为官方 `*-chunks` 行：
+///     type 去 `chunkrow/` 前缀、`seq`/`time` → `seq0`/`time0`；
+///   - 已是平铺形态（type/seq/time/data 在顶层，含官方 `*-chunks` 形态）的
+///     record 原样输出。
 pub fn rebuild_record_line(rec: &serde_json::Value) -> String {
-    let mut out = serde_json::to_string(rec).unwrap_or_else(|_| "{}".into());
+    let line = rebuild_record_to_line(rec);
+    let mut out = serde_json::to_string(&line).unwrap_or_else(|_| "{}".into());
     out.push('\n');
     out
 }
 
+/// 纯映射（不序列化，便于单测逐字段断言）：见 `rebuild_record_line` 说明。
+fn rebuild_record_to_line(rec: &serde_json::Value) -> serde_json::Value {
+    // 1) 解包 page wrapper：`{type:"event"|"chunks", event:X}` → X。
+    let wrapped = matches!(
+        rec.get("type").and_then(|t| t.as_str()),
+        Some("event" | "chunks")
+    );
+    let inner = if wrapped {
+        rec.get("event").cloned().unwrap_or_else(|| rec.clone())
+    } else {
+        rec.clone()
+    };
+    // 2) chunkrow 行映射为官方 `*-chunks` 行（仅当 type 带 chunkrow/ 前缀）。
+    let Some(inner_type) = inner.get("type").and_then(|t| t.as_str()) else {
+        return inner;
+    };
+    let Some(stripped) = inner_type.strip_prefix("chunkrow/") else {
+        return inner;
+    };
+    let Some(obj) = inner.as_object() else {
+        return inner;
+    };
+    let mut out = obj.clone();
+    out.insert("type".into(), serde_json::json!(stripped));
+    // seq/time → seq0/time0（官方 flush 行字段名；其余字段含 data 原样保留）。
+    if let Some(seq) = out.remove("seq") {
+        out.insert("seq0".into(), seq);
+    }
+    if let Some(time) = out.remove("time") {
+        out.insert("time0".into(), time);
+    }
+    serde_json::Value::Object(out)
+}
+
+/// 从一条 record 的原始 JSON 提取 seq：Event/Chunks 形态
+/// `{type:"event"|"chunks",event:{seq}}` 与宽容 `{seq}` 兜底；无 seq 返回
+/// None（理论上 page 恒带 seq，chunkrow 的 seq 也在 event 内）。
+fn rebuild_record_seq(rec: &serde_json::Value) -> Option<u64> {
+    let seq = rec
+        .get("event")
+        .and_then(|e| e.get("seq"))
+        .or_else(|| rec.get("seq"))
+        .and_then(|v| v.as_u64());
+    seq
+}
+
+/// 按 record seq 升序稳定排序（顺时；官方 `session.jsonl` 为 seq 升序时间序）。
+///
+/// REQ-008 live 实证：官方 0.1.2-rc.1 `session/page` 响应**页内升序**、跨页
+/// （beforeSeq 独占上界单调后退取更旧页）整体非单调——收集顺序不可作为输出
+/// 顺序。统一在收集全量后调用本函数，保证任何服务器分页顺序下输出均为顺时。
+/// 无 seq 的 record（占位/异常）按 None（排最前）处理，稳定排序保持相对序。
+pub fn rebuild_sort_chronological(records: &mut [serde_json::Value]) {
+    records.sort_by_key(rebuild_record_seq);
+}
+
 /// D-46 page 重建 JSONL 纯函数（headless seam）：`records`（fixture/收集的
-/// 原始 record JSON）→ 输出 JSONL 文本——header 行（会话 meta）+ 每行一条
-/// record。行格式 `[验证]`（无 live 契约证据，REQ-008 冒烟锁定）；可测口径 =
-/// 行数 = records 数 + header，内容逐条可对账。
+/// 原始 record JSON，顺序任意）→ 输出 JSONL 文本——header 行 + 每行一条
+/// record，先按 seq 顺时排序（见 `rebuild_sort_chronological`）。行格式 =
+/// REQ-008 live 锁定结论（模块头）；可测口径 = 行数 = records 数 + header、
+/// 逐行可回读、每行与输入经解包/映射后对账。
 pub fn rebuild_jsonl(session_id: &str, records: &[serde_json::Value]) -> String {
     let mut out = rebuild_header_line(session_id);
-    for rec in records {
+    let mut sorted: Vec<&serde_json::Value> = records.iter().collect();
+    sorted.sort_by_key(|r| rebuild_record_seq(r));
+    for rec in sorted {
         out.push_str(&rebuild_record_line(rec));
     }
     out
@@ -144,8 +248,9 @@ pub fn rebuild_jsonl(session_id: &str, records: &[serde_json::Value]) -> String 
 /// 旧 record seq 为下一次 beforeSeq，直至 `has_more=false` 或空页/无 seq 页/
 /// 达页数硬上界（防死循环）。
 ///
-/// 返回 (next_before_seq, should_stop)。`[验证]`：live 冒烟在 REQ-008 锁定，
-/// mock 语义与官方 client 用法一致。
+/// 返回 (next_before_seq, should_stop)。REQ-008 live 锁定（0.1.2-rc.1 实读）：
+/// `beforeSeq` 独占上界、页内 seq 升序、跨页单调退旧——本函数只依赖页内
+/// min seq 推进，与页序无关。
 pub fn rebuild_next_cursor(
     before_seq: Option<u64>,
     records: &[serde_json::Value],
@@ -172,17 +277,6 @@ pub fn rebuild_next_cursor(
             }
         }
     }
-}
-
-/// 从一条 record 的原始 JSON 提取 seq：Event 形态 `{type:"event",event:{seq}}`
-/// 与宽容 `{seq}` 兜底；Chunks 无 seq。
-fn rebuild_record_seq(rec: &serde_json::Value) -> Option<u64> {
-    let seq = rec
-        .get("event")
-        .and_then(|e| e.get("seq"))
-        .or_else(|| rec.get("seq"))
-        .and_then(|v| v.as_u64());
-    seq
 }
 
 #[cfg(test)]
@@ -251,21 +345,96 @@ mod tests {
 
     #[test]
     fn rebuild_jsonl_header_plus_one_line_per_record_ac007_17() {
+        use serde_json::json;
+        // 输入乱序（含 event 与 chunks 两类 record）→ 输出 header + N 行，
+        // 按 seq 顺时，逐行 = 解包/映射后的平铺形态。
         let records = vec![
-            serde_json::json!({"type":"event","event":{"seq":1,"type":"user/message"}}),
-            serde_json::json!({"type":"event","event":{"seq":2,"type":"assistant/message"}}),
+            json!({"type":"event","event":{"seq":2,"type":"assistant/message"}}),
+            json!({"type":"chunks","event":{
+                "type":"chunkrow/reasoning-chunks","seq":3,"time":123,
+                "data":{"turn":1,"step":1,"index":0,"dt":[1.0],"texts":["x"]}}}),
+            json!({"type":"event","event":{"seq":1,"type":"user/message"}}),
         ];
         let out = rebuild_jsonl("sess-1", &records);
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines.len(), records.len() + 1, "header + N records");
+        // header = 官方 session 形态（无 sessionId/source 自造标记）。
         let header: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
-        assert_eq!(header["type"], "session-meta");
-        assert_eq!(header["sessionId"], "sess-1");
-        // 每行可回读且与输入一致。
-        for (i, rec) in records.iter().enumerate() {
+        assert_eq!(
+            header,
+            json!({"type":"session","version":0,"id":"sess-1"}),
+            "header 对齐官方 session 行"
+        );
+        // 每行可回读、平铺、按 seq 顺时、与输入经解包/映射后一致。
+        let expected = [
+            json!({"type":"user/message","seq":1}),
+            json!({"type":"assistant/message","seq":2}),
+            json!({
+                "type":"reasoning-chunks","seq0":3,"time0":123,
+                "data":{"turn":1,"step":1,"index":0,"dt":[1.0],"texts":["x"]}
+            }),
+        ];
+        for (i, exp) in expected.iter().enumerate() {
             let parsed: serde_json::Value = serde_json::from_str(lines[i + 1]).unwrap();
-            assert_eq!(parsed, *rec, "第 {i} 行内容对账");
+            assert_eq!(&parsed, exp, "第 {} 行解包/映射对账", i + 1);
         }
+    }
+
+    #[test]
+    fn rebuild_record_line_unwraps_and_maps_chunkrow_ac008_15() {
+        use serde_json::json;
+        // event wrapper 解包 → 内层原样（type/seq/time/data 平铺）。
+        let event = json!({"type":"event","event":{
+            "type":"assistant/chunk","seq":7,"time":99,
+            "data":{"turn":1,"step":2,"chunk":{"type":"block-start","index":0}}}});
+        let parsed: serde_json::Value =
+            serde_json::from_str(rebuild_record_line(&event).trim()).unwrap();
+        assert_eq!(
+            parsed,
+            json!({"type":"assistant/chunk","seq":7,"time":99,
+                   "data":{"turn":1,"step":2,"chunk":{"type":"block-start","index":0}}})
+        );
+        // chunks wrapper → 去 chunkrow/ 前缀 + seq/time → seq0/time0。
+        for (chunkrow, official) in [
+            ("chunkrow/reasoning-chunks", "reasoning-chunks"),
+            ("chunkrow/text-chunks", "text-chunks"),
+            ("chunkrow/tool-call-chunks", "tool-call-chunks"),
+        ] {
+            let chunks = json!({"type":"chunks","event":{
+                "type": chunkrow, "seq":14, "time":1788859029701_i64,
+                "data":{"turn":1,"step":1,"index":0,"dt":[1.0,2.0],"texts":["a","b"]}}});
+            let parsed: serde_json::Value =
+                serde_json::from_str(rebuild_record_line(&chunks).trim()).unwrap();
+            assert_eq!(
+                parsed,
+                json!({"type": official, "seq0":14, "time0":1788859029701_i64,
+                       "data":{"turn":1,"step":1,"index":0,"dt":[1.0,2.0],"texts":["a","b"]}}),
+                "chunkrow {chunkrow} → 官方 {official}"
+            );
+        }
+        // 平铺形态原样（含官方 *-chunks 形态，无 chunkrow/ 前缀 → 不再二次改名）。
+        let flat = json!({"type":"reasoning-chunks","seq0":5,"time0":1,"data":{"texts":[]}});
+        let parsed: serde_json::Value =
+            serde_json::from_str(rebuild_record_line(&flat).trim()).unwrap();
+        assert_eq!(parsed, flat);
+    }
+
+    #[test]
+    fn rebuild_sort_chronological_orders_by_seq_ac008_15() {
+        use serde_json::json;
+        let mut recs = vec![
+            json!({"type":"event","event":{"seq":50,"type":"step/end"}}),
+            json!({"type":"event","event":{"seq":1,"type":"permission/preset"}}),
+            json!({"type":"chunks","event":{
+                "type":"chunkrow/text-chunks","seq":25,"time":1,"data":{"texts":[]}}}),
+            json!({"type":"event","event":{"seq":10,"type":"step/start"}}),
+        ];
+        rebuild_sort_chronological(&mut recs);
+        let seqs: Vec<u64> = recs
+            .iter()
+            .map(|r| r["event"]["seq"].as_u64().unwrap())
+            .collect();
+        assert_eq!(seqs, vec![1, 10, 25, 50], "按 seq 升序（顺时）");
     }
 
     #[test]

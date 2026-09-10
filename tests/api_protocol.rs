@@ -51,8 +51,8 @@ async fn write_json_response(socket: &mut tokio::net::TcpStream, resp: Value) {
 
 fn queue_prompt_request() -> PromptRequest {
     PromptRequest {
-        request_id: SessionRequestId("client-minted-1".into()),
-        session_id: SessionId("sess-1".into()),
+        request_id: SessionRequestId::new("client-minted-1".into()),
+        session_id: SessionId::new("sess-1".into()),
         mode: PromptMode::Queue,
         content: vec![PromptContentPart::Text {
             text: "你好 draft".into(),
@@ -150,7 +150,7 @@ fn typed_follow_frame_accepts_snapshot_and_event_shapes() {
             projections,
             ..
         } => {
-            assert_eq!(cursor.map(|v| v.0), Some(41));
+            assert_eq!(cursor.map(|v| v.get()), Some(41));
             assert_eq!(has_more, Some(true));
             assert_eq!(projections.unwrap()["running"], false);
         }
@@ -164,7 +164,7 @@ fn typed_follow_frame_accepts_snapshot_and_event_shapes() {
     .unwrap();
     assert!(matches!(
         event,
-        FollowFrame::Event { event } if event.seq == Some(SessionSeq(42))
+        FollowFrame::Event { event } if event.seq == Some(SessionSeq::new(42))
             && event.request_id.as_deref() == Some("req-42")
     ));
 }
@@ -220,7 +220,8 @@ async fn mux_open_stream_routes_item_and_end_frames() {
         let first = ws.next().await.unwrap().unwrap();
         let frame: Value = serde_json::from_str(first.to_text().unwrap()).unwrap();
         opened_tx.send(frame.clone()).unwrap();
-        let stream_id = frame["streamId"].as_u64().unwrap();
+        // streamId 为客户端铸币字符串（官方协议要求；mock 回显同一字符串）。
+        let stream_id = frame["streamId"].as_str().unwrap().to_string();
 
         ws.send(Message::Text(
             json!({"type": "item", "streamId": stream_id, "value": {"answer": 42}}).to_string(),
@@ -303,13 +304,16 @@ async fn prompt_unary_posts_official_args_and_parses_accepted() {
         let body: Value = serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
         assert_eq!(body["type"], "client-request");
         assert_eq!(body["method"], "session/prompt");
+        // 单 request 形参：业务字段嵌套在 args.request（wire 校正 0.1.2-rc.1）。
         let args = &body["payload"]["args"];
-        assert_eq!(args["requestId"], "client-minted-1");
-        assert_eq!(args["sessionId"], "sess-1");
-        assert_eq!(args["mode"], "queue");
-        assert_eq!(args["content"][0]["type"], "text");
-        assert_eq!(args["content"][0]["text"], "你好 draft");
-        assert!(args.get("clientTimeZone").is_none());
+        assert!(args.get("requestId").is_none(), "不得平铺 requestId");
+        let req = &args["request"];
+        assert_eq!(req["requestId"], "client-minted-1");
+        assert_eq!(req["sessionId"], "sess-1");
+        assert_eq!(req["mode"], "queue");
+        assert_eq!(req["content"][0]["type"], "text");
+        assert_eq!(req["content"][0]["text"], "你好 draft");
+        assert!(req.get("clientTimeZone").is_none());
         let rpc_id = body["rpcId"].as_str().unwrap().to_string();
         write_json_response(
             &mut socket,
@@ -446,7 +450,9 @@ async fn cancel_unary_returns_typed_accepted_receipt() {
         assert!(request.starts_with("POST /api/session/cancel HTTP/1.1"));
         let body: Value = serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
         assert_eq!(body["method"], "session/cancel");
-        assert_eq!(body["payload"]["args"]["sessionId"], "sess-1");
+        // 单 request 形参（wire 校正 0.1.2-rc.1）：sessionId 嵌套在 args.request。
+        assert!(body["payload"]["args"].get("sessionId").is_none());
+        assert_eq!(body["payload"]["args"]["request"]["sessionId"], "sess-1");
         let rpc_id = body["rpcId"].as_str().unwrap().to_string();
         write_json_response(
             &mut socket,
@@ -546,7 +552,9 @@ async fn search_unary_posts_query_and_parses_session_level_hits() {
         let body: Value = serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
         let rpc_id = body["rpcId"].as_str().unwrap().to_string();
         assert_eq!(body["method"], "session/search");
-        assert_eq!(body["payload"]["args"]["query"], "deploy");
+        // 单 request 形参（wire 校正 0.1.2-rc.1）：query 嵌套在 args.request。
+        assert!(body["payload"]["args"].get("query").is_none());
+        assert_eq!(body["payload"]["args"]["request"]["query"], "deploy");
         write_json_response(
             &mut socket,
             json!({
@@ -571,7 +579,7 @@ async fn search_unary_posts_query_and_parses_session_level_hits() {
     .await
     .unwrap();
     assert_eq!(result.items.len(), 1);
-    assert_eq!(result.items[0].session_id, SessionId("sess-9".into()));
+    assert_eq!(result.items[0].session_id, SessionId::new("sess-9".into()));
     assert_eq!(result.items[0].snippet, "deploy 排查 …");
     assert!(result.has_more);
     server.await.unwrap();
@@ -658,7 +666,8 @@ async fn mux_pushes_streamless_frames_to_bypass_and_routes_streams() {
         let first = ws.next().await.unwrap().unwrap();
         let frame: Value = serde_json::from_str(first.to_text().unwrap()).unwrap();
         opened_tx.send(frame.clone()).unwrap();
-        let stream_id = frame["streamId"].as_u64().unwrap();
+        // streamId 为客户端铸币字符串（官方协议要求；mock 回显同一字符串）。
+        let stream_id = frame["streamId"].as_str().unwrap().to_string();
 
         ws.send(Message::Text(
             json!({
@@ -782,8 +791,13 @@ async fn attachment_fetch_sends_envelope_and_decodes_base64_data() {
         let request: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(request["type"], "client-request");
         assert_eq!(request["method"], "session/attachment");
-        assert_eq!(request["payload"]["args"]["sessionId"], "sess-1");
-        assert_eq!(request["payload"]["args"]["attachmentId"], "att-9");
+        // 单 request 形参（wire 校正 0.1.2-rc.1）：嵌套在 args.request。
+        assert!(request["payload"]["args"].get("sessionId").is_none());
+        assert_eq!(request["payload"]["args"]["request"]["sessionId"], "sess-1");
+        assert_eq!(
+            request["payload"]["args"]["request"]["attachmentId"],
+            "att-9"
+        );
         let rpc_id = request["rpcId"].as_str().unwrap();
 
         let png: Vec<u8> = vec![0x89, b'P', b'N', b'G', 1, 2, 3, 4];
@@ -820,13 +834,13 @@ async fn attachment_fetch_sends_envelope_and_decodes_base64_data() {
     let got = attachment::fetch(
         &http,
         &base,
-        &SessionId("sess-1".into()),
-        &AttachmentId("att-9".into()),
+        &SessionId::new("sess-1".into()),
+        &AttachmentId::new("att-9".into()),
     )
     .await
     .unwrap();
-    assert_eq!(got.attachment_id.0, "att-9");
-    assert_eq!(got.media_type.0, "image/png");
+    assert_eq!(got.attachment_id.get(), "att-9");
+    assert_eq!(got.media_type.get(), "image/png");
     assert_eq!(got.bytes, 8);
     assert_eq!(got.width, 640);
     assert_eq!(got.height, 480);
@@ -865,8 +879,8 @@ async fn attachment_fetch_error_envelope_classifies_by_code() {
     let err = attachment::fetch(
         &http,
         &format!("http://{addr}"),
-        &SessionId("sess-1".into()),
-        &AttachmentId("att-9".into()),
+        &SessionId::new("sess-1".into()),
+        &AttachmentId::new("att-9".into()),
     )
     .await
     .unwrap_err();
@@ -1038,7 +1052,7 @@ async fn select_model_nests_request_and_parses_selected_ac006_08() {
     let sel = dshtui::api::session::select_model(
         &http,
         &format!("http://{addr}"),
-        &SessionId("sess-1".into()),
+        &SessionId::new("sess-1".into()),
         "deepseek_official",
         "deepseek-chat",
         Some("low"),
@@ -1089,13 +1103,14 @@ async fn session_fork_rename_create_nest_request_and_parse_typed_values() {
 
     let http = reqwest::Client::new();
     let base = format!("http://{addr}");
-    let fork = dshtui::api::session::fork(&http, &base, &SessionId("sess-1".into()), Some(7))
+    let fork = dshtui::api::session::fork(&http, &base, &SessionId::new("sess-1".into()), Some(7))
         .await
         .unwrap();
     assert_eq!(fork.session_id, "new-fork-1");
-    let rename = dshtui::api::session::rename(&http, &base, &SessionId("sess-1".into()), "新标题")
-        .await
-        .unwrap();
+    let rename =
+        dshtui::api::session::rename(&http, &base, &SessionId::new("sess-1".into()), "新标题")
+            .await
+            .unwrap();
     assert_eq!(rename.title, "新标题");
     assert_eq!(rename.seq, 42);
     let created = dshtui::api::session::create(&http, &base, Some("ws-1"), None)
@@ -1651,7 +1666,9 @@ async fn skills_list_session_scoped_and_typed_entries() {
         assert!(request.starts_with("POST /api/skills/list HTTP/1.1"));
         let body: Value = serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
         assert_eq!(body["method"], "skills/list");
-        assert_eq!(body["payload"]["args"]["sessionId"], "sess-1");
+        // 单 request 形参（wire 校正 0.1.2-rc.1）：sessionId 嵌套在 args.request。
+        assert!(body["payload"]["args"].get("sessionId").is_none());
+        assert_eq!(body["payload"]["args"]["request"]["sessionId"], "sess-1");
         let rpc_id = body["rpcId"].as_str().unwrap().to_string();
         write_json_response(
             &mut socket,
@@ -1760,7 +1777,10 @@ async fn feedback_put_nests_cas_fields_and_lists() {
                     .await;
                 }
                 _ => {
-                    assert_eq!(body["payload"]["args"]["sessionId"], "sess-1");
+                    // messageFeedback/list 单 request 形参（wire 校正
+                    // 0.1.2-rc.1）：sessionId 嵌套在 args.request。
+                    assert!(body["payload"]["args"].get("sessionId").is_none());
+                    assert_eq!(body["payload"]["args"]["request"]["sessionId"], "sess-1");
                     write_json_response(
                         &mut socket,
                         json!({"type": "server-response", "rpcId": rpc_id,

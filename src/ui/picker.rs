@@ -104,7 +104,7 @@ mod tests {
 
     fn meta(id: &str, title: &str) -> SessionMeta {
         SessionMeta {
-            id: SessionId(id.into()),
+            id: SessionId::new(id.into()),
             title: Some(title.into()),
             cwd: None,
             updated_at_ms: 1,

@@ -1,0 +1,113 @@
+# dshtui CI —— REQ-008 Step 7 交付（依据 Notes/09 P04/P06）：
+#   * AC-008-18：fmt / clippy / test 全绿；
+#   * AC-008-19：契约冒烟以离线 mock 为主（api_protocol / export_rebuild_proto），
+#     live smoke（tests/live_smoke.rs，连真实 dsh）默认跳过——用 env 门控，
+#     无本地 dsh 的 CI 一律以 mock 为准；
+#   * perf gate 独立 job 可选：#[ignore] 性能测试不随 PR 常跑，仅 release 相关
+#     push 或手动 workflow_dispatch 触发。
+# 安全约束：不引用任何第三方 secret、不内嵌 token，只用 GitHub 内置
+# GITHUB_TOKEN 与仓库级 env（DSHTUI_LIVE_SMOKE）；只读权限足够。
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      perf_gate:
+        description: 运行 release 性能门禁
+        type: boolean
+        required: false
+        default: false
+
+
+permissions:
+  # 校验型 CI：只读检出即可，无需写权限。
+  contents: read
+
+concurrency:
+  # 同一分支/PR 的重复运行可取消，省排队资源；不阻断发布流程。
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 主质量门禁：fmt → clippy → test → 契约冒烟（mock），AC-008-18 要求全绿。
+  # ---------------------------------------------------------------------------
+  test:
+    name: fmt · clippy · test · contract-smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      # stable 工具链显式装 rustfmt/clippy 组件，保证与仓库 rust-version 之上
+      # 的当前 stable 行为一致（README「测试与质量」同口径）。
+      - name: 安装 stable Rust（rustfmt + clippy）
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: fmt 检查（AC-008-18）
+        run: cargo fmt --all -- --check
+
+      - name: clippy 全 target/all features（-D warnings，AC-008-18）
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: cargo test --all-targets（单元 + tests/ 全部 mock 集成测试）
+        run: cargo test --all-targets
+
+      # -----------------------------------------------------------------------
+      # 契约冒烟（AC-008-19）：协议 mock 为主，无 dsh 依赖即可稳定全绿。
+      # 单独列出便于在 CI 日志中直接定位契约结果（上述 --all-targets 已含，
+      # 此处为显式证据步骤）。
+      # -----------------------------------------------------------------------
+      - name: 契约冒烟：api_protocol（mock HTTP/WS）
+        run: cargo test --test api_protocol
+      - name: 契约冒烟：export_rebuild_proto（mock）
+        run: cargo test --test export_rebuild_proto
+
+      # live smoke：连真实 dsh web / OTR agent-server，需要本地 dsh 环境。
+      # 默认跳过；仅在 DSHTUI_LIVE_SMOKE=1 时启用——该值通过 GitHub 仓库级
+      # environment variable（Settings → Environment variables，注入 job 环境，
+      # 走 env context）提供；token 由仓库 secret 注入，本文件不内嵌任何凭据。
+      # tests/live_smoke.rs 尚未落地时即使开启也跳过（不报错）。
+      - name: live smoke（env 门控，默认跳过）
+        if: env.DSHTUI_LIVE_SMOKE == '1'
+        env:
+          DSH_TOKEN: ${{ secrets.DSH_TOKEN }}
+        run: |
+          if [ -f tests/live_smoke.rs ]; then
+            cargo test --test live_smoke -- --ignored
+          else
+            echo "tests/live_smoke.rs 尚未落地，跳过 live smoke（CI 以 mock 为准）"
+          fi
+
+  # ---------------------------------------------------------------------------
+  # REQ-008 AC-008-19 perf gate 独立 job（可选）：
+  #   trajectory_27turn_1144step_perf（#[ignore] 性能测试）release 优化下跑，
+  #   预算首屏构建 <1s / 全量 apply 等（见 tests/model.rs 注释）。
+  # 门控（二选一即触发）：
+  #   1) push 且 ref 含 "release"（如 main/release-* 分支，作为发布前预检）；
+  #   2) 手动 workflow_dispatch 勾选 perf_gate。
+  # 不在 PR / 普通 push 上跑，避免拖慢日常 CI。
+  # ---------------------------------------------------------------------------
+  perf-gate:
+    name: perf-gate（release 轨迹性能门禁）
+    if: (github.event_name == 'push' && contains(github.ref, 'release')) || (github.event_name == 'workflow_dispatch' && github.event.inputs.perf_gate == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - name: 安装 stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 构建 release 二进制
+        run: cargo build --release
+
+      - name: dshtui bench seed 门禁（AC-008-19）
+        run: ./target/release/dshtui bench --fixture seed
+
+      - name: 27turn/1144step release 性能测试
+        run: cargo test --release --test model trajectory_27turn_1144step_perf -- --ignored
+

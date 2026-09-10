@@ -4,9 +4,11 @@ use tokio::io::AsyncReadExt;
 //    (a) the official export route 404 classification is distinguishable from
 //        403 (structured HttpStatus, not silent Http);
 //    (b) `rebuild_export_jsonl` page-loops to collect the FULL fixture record
-//        set (3 pages → exact count), writes JSONL lines = records + 1 header,
-//        keeps hasMore/cursor termination, and cleans tmp on stream error /
-//   cancel.
+//        set (3 pages → exact count, 6 events + 1 chunkrow), writes JSONL
+//        lines = records + 1 header in chronological order, maps each record
+//        line to the official format (REQ-008 AC-008-15: `session` header /
+//        unwrap event wrapper / chunkrow→`*-chunks` + seq0/time0), keeps
+//        hasMore/cursor termination, and cleans tmp on stream error / cancel.
 use serde_json::{json, Value};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
@@ -14,6 +16,13 @@ use tokio::net::TcpListener;
 fn record(seq: u64) -> Value {
     json!({"type":"event","event":{"seq": seq, "type": "user/message",
            "data": {"content": format!("msg {seq}")}}})
+}
+
+/// 一条 chunkrow record（page 聚合形态；REQ-008 AC-008-15 锁定 chunkrow 映射）。
+fn chunks_record(seq: u64) -> Value {
+    json!({"type":"chunks","event":{
+        "type":"chunkrow/reasoning-chunks","seq": seq, "time": 100,
+        "data":{"turn":1,"step":1,"index":0,"dt":[1.0],"texts":["chunk"]}}})
 }
 
 fn page_payload(records: Vec<Value>, has_more: bool) -> Value {
@@ -89,13 +98,15 @@ async fn serve_page_rpc(listener: TcpListener) -> tokio::task::JoinHandle<()> {
             let body: Value = serde_json::from_str(&text[body_start..]).unwrap_or(Value::Null);
             let rpc_id = body.get("rpcId").and_then(|v| v.as_str()).unwrap_or("r");
             // Pick page by beforeSeq value (deterministic fixture).
+            // session/page 单 request 形参（wire 校正 0.1.2-rc.1）：
+            // beforeSeq 位于 args.request.beforeSeq。
             let before_seq = body
-                .pointer("/payload/args/beforeSeq")
+                .pointer("/payload/args/request/beforeSeq")
                 .and_then(|v| v.as_u64());
             let (records, has_more) = match before_seq {
                 None => (vec![record(6), record(5)], true),
                 Some(5) => (vec![record(4), record(3)], true),
-                _ => (vec![record(2), record(1)], false),
+                _ => (vec![record(2), record(1), chunks_record(0)], false),
             };
             let resp = json!({
                 "type": "server-response",
@@ -158,7 +169,7 @@ async fn export_404_is_structured_and_rebuild_collects_full_fixture() {
     assert_eq!(err.class(), dshtui::api::ErrorClass::PermissionDenied);
     srv.await.unwrap();
 
-    // 3) page rebuild: 3 pages → full fixture (6 records) + 1 header line.
+    // 3) page rebuild: 3 pages → full fixture (6 events + 1 chunkrow) + 1 header.
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = l.local_addr().unwrap();
     let page_srv = serve_page_rpc(l).await;
@@ -174,7 +185,7 @@ async fn export_404_is_structured_and_rebuild_collects_full_fixture() {
         &format!("http://{addr}"),
         "sess-1",
         &address,
-        dshtui::api::types::SessionSeq(6),
+        dshtui::api::types::SessionSeq::new(6),
         &target,
         &mut |n| reported.push(n),
         || false,
@@ -186,13 +197,53 @@ async fn export_404_is_structured_and_rebuild_collects_full_fixture() {
     let lines: Vec<&str> = text.lines().collect();
     assert_eq!(
         lines.len(),
-        6 + 1,
-        "records(6)+header(1); lines={}",
+        7 + 1,
+        "records(6 events+1 chunkrow)+header(1); lines={}",
         lines.len()
     );
-    assert!(lines[0].contains("session-meta"));
+    // header = 官方 session 形态（REQ-008 AC-008-15 锁定）。
+    let header: Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(
+        header,
+        json!({"type":"session","version":0,"id":"sess-1"}),
+        "header 对齐官方 session 行"
+    );
+    // 记录行按 seq 顺时（fixture 分页倒序 → 输出 chunkrow(0) 然后 1..6）；
+    // event 行解包平铺，chunkrow 行映射为官方 reasoning-chunks（seq0/time0）。
+    let parsed: Vec<Value> = lines[1..]
+        .iter()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(
+        parsed[0],
+        json!({"type":"reasoning-chunks","seq0":0,"time0":100,
+               "data":{"turn":1,"step":1,"index":0,"dt":[1.0],"texts":["chunk"]}}),
+        "chunkrow 行映射为官方 *-chunks（无 event 包裹、seq/time→seq0/time0）"
+    );
+    let seqs: Vec<u64> = parsed
+        .iter()
+        .map(|v| {
+            v["seq0"]
+                .as_u64()
+                .unwrap_or_else(|| v["seq"].as_u64().unwrap())
+        })
+        .collect();
+    assert_eq!(seqs, vec![0, 1, 2, 3, 4, 5, 6], "顺时升序输出");
+    for (i, v) in parsed.iter().enumerate().skip(1) {
+        let n = (i) as u64; // line i+1 of records → event seq i (0-based i=1→seq1)
+        assert_eq!(
+            v["type"], "user/message",
+            "record {} 平铺（无 event 包裹）",
+            n
+        );
+        assert_eq!(
+            v["data"]["content"],
+            json!(format!("msg {n}")),
+            "record {n} 内容"
+        );
+    }
     // 进度单调。
-    assert_eq!(reported.last(), Some(&6));
+    assert_eq!(reported.last(), Some(&7));
     assert!(reported.windows(2).all(|w| w[1] >= w[0]));
     let _ = receipt;
     let _ = std::fs::remove_dir_all(&tmp);
@@ -254,7 +305,7 @@ async fn export_rebuild_cancel_and_error_clean_tmp() {
         &format!("http://{addr}"),
         "sess-1",
         &address,
-        dshtui::api::types::SessionSeq(6),
+        dshtui::api::types::SessionSeq::new(6),
         &target,
         &mut |_| {},
         || false,
@@ -284,7 +335,7 @@ async fn export_rebuild_cancel_and_error_clean_tmp() {
         "http://127.0.0.1:1", // unreachable
         "sess-1",
         &address,
-        dshtui::api::types::SessionSeq(6),
+        dshtui::api::types::SessionSeq::new(6),
         &target2,
         &mut |_| {},
         || cancel.load(Ordering::Relaxed),

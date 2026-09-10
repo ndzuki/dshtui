@@ -107,10 +107,10 @@ fn insert_mode_decodes_and_routes_composer_lifecycle_ac002_01_04() {
     assert_eq!(app.mode, Mode::Normal, "无会话 i 不进入 INSERT");
 
     // 打开会话后 i → INSERT。
-    app.handle_command(Command::OpenSession(SessionId("s1".into())));
+    app.handle_command(Command::OpenSession(SessionId::new("s1".into())));
     app.handle(AppEvent::FollowSnapshot {
-        session_id: SessionId("s1".into()),
-        cursor: Some(SessionLogOffset(0)),
+        session_id: SessionId::new("s1".into()),
+        cursor: Some(SessionLogOffset::new(0)),
         records: vec![],
         has_more: true,
         projections: Some(serde_json::json!({"running": false})),
@@ -297,14 +297,14 @@ fn req003_key_route_updates_app_state() {
     app.handle_command(Command::ClosePicker);
     assert_eq!(app.mode, Mode::Normal);
     // `v`/`V` → VISUAL；y 退出并复制。
-    app.handle_command(Command::OpenSession(SessionId("s1".into())));
+    app.handle_command(Command::OpenSession(SessionId::new("s1".into())));
     app.handle(AppEvent::FollowSnapshot {
-        session_id: SessionId("s1".into()),
-        cursor: Some(SessionLogOffset(1)),
+        session_id: SessionId::new("s1".into()),
+        cursor: Some(SessionLogOffset::new(1)),
         records: vec![dshtui::api::types::SessionHistoryRecord::Event {
             event: dshtui::api::types::SessionWireEvent {
                 event_type: "user/message".into(),
-                seq: Some(dshtui::api::types::SessionSeq(1)),
+                seq: Some(dshtui::api::types::SessionSeq::new(1)),
                 time: None,
                 request_id: None,
                 ignorable: None,
@@ -334,11 +334,11 @@ fn image_app(kitty: bool) -> AppState {
     let mut app = AppState::new(20);
     app.conn = dshtui::app::ConnState::Ready;
     app.kitty_capable = kitty;
-    app.active_session = Some(dshtui::api::types::SessionId("sess-1".into()));
+    app.active_session = Some(dshtui::api::types::SessionId::new("sess-1".into()));
     let records = vec![dshtui::api::types::SessionHistoryRecord::Event {
         event: dshtui::api::types::SessionWireEvent {
             event_type: "message/image".to_string(),
-            seq: Some(dshtui::api::types::SessionSeq(1)),
+            seq: Some(dshtui::api::types::SessionSeq::new(1)),
             time: None,
             request_id: None,
             ignorable: None,
@@ -353,7 +353,7 @@ fn image_app(kitty: bool) -> AppState {
     }];
     app.focus = dshtui::app::Focus::Center;
     app.handle(dshtui::app::AppEvent::FollowSnapshot {
-        session_id: dshtui::api::types::SessionId("sess-1".into()),
+        session_id: dshtui::api::types::SessionId::new("sess-1".into()),
         cursor: None,
         records,
         has_more: false,
@@ -374,11 +374,11 @@ fn kitty_open_focused_image_enters_imageview_and_emits_fetch() {
     assert_eq!(app.image_view.phase, dshtui::model::ImageViewPhase::Loading);
     assert_eq!(
         app.image_view.block_seq,
-        Some(dshtui::api::types::SessionSeq(1))
+        Some(dshtui::api::types::SessionSeq::new(1))
     );
     assert!(app
         .image_loading
-        .contains(&dshtui::api::types::AttachmentId("att-1".into())));
+        .contains(&dshtui::api::types::AttachmentId::new("att-1".into())));
     match cmds.as_slice() {
         [dshtui::app::Cmd::FetchAttachment {
             session_id,
@@ -386,9 +386,9 @@ fn kitty_open_focused_image_enters_imageview_and_emits_fetch() {
             block_seq,
             for_viewer,
         }] => {
-            assert_eq!(session_id.0, "sess-1");
-            assert_eq!(attachment_id.0, "att-1");
-            assert_eq!(block_seq.0, 1);
+            assert_eq!(session_id.get(), "sess-1");
+            assert_eq!(attachment_id.get(), "att-1");
+            assert_eq!(block_seq.get(), 1);
             assert!(!for_viewer);
         }
         other => panic!("期望单条 FetchAttachment，得到 {other:?}"),
@@ -435,14 +435,14 @@ fn non_kitty_open_goes_directly_to_viewer_fetch_without_imageview() {
     let temp = app
         .image_cache
         .write_temp_file(
-            &dshtui::api::types::MediaType("image/png".into()),
+            &dshtui::api::types::MediaType::new("image/png".into()),
             vec![1, 2, 3],
         )
         .unwrap();
     let cmds = app.handle(dshtui::app::AppEvent::AttachmentReady {
-        session_id: dshtui::api::types::SessionId("sess-1".into()),
-        attachment_id: dshtui::api::types::AttachmentId("att-1".into()),
-        block_seq: dshtui::api::types::SessionSeq(1),
+        session_id: dshtui::api::types::SessionId::new("sess-1".into()),
+        attachment_id: dshtui::api::types::AttachmentId::new("att-1".into()),
+        block_seq: dshtui::api::types::SessionSeq::new(1),
         meta: dshtui::model::AttachmentRef::from(
             &dshtui::api::attachment::parse_response(&serde_json::json!({
                 "attachment": {
@@ -459,8 +459,8 @@ fn non_kitty_open_goes_directly_to_viewer_fetch_without_imageview() {
         ),
         frame: None,
         entry: dshtui::model::ImageCacheEntry {
-            attachment_id: dshtui::api::types::AttachmentId("att-1".into()),
-            media_type: dshtui::api::types::MediaType("image/png".into()),
+            attachment_id: dshtui::api::types::AttachmentId::new("att-1".into()),
+            media_type: dshtui::api::types::MediaType::new("image/png".into()),
             bytes: 3,
             width: 1,
             height: 1,
@@ -491,9 +491,9 @@ fn attachment_ready_renders_frame_and_marks_rendered_with_anchor() {
     )
     .unwrap();
     let cmds = app.handle(dshtui::app::AppEvent::AttachmentReady {
-        session_id: dshtui::api::types::SessionId("sess-1".into()),
-        attachment_id: dshtui::api::types::AttachmentId("att-1".into()),
-        block_seq: dshtui::api::types::SessionSeq(1),
+        session_id: dshtui::api::types::SessionId::new("sess-1".into()),
+        attachment_id: dshtui::api::types::AttachmentId::new("att-1".into()),
+        block_seq: dshtui::api::types::SessionSeq::new(1),
         meta: dshtui::model::AttachmentRef::from(
             &dshtui::api::attachment::parse_response(&serde_json::json!({
                 "attachment": {
@@ -510,15 +510,15 @@ fn attachment_ready_renders_frame_and_marks_rendered_with_anchor() {
         ),
         frame: Some(dshtui::app::KittyFrame(frame)),
         entry: dshtui::model::ImageCacheEntry {
-            attachment_id: dshtui::api::types::AttachmentId("att-1".into()),
-            media_type: dshtui::api::types::MediaType("image/png".into()),
+            attachment_id: dshtui::api::types::AttachmentId::new("att-1".into()),
+            media_type: dshtui::api::types::MediaType::new("image/png".into()),
             bytes: 8,
             width: 16,
             height: 16,
             temp_file: app
                 .image_cache
                 .write_temp_file(
-                    &dshtui::api::types::MediaType("image/png".into()),
+                    &dshtui::api::types::MediaType::new("image/png".into()),
                     vec![0; 8],
                 )
                 .unwrap(),
@@ -535,14 +535,14 @@ fn attachment_ready_renders_frame_and_marks_rendered_with_anchor() {
     assert!(app.image_frame.is_some(), "Kitty 帧应已挂载");
     assert_eq!(
         app.image_meta
-            .get(&dshtui::api::types::AttachmentId("att-1".into()))
+            .get(&dshtui::api::types::AttachmentId::new("att-1".into()))
             .and_then(|m| m.name.as_deref()),
         Some("fetched.png"),
         "元数据回填"
     );
     assert!(app
         .image_cache
-        .get(&dshtui::api::types::AttachmentId("att-1".into()))
+        .get(&dshtui::api::types::AttachmentId::new("att-1".into()))
         .is_some());
     app.cleanup_transient_files();
 }
@@ -553,9 +553,9 @@ fn stale_attachment_ready_is_discarded_no_cross_image() {
     let mut app = image_app(true);
     app.handle_command(Command::OpenFocused);
     let stale = app.handle(dshtui::app::AppEvent::AttachmentReady {
-        session_id: dshtui::api::types::SessionId("sess-1".into()),
-        attachment_id: dshtui::api::types::AttachmentId("att-1".into()),
-        block_seq: dshtui::api::types::SessionSeq(99),
+        session_id: dshtui::api::types::SessionId::new("sess-1".into()),
+        attachment_id: dshtui::api::types::AttachmentId::new("att-1".into()),
+        block_seq: dshtui::api::types::SessionSeq::new(99),
         meta: dshtui::model::AttachmentRef::from(
             &dshtui::api::attachment::parse_response(&serde_json::json!({
                 "attachment": {
@@ -568,14 +568,17 @@ fn stale_attachment_ready_is_discarded_no_cross_image() {
         ),
         frame: None,
         entry: dshtui::model::ImageCacheEntry {
-            attachment_id: dshtui::api::types::AttachmentId("att-1".into()),
-            media_type: dshtui::api::types::MediaType("image/png".into()),
+            attachment_id: dshtui::api::types::AttachmentId::new("att-1".into()),
+            media_type: dshtui::api::types::MediaType::new("image/png".into()),
             bytes: 1,
             width: 1,
             height: 1,
             temp_file: app
                 .image_cache
-                .write_temp_file(&dshtui::api::types::MediaType("image/png".into()), vec![1])
+                .write_temp_file(
+                    &dshtui::api::types::MediaType::new("image/png".into()),
+                    vec![1],
+                )
                 .unwrap(),
             last_used: 0,
         },
@@ -594,9 +597,9 @@ fn attachment_failed_permission_marks_error_without_reconnect() {
     let mut app = image_app(true);
     app.handle_command(Command::OpenFocused);
     let cmds = app.handle(dshtui::app::AppEvent::AttachmentFailed {
-        session_id: dshtui::api::types::SessionId("sess-1".into()),
-        attachment_id: dshtui::api::types::AttachmentId("att-1".into()),
-        block_seq: dshtui::api::types::SessionSeq(1),
+        session_id: dshtui::api::types::SessionId::new("sess-1".into()),
+        attachment_id: dshtui::api::types::AttachmentId::new("att-1".into()),
+        block_seq: dshtui::api::types::SessionSeq::new(1),
         code: "PERMISSION_DENIED".into(),
         message: "需审批".into(),
         retryable: false,
@@ -608,12 +611,12 @@ fn attachment_failed_permission_marks_error_without_reconnect() {
     assert_eq!(err.code, "PERMISSION_DENIED");
     assert!(app
         .image_errors
-        .get(&dshtui::api::types::AttachmentId("att-1".into()))
+        .get(&dshtui::api::types::AttachmentId::new("att-1".into()))
         .unwrap()
         .contains("PERMISSION_DENIED"));
     assert!(!app
         .image_loading
-        .contains(&dshtui::api::types::AttachmentId("att-1".into())));
+        .contains(&dshtui::api::types::AttachmentId::new("att-1".into())));
 }
 
 #[test]
@@ -622,9 +625,9 @@ fn attachment_failed_network_triggers_existing_reconnect() {
     let mut app = image_app(true);
     app.handle_command(Command::OpenFocused);
     let cmds = app.handle(dshtui::app::AppEvent::AttachmentFailed {
-        session_id: dshtui::api::types::SessionId("sess-1".into()),
-        attachment_id: dshtui::api::types::AttachmentId("att-1".into()),
-        block_seq: dshtui::api::types::SessionSeq(1),
+        session_id: dshtui::api::types::SessionId::new("sess-1".into()),
+        attachment_id: dshtui::api::types::AttachmentId::new("att-1".into()),
+        block_seq: dshtui::api::types::SessionSeq::new(1),
         code: "network".into(),
         message: "连接中断".into(),
         retryable: true,
@@ -655,15 +658,15 @@ fn cached_hit_rerenders_without_refetch_and_copy_uses_cached_path() {
     let temp = app
         .image_cache
         .write_temp_file(
-            &dshtui::api::types::MediaType("image/png".into()),
+            &dshtui::api::types::MediaType::new("image/png".into()),
             vec![1, 2, 3],
         )
         .unwrap();
     app.image_cache.complete(
-        &dshtui::api::types::AttachmentId("att-1".into()),
+        &dshtui::api::types::AttachmentId::new("att-1".into()),
         dshtui::model::ImageCacheEntry {
-            attachment_id: dshtui::api::types::AttachmentId("att-1".into()),
-            media_type: dshtui::api::types::MediaType("image/png".into()),
+            attachment_id: dshtui::api::types::AttachmentId::new("att-1".into()),
+            media_type: dshtui::api::types::MediaType::new("image/png".into()),
             bytes: 3,
             width: 1,
             height: 1,
@@ -678,16 +681,16 @@ fn cached_hit_rerenders_without_refetch_and_copy_uses_cached_path() {
             temp_file,
             ..
         }] => {
-            assert_eq!(attachment_id.0, "att-1");
+            assert_eq!(attachment_id.get(), "att-1");
             assert_eq!(temp_file, &temp);
         }
         other => panic!("缓存命中应走 RenderCachedImage，得到 {other:?}"),
     }
     // 渲染成功后 y 复制缓存文件路径。
     app.handle(dshtui::app::AppEvent::AttachmentReady {
-        session_id: dshtui::api::types::SessionId("sess-1".into()),
-        attachment_id: dshtui::api::types::AttachmentId("att-1".into()),
-        block_seq: dshtui::api::types::SessionSeq(1),
+        session_id: dshtui::api::types::SessionId::new("sess-1".into()),
+        attachment_id: dshtui::api::types::AttachmentId::new("att-1".into()),
+        block_seq: dshtui::api::types::SessionSeq::new(1),
         meta: dshtui::model::AttachmentRef::from(
             &dshtui::api::attachment::parse_response(&serde_json::json!({
                 "attachment": {
@@ -703,8 +706,8 @@ fn cached_hit_rerenders_without_refetch_and_copy_uses_cached_path() {
         ),
         frame: None,
         entry: dshtui::model::ImageCacheEntry {
-            attachment_id: dshtui::api::types::AttachmentId("att-1".into()),
-            media_type: dshtui::api::types::MediaType("image/png".into()),
+            attachment_id: dshtui::api::types::AttachmentId::new("att-1".into()),
+            media_type: dshtui::api::types::MediaType::new("image/png".into()),
             bytes: 3,
             width: 1,
             height: 1,
@@ -742,12 +745,15 @@ fn stale_non_kitty_result_does_not_launch_viewer() {
     assert!(app.pending_viewer.is_some(), "非 Kitty 已登记查看器目标");
     let stale_file = app
         .image_cache
-        .write_temp_file(&dshtui::api::types::MediaType("image/png".into()), vec![9])
+        .write_temp_file(
+            &dshtui::api::types::MediaType::new("image/png".into()),
+            vec![9],
+        )
         .unwrap();
     let cmds = app.handle(dshtui::app::AppEvent::AttachmentReady {
-        session_id: dshtui::api::types::SessionId("sess-1".into()),
-        attachment_id: dshtui::api::types::AttachmentId("att-1".into()),
-        block_seq: dshtui::api::types::SessionSeq(99),
+        session_id: dshtui::api::types::SessionId::new("sess-1".into()),
+        attachment_id: dshtui::api::types::AttachmentId::new("att-1".into()),
+        block_seq: dshtui::api::types::SessionSeq::new(99),
         meta: dshtui::model::AttachmentRef::from(
             &dshtui::api::attachment::parse_response(&serde_json::json!({
                 "attachment": {
@@ -760,8 +766,8 @@ fn stale_non_kitty_result_does_not_launch_viewer() {
         ),
         frame: None,
         entry: dshtui::model::ImageCacheEntry {
-            attachment_id: dshtui::api::types::AttachmentId("att-1".into()),
-            media_type: dshtui::api::types::MediaType("image/png".into()),
+            attachment_id: dshtui::api::types::AttachmentId::new("att-1".into()),
+            media_type: dshtui::api::types::MediaType::new("image/png".into()),
             bytes: 1,
             width: 1,
             height: 1,
@@ -786,9 +792,9 @@ fn stale_attachment_failure_does_not_reconnect_active_session() {
     let mut app = image_app(true);
     app.handle_command(Command::OpenFocused);
     let cmds = app.handle(dshtui::app::AppEvent::AttachmentFailed {
-        session_id: dshtui::api::types::SessionId("sess-1".into()),
-        attachment_id: dshtui::api::types::AttachmentId("att-1".into()),
-        block_seq: dshtui::api::types::SessionSeq(99),
+        session_id: dshtui::api::types::SessionId::new("sess-1".into()),
+        attachment_id: dshtui::api::types::AttachmentId::new("att-1".into()),
+        block_seq: dshtui::api::types::SessionSeq::new(99),
         code: "network".into(),
         message: "stale".into(),
         retryable: true,
@@ -922,13 +928,13 @@ fn normal_gg_still_works_after_g_prefix_extension() {
 fn traj_app() -> AppState {
     let mut app = AppState::new(200);
     app.conn = dshtui::app::ConnState::Ready;
-    let sid = SessionId("sess-traj".into());
+    let sid = SessionId::new("sess-traj".into());
     app.active_session = Some(sid.clone());
     let rec = |seq: u64, ty: &str, data: serde_json::Value| {
         dshtui::api::types::SessionHistoryRecord::Event {
             event: dshtui::api::types::SessionWireEvent {
                 event_type: ty.to_string(),
-                seq: Some(dshtui::api::types::SessionSeq(seq)),
+                seq: Some(dshtui::api::types::SessionSeq::new(seq)),
                 time: Some(seq as i64),
                 request_id: None,
                 ignorable: None,
@@ -1112,7 +1118,7 @@ fn trajectory_filter_input_highlight_and_enter_jump_ac005_05_13() {
     let window = app
         .active_session
         .as_ref()
-        .and_then(|sid| app.traj_sessions.get(&sid.0))
+        .and_then(|sid| app.traj_sessions.get(&sid.get()))
         .unwrap();
     let view = window.view(&app.traj.fold);
     let pos = view
@@ -1139,7 +1145,7 @@ fn trajectory_filter_jump_expands_collapsed_group_ac005_13() {
         let window = app
             .active_session
             .as_ref()
-            .and_then(|sid| app.traj_sessions.get(&sid.0))
+            .and_then(|sid| app.traj_sessions.get(&sid.get()))
             .unwrap();
         window
             .raw_rows()
@@ -1164,7 +1170,7 @@ fn trajectory_filter_jump_expands_collapsed_group_ac005_13() {
     let window = app
         .active_session
         .as_ref()
-        .and_then(|sid| app.traj_sessions.get(&sid.0))
+        .and_then(|sid| app.traj_sessions.get(&sid.get()))
         .unwrap();
     assert!(window
         .view(&app.traj.fold)
@@ -1210,7 +1216,7 @@ fn trajectory_page_permission_error_no_retry_ac005_09() {
     };
     // 权限错误（generation 匹配，非 stale）。
     let cmds = app.handle(AppEvent::PageError {
-        session_id: SessionId("sess-traj".into()),
+        session_id: SessionId::new("sess-traj".into()),
         generation: gen,
         error: dshtui::api::ClientError::Remote {
             code: "PERMISSION_DENIED".into(),
@@ -1246,19 +1252,19 @@ fn trajectory_reconnect_snapshot_no_dup_and_gap_fill_ac005_08() {
         let w = app
             .active_session
             .as_ref()
-            .and_then(|sid| app.traj_sessions.get(&sid.0))
+            .and_then(|sid| app.traj_sessions.get(&sid.get()))
             .unwrap();
-        w.raw_rows().map(|r| r.seq().0).collect()
+        w.raw_rows().map(|r| r.seq().get()).collect()
     };
     assert_eq!(seq_before.len(), 7);
     // 重连快照（模拟 unfixable gap 重建：同 seq 1..=7 重放）。
     app.handle(AppEvent::FollowSnapshot {
-        session_id: SessionId("sess-traj".into()),
+        session_id: SessionId::new("sess-traj".into()),
         cursor: None,
         records: vec![dshtui::api::types::SessionHistoryRecord::Event {
             event: dshtui::api::types::SessionWireEvent {
                 event_type: "turn/start".into(),
-                seq: Some(dshtui::api::types::SessionSeq(1)),
+                seq: Some(dshtui::api::types::SessionSeq::new(1)),
                 time: Some(1),
                 request_id: None,
                 ignorable: None,
@@ -1274,10 +1280,10 @@ fn trajectory_reconnect_snapshot_no_dup_and_gap_fill_ac005_08() {
     let w = app
         .active_session
         .as_ref()
-        .and_then(|sid| app.traj_sessions.get(&sid.0))
+        .and_then(|sid| app.traj_sessions.get(&sid.get()))
         .unwrap();
     assert_eq!(w.len(), 1, "重建只含快照行");
-    let sid = SessionId("sess-traj".into());
+    let sid = SessionId::new("sess-traj".into());
     for s in 2..=7 {
         let data = match s {
             2 => serde_json::json!({"turn":1,"step":1}),
@@ -1299,7 +1305,7 @@ fn trajectory_reconnect_snapshot_no_dup_and_gap_fill_ac005_08() {
         };
         let e = dshtui::api::types::SessionWireEvent {
             event_type: ty.into(),
-            seq: Some(dshtui::api::types::SessionSeq(s)),
+            seq: Some(dshtui::api::types::SessionSeq::new(s)),
             time: Some(s as i64),
             request_id: None,
             ignorable: None,
@@ -1315,9 +1321,9 @@ fn trajectory_reconnect_snapshot_no_dup_and_gap_fill_ac005_08() {
     let w = app
         .active_session
         .as_ref()
-        .and_then(|sid| app.traj_sessions.get(&sid.0))
+        .and_then(|sid| app.traj_sessions.get(&sid.get()))
         .unwrap();
-    let seqs: Vec<u64> = w.raw_rows().map(|r| r.seq().0).collect();
+    let seqs: Vec<u64> = w.raw_rows().map(|r| r.seq().get()).collect();
     assert_eq!(seqs, (1..=7).collect::<Vec<_>>(), "缺口补齐、无重复无空洞");
 }
 
@@ -1349,7 +1355,7 @@ fn trajectory_open_detail_refreshes_on_cursor_move_ac005_03() {
         dshtui::model::TrajKind::ToolResult,
         "详情随新选中行重建"
     );
-    assert_eq!(detail.source_seq, dshtui::api::types::SessionSeq(5));
+    assert_eq!(detail.source_seq, dshtui::api::types::SessionSeq::new(5));
     // 移到不可详查行（step/end idx 5）→ 详情关闭回列表。
     app.handle_command(Command::MoveDown);
     assert!(!app.traj.detail_open, "不可详查行关闭详情");
@@ -1366,12 +1372,12 @@ fn trajectory_search_index_updates_on_stream_append_ac005_05() {
     app.handle_command(Command::PickerInput("done".to_string()));
     assert_eq!(app.traj_search_index.query("done").len(), 1, "既有命中");
     // 流式 append：新 tool/result（message 含 "done"）。
-    let sid = SessionId("sess-traj".into());
+    let sid = SessionId::new("sess-traj".into());
     app.handle(AppEvent::FollowEvent {
         session_id: sid.clone(),
         event: dshtui::api::types::SessionWireEvent {
             event_type: "tool/result".into(),
-            seq: Some(dshtui::api::types::SessionSeq(8)),
+            seq: Some(dshtui::api::types::SessionSeq::new(8)),
             time: Some(8),
             request_id: None,
             ignorable: None,
@@ -1596,7 +1602,7 @@ fn srec(seq: u64) -> dshtui::api::types::SessionHistoryRecord {
     dshtui::api::types::SessionHistoryRecord::Event {
         event: dshtui::api::types::SessionWireEvent {
             event_type: "user/message".into(),
-            seq: Some(dshtui::api::types::SessionSeq(seq)),
+            seq: Some(dshtui::api::types::SessionSeq::new(seq)),
             time: None,
             request_id: None,
             ignorable: None,
@@ -1614,7 +1620,7 @@ fn sidebar_app() -> AppState {
     app.mode = Mode::Normal;
     app.focus = dshtui::app::Focus::Sidebar;
     let meta = |id: &str, updated: i64, ws: Option<&str>| SessionMeta {
-        id: SessionId(id.into()),
+        id: SessionId::new(id.into()),
         title: Some(format!("S-{id}")),
         cwd: None,
         updated_at_ms: updated,
@@ -1622,7 +1628,7 @@ fn sidebar_app() -> AppState {
         blank: false,
         origin: None,
         parent_id: None,
-        workspace: ws.map(|w| WorkspaceId(w.into())),
+        workspace: ws.map(|w| WorkspaceId::new(w.into())),
         last_turn_preview: None,
     };
     app.workspaces.upsert_session(meta("s1", 300, None));
@@ -1636,7 +1642,7 @@ fn sidebar_focus_jk_moves_cursor_without_chat_scroll_ac006_03() {
     let mut app = sidebar_app();
     app.focus = dshtui::app::Focus::Sidebar;
     // 给 Center 一个窗口：j/k 若误触发 Chat 滚动会改变 viewport。
-    app.active_session = Some(SessionId("s1".into()));
+    app.active_session = Some(SessionId::new("s1".into()));
     app.sessions
         .touch("s1", 20)
         .apply(dshtui::model::Incoming::Snapshot {
@@ -1663,7 +1669,7 @@ fn center_focus_jk_still_scrolls_chat_ac006_03_regression() {
     // 回归：Center/Details 焦点下 j/k 仍滚动 Chat（既有语义）。
     let mut app = sidebar_app();
     app.focus = dshtui::app::Focus::Center;
-    app.active_session = Some(SessionId("s1".into()));
+    app.active_session = Some(SessionId::new("s1".into()));
     app.sessions
         .touch("s1", 20)
         .apply(dshtui::model::Incoming::Snapshot {
@@ -1683,13 +1689,13 @@ fn center_focus_jk_still_scrolls_chat_ac006_03_regression() {
 #[test]
 fn sidebar_enter_opens_cursor_session_row_ac006_02() {
     let mut app = sidebar_app();
-    app.active_session = Some(SessionId("s1".into()));
+    app.active_session = Some(SessionId::new("s1".into()));
     // 光标移到 s3 → Enter 打开 s3。
     app.sidebar.cursor = 2;
     app.handle_command(Command::OpenFocused);
     assert_eq!(
         app.active_session,
-        Some(SessionId("s3".into())),
+        Some(SessionId::new("s3".into())),
         "Enter 打开光标行会话"
     );
 }
@@ -1701,10 +1707,10 @@ fn sidebar_enter_on_workspace_header_toggles_collapse_ac006_03() {
     app.mode = Mode::Normal;
     app.focus = dshtui::app::Focus::Sidebar;
     app.workspaces
-        .upsert_workspace(WorkspaceId("ws1".into()), Some("项目A".into()));
+        .upsert_workspace(WorkspaceId::new("ws1".into()), Some("项目A".into()));
     app.workspaces
         .upsert_session(dshtui::api::types::SessionMeta {
-            id: SessionId("s1".into()),
+            id: SessionId::new("s1".into()),
             title: Some("S-s1".into()),
             cwd: None,
             updated_at_ms: 1,
@@ -1712,22 +1718,26 @@ fn sidebar_enter_on_workspace_header_toggles_collapse_ac006_03() {
             blank: false,
             origin: None,
             parent_id: None,
-            workspace: Some(WorkspaceId("ws1".into())),
+            workspace: Some(WorkspaceId::new("ws1".into())),
             last_turn_preview: None,
         });
-    app.workspaces
-        .attach_session_to_workspace(&WorkspaceId("ws1".into()), &SessionId("s1".into()));
+    app.workspaces.attach_session_to_workspace(
+        &WorkspaceId::new("ws1".into()),
+        &SessionId::new("s1".into()),
+    );
     // 光标在第 0 行 = workspace header。
     app.sidebar.cursor = 0;
     app.handle_command(Command::OpenFocused);
     assert!(
-        app.sidebar_view.is_collapsed(&WorkspaceId("ws1".into())),
+        app.sidebar_view
+            .is_collapsed(&WorkspaceId::new("ws1".into())),
         "Enter 折叠 workspace header"
     );
     assert_eq!(app.sidebar.cursor, 0);
     app.handle_command(Command::OpenFocused);
     assert!(
-        !app.sidebar_view.is_collapsed(&WorkspaceId("ws1".into())),
+        !app.sidebar_view
+            .is_collapsed(&WorkspaceId::new("ws1".into())),
         "再次 Enter 展开"
     );
 }
@@ -1753,15 +1763,23 @@ fn h_l_collapse_expand_all_workspaces_ac006_03() {
     use dshtui::api::types::WorkspaceId;
     let mut app = AppState::new(20);
     app.workspaces
-        .upsert_workspace(WorkspaceId("w1".into()), Some("A".into()));
+        .upsert_workspace(WorkspaceId::new("w1".into()), Some("A".into()));
     app.workspaces
-        .upsert_workspace(WorkspaceId("w2".into()), Some("B".into()));
+        .upsert_workspace(WorkspaceId::new("w2".into()), Some("B".into()));
     app.handle_command(Command::CollapseProject); // h
-    assert!(app.sidebar_view.is_collapsed(&WorkspaceId("w1".into())));
-    assert!(app.sidebar_view.is_collapsed(&WorkspaceId("w2".into())));
+    assert!(app
+        .sidebar_view
+        .is_collapsed(&WorkspaceId::new("w1".into())));
+    assert!(app
+        .sidebar_view
+        .is_collapsed(&WorkspaceId::new("w2".into())));
     app.handle_command(Command::ExpandProject); // l
-    assert!(!app.sidebar_view.is_collapsed(&WorkspaceId("w1".into())));
-    assert!(!app.sidebar_view.is_collapsed(&WorkspaceId("w2".into())));
+    assert!(!app
+        .sidebar_view
+        .is_collapsed(&WorkspaceId::new("w1".into())));
+    assert!(!app
+        .sidebar_view
+        .is_collapsed(&WorkspaceId::new("w2".into())));
 }
 
 #[test]
@@ -1847,7 +1865,7 @@ fn insert_tab_opens_palette_with_slash_prefix_and_esc_returns_composer_ac006_04(
     use dshtui::api::types::SessionId;
     // 打开 composer（有活动会话 + 草稿 `/pl`）。
     let mut app = AppState::default();
-    app.handle_command(Command::OpenSession(SessionId("s1".into())));
+    app.handle_command(Command::OpenSession(SessionId::new("s1".into())));
     app.handle_command(Command::InsertMode);
     assert_eq!(app.mode, Mode::Insert);
     assert!(app.composer.visible);

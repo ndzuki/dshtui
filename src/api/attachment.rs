@@ -73,8 +73,8 @@ pub fn parse_response(value: &Value) -> Result<AttachmentData, ClientError> {
         ClientError::Protocol(format!("session/attachment data base64 解码失败: {e}"))
     })?;
     Ok(AttachmentData {
-        attachment_id: AttachmentId(wire.attachment_id),
-        media_type: MediaType(wire.media_type),
+        attachment_id: AttachmentId::new(wire.attachment_id),
+        media_type: MediaType::new(wire.media_type),
         bytes: wire.bytes,
         width: wire.width,
         height: wire.height,
@@ -92,9 +92,14 @@ pub async fn fetch(
     session_id: &SessionId,
     attachment_id: &AttachmentId,
 ) -> Result<AttachmentData, ClientError> {
+    // wire 校正（0.1.2-rc.1 实读）：`session/attachment` 单 request 形参，
+    // sessionId/attachmentId 嵌套在 args.request 内
+    // （SessionAttachmentRequest{sessionId,attachmentId}）。
     let args = serde_json::json!({
-        "sessionId": session_id.0,
-        "attachmentId": attachment_id.0,
+        "request": {
+            "sessionId": session_id.get(),
+            "attachmentId": attachment_id.get(),
+        }
     });
     let value = unary(http, base, "session/attachment", args).await?;
     parse_response(&value)
@@ -120,8 +125,8 @@ mod tests {
             "data": "AQIDBA=="
         });
         let parsed = parse_response(&value).unwrap();
-        assert_eq!(parsed.attachment_id.0, "att-1");
-        assert_eq!(parsed.media_type.0, "image/png");
+        assert_eq!(parsed.attachment_id.get(), "att-1");
+        assert_eq!(parsed.media_type.get(), "image/png");
         assert_eq!(parsed.bytes, 4);
         assert_eq!(parsed.width, 10);
         assert_eq!(parsed.name.as_deref(), Some("a.png"));
@@ -136,7 +141,7 @@ mod tests {
             "futureField": {"anything": true}
         });
         let parsed = parse_response(&value).unwrap();
-        assert_eq!(parsed.attachment_id.0, "att-2");
+        assert_eq!(parsed.attachment_id.get(), "att-2");
         assert!(parsed.name.is_none());
         assert!(parsed.original_dimensions.is_none());
         assert!(parsed.image_bytes.is_empty());

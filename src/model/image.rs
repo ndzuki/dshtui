@@ -43,7 +43,7 @@ pub fn image_block_of(block: &Block) -> Option<ImageBlockRef> {
             seq: *seq,
             attachment_id: attachment_id
                 .as_deref()
-                .map(|id| AttachmentId(id.to_string())),
+                .map(|id| AttachmentId::new(id.to_string())),
             name: name.clone(),
             dims: dims.clone(),
         }),
@@ -222,7 +222,7 @@ fn image_run_locate(
         }
         if let Some(att) = attachment_id {
             return crate::model::image::image_block_of(b)
-                .and_then(|r| r.attachment_id.map(|a| a.0))
+                .and_then(|r| r.attachment_id.map(|a| a.get()))
                 .is_some_and(|a| a == att);
         }
         if let Some(s) = seq {
@@ -381,7 +381,7 @@ mod tests {
         use crate::api::types::{ChunkData, ChunkRow, SessionSeq as Seq};
         use crate::model::PackedChunks;
         let img = |seq: u64| Block::Image {
-            seq: Seq(seq),
+            seq: Seq::new(seq),
             attachment_id: Some(format!("a{seq}")),
             name: None,
             dims: None,
@@ -390,7 +390,7 @@ mod tests {
             img(1),
             img(2),
             Block::UserMessage {
-                seq: Seq(3),
+                seq: Seq::new(3),
                 content: "之间".into(),
                 time: None,
             },
@@ -399,15 +399,15 @@ mod tests {
             img(6),
         ];
         // seq=1 组: (start0,total2,idx0)
-        assert_eq!(image_run_of(&blocks, Seq(1)), Some((0, 2, 0)));
+        assert_eq!(image_run_of(&blocks, Seq::new(1)), Some((0, 2, 0)));
         // seq=2 → (0,2,1)
-        assert_eq!(image_run_of(&blocks, Seq(2)), Some((0, 2, 1)));
+        assert_eq!(image_run_of(&blocks, Seq::new(2)), Some((0, 2, 1)));
         // seq=5 → 组在 idx3..6 (start3,total3,idx1)
-        assert_eq!(image_run_of(&blocks, Seq(5)), Some((3, 3, 1)));
+        assert_eq!(image_run_of(&blocks, Seq::new(5)), Some((3, 3, 1)));
         // 非图片 seq 不命中
-        assert_eq!(image_run_of(&blocks, Seq(3)), None);
+        assert_eq!(image_run_of(&blocks, Seq::new(3)), None);
         // 越界/缺失 seq → None
-        assert_eq!(image_run_of(&blocks, Seq(99)), None);
+        assert_eq!(image_run_of(&blocks, Seq::new(99)), None);
         let _ = PackedChunks::default();
         let _ = ChunkData::default();
         let _ = ChunkRow::Unknown {
@@ -422,14 +422,14 @@ mod tests {
         // 官方多图消息 = 一个 host 事件 seq=7 携带两张图（REQ-004 AC-004-01：
         // 逐 image 引用产出独立 Image 块、共享 host seq）。
         let img = |att: &str| Block::Image {
-            seq: Seq(7),
+            seq: Seq::new(7),
             attachment_id: Some(att.to_string()),
             name: None,
             dims: None,
         };
         let blocks = vec![
             Block::UserMessage {
-                seq: Seq(7),
+                seq: Seq::new(7),
                 content: "图：".into(),
                 time: None,
             },
@@ -438,7 +438,7 @@ mod tests {
             img("a3"),
         ];
         // seq 定位只能落到组内第一块（同 seq 无法区分）。
-        assert_eq!(image_run_of(&blocks, Seq(7)), Some((1, 3, 0)));
+        assert_eq!(image_run_of(&blocks, Seq::new(7)), Some((1, 3, 0)));
         // attachment 定位到各自正确下标（AC-007-30 pager 锚点）。
         assert_eq!(image_run_by_attachment(&blocks, "a1"), Some((1, 3, 0)));
         assert_eq!(image_run_by_attachment(&blocks, "a2"), Some((1, 3, 1)));
@@ -494,7 +494,12 @@ mod tests {
         assert_eq!(v.zoom, 1.0);
         // 打开新图：zoom 复位整图 fit（不继承上一张）。
         v.zoom_in();
-        v.open_view(SessionSeq(7), AttachmentId("a1".into()), None, None);
+        v.open_view(
+            SessionSeq::new(7),
+            AttachmentId::new("a1".into()),
+            None,
+            None,
+        );
         assert_eq!(v.zoom, 1.0, "open_view 复位 zoom");
         v.close();
         assert_eq!(v.zoom, 1.0);
@@ -503,7 +508,7 @@ mod tests {
     #[test]
     fn image_block_of_none_for_non_image_blocks() {
         let block = Block::Unknown {
-            seq: SessionSeq(1),
+            seq: SessionSeq::new(1),
             event_type: "weird/thing".into(),
             raw: serde_json::Value::Null,
         };

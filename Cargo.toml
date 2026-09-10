@@ -1,10 +1,10 @@
 [package]
 name = "dshtui"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
-description = "dshtui — 官方 dsh web Remote API 的 Rust TUI 客户端（V0.1 核心底座）"
+description = "官方 dsh web Remote API 的 Rust TUI 客户端（V1：性能门禁 / 官方升级兼容 / 发布）"
 license = "MIT"
-repository = ""
+repository = "https://github.com/ndzuki/dshtui"
 rust-version = "1.80"
 
 # 依赖清单对齐 Notes/02-architecture.md §5（ratatui/crossterm/tokio/reqwest/
@@ -52,3 +52,33 @@ flate2 = "1"
 
 [profile.release]
 opt-level = 2
+
+# ============================================================================
+# cargo-dist 发布配置（REQ-008 Step 7 交付 / AC-008-18 发布自动化；
+# 依据 Notes/09 P04/P06 与 cargo-dist 0.32.0 现行约定，经真实 cargo-dist 0.32.0
+# 在临时 worktree 中 `dist generate` 验证，键名/作用域均实测可解析）。
+#
+# 作用域说明（cargo-dist 0.32 实测）：
+#   - 全局键（cargo-dist-version / ci）只接受放在 [workspace.metadata.dist]
+#     （放 [package.metadata.dist] 会被 WARN 忽略并报 "please run dist init"）；
+#   - package-local 键（installers / targets）放 [package.metadata.dist] 即可，
+#     由 `dist plan` 读入并驱动 release.yml 的 build matrix / 产物集合。
+#
+# 取值决策：
+#   - cargo-dist-version = "0.32.0"：2026-05 发布的最新稳定版（v1.0.0-rc 未计）；
+#   - ci = "github"：仅生成 GitHub Actions 发布编排；
+#   - installers = []：V1 暂不生成平台 installer（curl-sh/npm/msi 等）——
+#     只发布 tarball 归档 + .sha256 校验和 + source tarball；后续要 installer
+#     时在装有 cargo-dist 的机器上 `cargo dist init` 增选即可（docs/install.md
+#     提到的 installer 命名以后续 cargo-dist 配置为准）；
+#   - targets 仅 x86_64-unknown-linux-gnu：V1 预编译二进制只覆盖与 CI
+#     ubuntu runner 一致的环境；扩平台同样由 `cargo dist init` 完成。
+# 最终权威形态以 `cargo dist init` 生成/迁移结果为准（本段为 Step 7 手工书写）。
+# ============================================================================
+[workspace.metadata.dist]
+cargo-dist-version = "0.32.0"
+ci = "github"
+
+[package.metadata.dist]
+installers = []
+targets = ["x86_64-unknown-linux-gnu"]

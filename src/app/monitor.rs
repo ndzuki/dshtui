@@ -412,7 +412,7 @@ impl MonitorAppState {
                             n.cheer_until_ms = self.now_ms + 900.0; // HTML cheer 900ms 复位
                             self.toast(format!(
                                 "💗 已给 {} 加油！",
-                                crate::model::short_session(&sid.0)
+                                crate::model::short_session(&sid.get())
                             ));
                         }
                     }
@@ -1010,23 +1010,23 @@ mod tests {
     fn vim_navigation_and_detail_are_idempotent() {
         let mut app = app_with_two();
         // roster 按 stageKey 排序：idle（session-b）在前。
-        assert_eq!(app.focused_entry().unwrap().session_id.0, "session-b");
+        assert_eq!(app.focused_entry().unwrap().session_id.get(), "session-b");
         app.handle_command(Command::MoveDown);
-        assert_eq!(app.focused_entry().unwrap().session_id.0, "session-a");
+        assert_eq!(app.focused_entry().unwrap().session_id.get(), "session-a");
         app.handle_command(Command::MoveDown); // 越界 clamp
-        assert_eq!(app.focused_entry().unwrap().session_id.0, "session-a");
+        assert_eq!(app.focused_entry().unwrap().session_id.get(), "session-a");
         app.handle_command(Command::GotoTop);
         assert_eq!(app.focus, 0);
-        assert_eq!(app.focused_entry().unwrap().session_id.0, "session-b");
+        assert_eq!(app.focused_entry().unwrap().session_id.get(), "session-b");
         app.handle_command(Command::GotoBottom);
         assert_eq!(app.focus, 1);
 
         // Enter 开详情；重复 Enter 幂等（不叠加 pane，AC-009-04）。
         app.handle_command(Command::OpenFocused);
         assert_eq!(app.mode, MonitorMode::Detail);
-        assert_eq!(app.detail.as_ref().unwrap().0, "session-a");
+        assert_eq!(app.detail.as_ref().unwrap().get(), "session-a");
         app.handle_command(Command::OpenFocused);
-        assert_eq!(app.detail.as_ref().unwrap().0, "session-a");
+        assert_eq!(app.detail.as_ref().unwrap().get(), "session-a");
 
         // Esc 关闭详情回 Town。
         app.handle_command(Command::ClosePicker);
@@ -1043,12 +1043,12 @@ mod tests {
         let hit = app
             .hit_npc((cx.round() as u16, cy.round() as u16))
             .expect("广场出生点应命中");
-        assert_eq!(hit.sid.0, "session-a");
+        assert_eq!(hit.sid.get(), "session-a");
         app.open_detail(Some(hit.sid.clone()));
-        assert_eq!(app.detail.as_ref().unwrap().0, "session-a");
+        assert_eq!(app.detail.as_ref().unwrap().get(), "session-a");
         // 同 NPC 重复点击幂等。
         app.open_detail(Some(hit.sid));
-        assert_eq!(app.detail.as_ref().unwrap().0, "session-a");
+        assert_eq!(app.detail.as_ref().unwrap().get(), "session-a");
         // 远离 NPC 的点击不命中（容差 24px）。
         assert!(app.hit_npc((20, 20)).is_none());
     }
@@ -1060,7 +1060,7 @@ mod tests {
         assert_eq!(app.mode, MonitorMode::Chat);
         // 焦点 = stageKey 排序首位（idle → session-b）。
         let sid = app.chat.target.clone().unwrap();
-        assert_eq!(sid.0, "session-b");
+        assert_eq!(sid.get(), "session-b");
         assert!(app.chat.session_id.is_none());
 
         // 输入消息 + 提交 → busy + SendChat（首条带 kbQuery/project）。
@@ -1172,14 +1172,14 @@ mod tests {
         assert_eq!(app.mode, MonitorMode::Filter);
         app.handle_command(Command::PickerInput("implementing".into()));
         assert_eq!(app.filtered_roster().len(), 1);
-        assert_eq!(app.filtered_roster()[0].session_id.0, "session-a");
+        assert_eq!(app.filtered_roster()[0].session_id.get(), "session-a");
         // status 过滤（idle）——重新开过滤输入。
         app.handle_command(Command::ClosePicker);
         app.handle_command(Command::StartSearch);
         app.handle_command(Command::PickerInput("idle".into()));
         let hits = app.filtered_roster();
         assert_eq!(hits.len(), 1, "idle 过滤只命中 session-b");
-        assert!(hits.iter().any(|e| e.session_id.0 == "session-b"));
+        assert!(hits.iter().any(|e| e.session_id.get() == "session-b"));
         // Esc 退出过滤。
         app.handle_command(Command::ClosePicker);
         assert_eq!(app.mode, MonitorMode::Town);
@@ -1331,12 +1331,12 @@ mod review_fix_tests {
     fn open_chat_with_explicit_sid_supports_click_entry() {
         // AC-009-06 双入口：`c`（焦点）与点击 💬（指定 sid）走同一 open_chat。
         let mut app = app_with_n(2);
-        app.open_chat(Some(crate::api::types::SessionId("session-1".into())));
+        app.open_chat(Some(crate::api::types::SessionId::new("session-1".into())));
         assert_eq!(app.mode, MonitorMode::Chat);
-        assert_eq!(app.chat.target.as_ref().unwrap().0, "session-1");
+        assert_eq!(app.chat.target.as_ref().unwrap().get(), "session-1");
         // 换目标：会话重置（新会话）。
-        app.open_chat(Some(crate::api::types::SessionId("session-0".into())));
-        assert_eq!(app.chat.target.as_ref().unwrap().0, "session-0");
+        app.open_chat(Some(crate::api::types::SessionId::new("session-0".into())));
+        assert_eq!(app.chat.target.as_ref().unwrap().get(), "session-0");
         assert!(app.chat.messages.is_empty());
     }
 }

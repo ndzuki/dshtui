@@ -21,11 +21,13 @@ pub async fn list(
     base: &str,
     session_id: &str,
 ) -> Result<SkillListValue, ClientError> {
+    // wire 校正（0.1.2-rc.1 实读）：`skills/list` 单 request 形参，sessionId
+    // 嵌套在 args.request 内（SkillListRequest{sessionId}）。
     let value = unary(
         http,
         base,
         "skills/list",
-        serde_json::json!({ "sessionId": session_id }),
+        serde_json::json!({ "request": { "sessionId": session_id } }),
     )
     .await?;
     serde_json::from_value(value)

@@ -297,7 +297,7 @@ fn block_lines(
                 ));
             }
             spans.push(Span::styled(
-                format!("U {:>5} ", seq.0),
+                format!("U {:>5} ", seq.get()),
                 Style::default()
                     .fg(palette.color(Role::UserFg))
                     .add_modifier(Modifier::BOLD),
@@ -320,7 +320,7 @@ fn block_lines(
                 ));
             }
             spans.push(Span::styled(
-                format!("A {:>5} ", seq.0),
+                format!("A {:>5} ", seq.get()),
                 Style::default()
                     .fg(palette.color(Role::AssistantFg))
                     .add_modifier(Modifier::BOLD),
@@ -364,7 +364,7 @@ fn block_lines(
         } => {
             push_time(&mut spans, *time);
             spans.push(Span::styled(
-                format!("T {:>5} ", seq.0),
+                format!("T {:>5} ", seq.get()),
                 Style::default()
                     .fg(palette.color(Role::ToolFg))
                     .add_modifier(Modifier::BOLD),
@@ -388,7 +388,7 @@ fn block_lines(
         } => {
             push_time(&mut spans, *time);
             spans.push(Span::styled(
-                format!("{} {:>5} ", if *is_error { "!" } else { "R" }, seq.0),
+                format!("{} {:>5} ", if *is_error { "!" } else { "R" }, seq.get()),
                 Style::default()
                     .fg(if *is_error {
                         palette.color(Role::Error)
@@ -402,7 +402,7 @@ fn block_lines(
         }
         Block::RequestHeader { seq, summary } => {
             spans.push(Span::styled(
-                format!("H {:>5} ", seq.0),
+                format!("H {:>5} ", seq.get()),
                 Style::default()
                     .fg(Color::Blue)
                     .add_modifier(Modifier::BOLD),
@@ -412,7 +412,7 @@ fn block_lines(
         }
         Block::Compaction { seq, summary } => {
             spans.push(Span::styled(
-                format!("C {:>5} ", seq.0),
+                format!("C {:>5} ", seq.get()),
                 Style::default()
                     .fg(Color::LightBlue)
                     .add_modifier(Modifier::BOLD),
@@ -427,7 +427,7 @@ fn block_lines(
             dims,
         } => {
             spans.push(Span::styled(
-                format!("I {:>5} ", seq.0),
+                format!("I {:>5} ", seq.get()),
                 Style::default()
                     .fg(Color::LightMagenta)
                     .add_modifier(Modifier::BOLD),
@@ -436,10 +436,10 @@ fn block_lines(
             // 回填刷新标注（占位位置不变）；失败 → 错误占位 + 可读提示。
             let meta = attachment_id
                 .as_deref()
-                .and_then(|id| image_meta.get(&AttachmentId(id.to_string())));
+                .and_then(|id| image_meta.get(&AttachmentId::new(id.to_string())));
             let error = attachment_id
                 .as_deref()
-                .and_then(|id| image_errors.get(&AttachmentId(id.to_string())));
+                .and_then(|id| image_errors.get(&AttachmentId::new(id.to_string())));
             let display_name = meta
                 .and_then(|m| m.name.as_deref())
                 .or(name.as_deref())
@@ -478,7 +478,7 @@ fn block_lines(
             seq, event_type, ..
         } => {
             spans.push(Span::styled(
-                format!("? {:>5} ", seq.0),
+                format!("? {:>5} ", seq.get()),
                 Style::default()
                     .fg(Color::DarkGray)
                     .add_modifier(Modifier::BOLD),
@@ -524,7 +524,7 @@ mod tests {
         SessionHistoryRecord::Event {
             event: SessionWireEvent {
                 event_type: event_type.into(),
-                seq: Some(SessionSeq(seq)),
+                seq: Some(SessionSeq::new(seq)),
                 time,
                 request_id: None,
                 ignorable: None,
@@ -544,7 +544,7 @@ mod tests {
         SessionHistoryRecord::Event {
             event: SessionWireEvent {
                 event_type: event_type.into(),
-                seq: Some(SessionSeq(seq)),
+                seq: Some(SessionSeq::new(seq)),
                 time,
                 request_id: None,
                 ignorable: None,
@@ -667,7 +667,7 @@ mod tests {
         )));
         window.apply(Incoming::FollowEvent(SessionWireEvent {
             event_type: "user/message".into(),
-            seq: Some(SessionSeq(4)),
+            seq: Some(SessionSeq::new(4)),
             time: None,
             request_id: None,
             ignorable: None,
@@ -711,10 +711,10 @@ mod tests {
             has_more: false,
             projections: None,
         });
-        window.echo(SessionRequestId("req-echo".into()), "optimistic-msg");
-        window.echo(SessionRequestId("req-fail".into()), "failed-msg");
+        window.echo(SessionRequestId::new("req-echo".into()), "optimistic-msg");
+        window.echo(SessionRequestId::new("req-fail".into()), "failed-msg");
         window.fail_echo(
-            &SessionRequestId("req-fail".into()),
+            &SessionRequestId::new("req-fail".into()),
             "gateway/bad-request",
             "非法请求",
         );
@@ -751,7 +751,7 @@ mod tests {
         // durable 同 requestId 到达 → 对账 retire，内容只来自 durable 一条。
         window.apply(Incoming::FollowEvent(SessionWireEvent {
             event_type: "user/message".into(),
-            seq: Some(SessionSeq(9)),
+            seq: Some(SessionSeq::new(9)),
             time: None,
             request_id: Some("req-echo".into()),
             ignorable: None,

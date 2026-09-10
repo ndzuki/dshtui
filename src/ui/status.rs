@@ -447,7 +447,7 @@ mod tests {
     #[test]
     fn status_reads_projection_values_without_inventing_totals() {
         let mut app = AppState::default();
-        app.active_session = Some(SessionId("s1".into()));
+        app.active_session = Some(SessionId::new("s1".into()));
         app.conn = ConnState::Ready;
         app.sessions.touch("s1", 20).apply(Incoming::Snapshot {
             cursor: None,
@@ -487,10 +487,10 @@ mod tests {
     #[test]
     fn status_falls_back_to_session_meta_when_projections_missing() {
         let mut app = AppState::default();
-        app.active_session = Some(SessionId("s1".into()));
+        app.active_session = Some(SessionId::new("s1".into()));
         app.conn = ConnState::Ready;
         app.workspaces.upsert_session(SessionMeta {
-            id: SessionId("s1".into()),
+            id: SessionId::new("s1".into()),
             title: Some("Meta title".into()),
             cwd: Some("/meta/cwd".into()),
             updated_at_ms: 1,
@@ -527,7 +527,7 @@ mod tests {
         // AC-006-08/D-033：selectModel 后官方 modelSelection.next ≠ lastUsed
         // → 状态条显示 `last → next`（next=下一次 prompt 实际模型）。
         let mut app = AppState::default();
-        app.active_session = Some(SessionId("s1".into()));
+        app.active_session = Some(SessionId::new("s1".into()));
         app.conn = ConnState::Ready;
         app.sessions.touch("s1", 20).apply(Incoming::Snapshot {
             cursor: None,
@@ -554,7 +554,7 @@ mod tests {
         );
         // 相同（无切换）→ 只显示当前一个。
         let mut app2 = AppState::default();
-        app2.active_session = Some(SessionId("s1".into()));
+        app2.active_session = Some(SessionId::new("s1".into()));
         app2.conn = ConnState::Ready;
         app2.sessions.touch("s1", 20).apply(Incoming::Snapshot {
             cursor: None,
@@ -630,11 +630,11 @@ mod tests {
     #[test]
     fn insert_mode_and_local_stopping_render_in_status_ac002_05() {
         let mut app = AppState::default();
-        app.active_session = Some(SessionId("s1".into()));
+        app.active_session = Some(SessionId::new("s1".into()));
         app.conn = ConnState::Ready;
         app.mode = crate::app::Mode::Insert;
         app.stop = crate::app::StopState {
-            requested_session: Some(SessionId("s1".into())),
+            requested_session: Some(SessionId::new("s1".into())),
         };
         // 官方投影仍 running：本地「停止中」转场。
         app.sessions.touch("s1", 20).apply(Incoming::Snapshot {
@@ -685,7 +685,7 @@ mod tests {
     #[test]
     fn stop_hint_only_when_official_projection_running() {
         let mut app = AppState::default();
-        app.active_session = Some(SessionId("s1".into()));
+        app.active_session = Some(SessionId::new("s1".into()));
         app.conn = ConnState::Ready;
         app.sessions.touch("s1", 20).apply(Incoming::Snapshot {
             cursor: None,
@@ -723,9 +723,9 @@ mod tests {
     #[test]
     fn plan_chip_shows_when_projection_active_ac007_26() {
         let mut app = crate::app::AppState::default();
-        let sid = crate::api::types::SessionId("s-p".into());
+        let sid = crate::api::types::SessionId::new("s-p".into());
         app.active_session = Some(sid.clone());
-        let w = app.sessions.touch(&sid.0, 50);
+        let w = app.sessions.touch(&sid.get(), 50);
         let _ = w.apply(crate::model::Incoming::Snapshot {
             cursor: None,
             records: vec![],
@@ -747,11 +747,11 @@ mod tests {
     #[test]
     fn subagent_child_lineage_shows_in_status_ac007_01_07() {
         let mut app = crate::app::AppState::default();
-        let sid = crate::api::types::SessionId("c1".into());
+        let sid = crate::api::types::SessionId::new("c1".into());
         app.active_session = Some(sid.clone());
         // 打开 child 时登记 parent（open_subagent_child 写入）。
         app.subagent_parents.insert("c1".into(), "p1".into());
-        let w = app.sessions.touch(&sid.0, 50);
+        let w = app.sessions.touch(&sid.get(), 50);
         let _ = w.apply(crate::model::Incoming::Snapshot {
             cursor: None,
             records: vec![],
@@ -770,9 +770,9 @@ mod tests {
         );
         // 普通会话（未登记 parent）不显示该标记。
         let mut app2 = crate::app::AppState::default();
-        let sid2 = crate::api::types::SessionId("s1".into());
+        let sid2 = crate::api::types::SessionId::new("s1".into());
         app2.active_session = Some(sid2.clone());
-        let w2 = app2.sessions.touch(&sid2.0, 50);
+        let w2 = app2.sessions.touch(&sid2.get(), 50);
         let _ = w2.apply(crate::model::Incoming::Snapshot {
             cursor: None,
             records: vec![],

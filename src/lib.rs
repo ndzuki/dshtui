@@ -6,6 +6,7 @@
 
 pub mod api;
 pub mod app;
+pub mod bench;
 pub mod cache;
 pub mod config;
 pub mod input;

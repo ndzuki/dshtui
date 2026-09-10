@@ -62,11 +62,13 @@ pub async fn list(
     base: &str,
     session_id: &str,
 ) -> Result<Vec<MessageFeedbackItem>, ClientError> {
+    // wire 校正（0.1.2-rc.1 实读 dsh-message-feedback descriptor）：
+    // messageFeedback/list 单 request 形参，sessionId 嵌套在 args.request 内。
     let value = unary(
         http,
         base,
         "messageFeedback/list",
-        serde_json::json!({ "sessionId": session_id }),
+        serde_json::json!({ "request": { "sessionId": session_id } }),
     )
     .await?;
     let arr = value

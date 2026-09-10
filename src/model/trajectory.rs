@@ -527,10 +527,10 @@ impl TrajectoryWindow {
                 return TrajEffect::Noop;
             }
         }
-        if self.seen_seq.contains(&seq.0) {
+        if self.seen_seq.contains(&seq.get()) {
             return TrajEffect::Noop;
         }
-        self.seen_seq.insert(seq.0);
+        self.seen_seq.insert(seq.get());
         if let Some(rid) = ev.request_id.as_deref() {
             self.seen_request.insert(rid.to_string());
         }
@@ -631,8 +631,10 @@ impl TrajectoryWindow {
         let mut inserted = 0usize;
         for rec in records {
             if let Some(seq) = record_seq(&rec) {
-                if self.seen_seq.contains(&seq.0)
-                    || self.evicted_head_seq.is_some_and(|anchor| seq.0 <= anchor)
+                if self.seen_seq.contains(&seq.get())
+                    || self
+                        .evicted_head_seq
+                        .is_some_and(|anchor| seq.get() <= anchor)
                 {
                     continue;
                 }
@@ -665,7 +667,7 @@ impl TrajectoryWindow {
                     tracing::warn!(event_type = %event.event_type, "轨迹 event 缺 seq；跳过");
                     return 0;
                 };
-                if self.seen_seq.contains(&seq.0) {
+                if self.seen_seq.contains(&seq.get()) {
                     return 0;
                 }
                 if let Some(rid) = event.request_id.as_deref() {
@@ -674,7 +676,7 @@ impl TrajectoryWindow {
                     }
                     self.seen_request.insert(rid.to_string());
                 }
-                self.seen_seq.insert(seq.0);
+                self.seen_seq.insert(seq.get());
                 let row = row_from_event(event, seq, self.next_id);
                 self.next_id += 1;
                 let idx = self.rows.partition_point(|r| r.seq() < seq);
@@ -691,7 +693,7 @@ impl TrajectoryWindow {
     fn evict(&mut self) {
         while self.rows.len() > self.cap {
             if let Some(old) = self.rows.pop_front() {
-                self.evicted_head_seq = Some(old.seq().0);
+                self.evicted_head_seq = Some(old.seq().get());
             }
         }
     }

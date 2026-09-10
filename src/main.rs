@@ -21,6 +21,7 @@ use dshtui::api::types::{SessionAddress, SessionId, SessionRequestId, SessionSeq
 use dshtui::api::workspace;
 use dshtui::api::{Backoff, ClientError, DshClient, Mux};
 use dshtui::app::{AppEvent, AppState, Cmd, Mode};
+use dshtui::bench::{BenchConfig, FixtureMode};
 use dshtui::config::{self, Cli, CliAction, Effective};
 use dshtui::input::{Command, InputMode, KeyDecoder};
 use ratatui::backend::CrosstermBackend;
@@ -28,7 +29,9 @@ use ratatui::Terminal;
 use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
 
-const LOG_ROTATE_BYTES: u64 = 5 * 1024 * 1024; // REQ §6: 5MB log rotation.
+// REQ-008 AC-008-09: default rotation cap = 5MB (Notes/06 §7); overridable via
+// `[log] max_bytes` (config.rs LogConfig). Kept as default when config absent.
+const LOG_ROTATE_BYTES: u64 = config::DEFAULT_LOG_MAX_BYTES;
 
 /// `session/search` 截止时间（REQ-003 §6：unary 不得挂死帧循环）。
 const SEARCH_TIMEOUT: Duration = Duration::from_secs(15);
@@ -58,23 +61,59 @@ async fn main() -> ExitCode {
             println!("dshtui {}", env!("CARGO_PKG_VERSION"));
             return ExitCode::SUCCESS;
         }
+        // REQ-008 FR-008-01：`dshtui bench` 性能基准独立分发——不加载
+        // config/token/日志（seed 默认无网络依赖；live/auto 由 bench 自读
+        // DSH_TOKEN env），exit 码 0/1/2 直映射。
+        CliAction::Bench {
+            report,
+            report_md,
+            fixture,
+            scenario,
+        } => {
+            let fixture_mode = match fixture.as_deref() {
+                None => FixtureMode::Auto,
+                Some(s) => match FixtureMode::parse(s) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        eprintln!("错误: {e}");
+                        return ExitCode::from(2);
+                    }
+                },
+            };
+            let report_path = report
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(dshtui::bench::DEFAULT_REPORT_PATH));
+            // markdown 默认路径 = JSON 报告 `.json → .md` 派生（--report-md 显式
+            // 覆盖；空 = 跳过 md 写，D-60）。
+            let report_md_path = match report_md {
+                Some(p) => PathBuf::from(p),
+                None => {
+                    let mut derived = report_path.clone();
+                    if !report_path.as_os_str().is_empty() {
+                        derived.set_extension("md");
+                    }
+                    derived
+                }
+            };
+            let cfg = BenchConfig {
+                report_path,
+                report_md_path,
+                fixture: fixture_mode,
+                scenario,
+            };
+            let (report, code) = dshtui::bench::run(&cfg);
+            print!("{}", dshtui::bench::format_summary(&report));
+            if !cfg.report_path.as_os_str().is_empty() {
+                println!("报告: {}", cfg.report_path.display());
+            }
+            if !cfg.report_md_path.as_os_str().is_empty() {
+                println!("markdown 报告: {}", cfg.report_md_path.display());
+            }
+            return ExitCode::from(code.clamp(0, 2) as u8);
+        }
         CliAction::Run => {}
         CliAction::Monitor { .. } => {}
     }
-
-    let log_path = cli
-        .log_file
-        .as_deref()
-        .map(PathBuf::from)
-        .unwrap_or_else(default_log_path);
-    // REQ §3/§6: all errors go to the rotating file log (never the terminal).
-    let _guard = match init_logging(&log_path) {
-        Ok(guard) => guard,
-        Err(error) => {
-            eprintln!("警告: 日志初始化失败（{error}），继续运行但无文件日志");
-            None
-        }
-    };
 
     let cfg = match config::Config::load(None) {
         Ok(c) => c,
@@ -88,6 +127,21 @@ async fn main() -> ExitCode {
         Err(e) => {
             eprintln!("错误: {e}");
             return ExitCode::from(2);
+        }
+    };
+
+    let log_path = cli
+        .log_file
+        .as_deref()
+        .map(PathBuf::from)
+        .unwrap_or_else(default_log_path);
+    // REQ §3/§6: all errors go to the rotating file log (never the terminal).
+    // REQ-008 AC-008-09: rotation cap from `[log] max_bytes` (default 5MB).
+    let _guard = match init_logging(&log_path, cfg.log.max_bytes) {
+        Ok(guard) => guard,
+        Err(error) => {
+            eprintln!("警告: 日志初始化失败（{error}），继续运行但无文件日志");
+            None
         }
     };
 
@@ -132,15 +186,24 @@ fn default_log_path() -> PathBuf {
     base.join(".local/state/dshtui/dshtui.log")
 }
 
-/// Initialize tracing to a rotating 5MB file log (REQ §6). Returns the guard
-/// that keeps the non-blocking writer alive for the process lifetime.
+/// Initialize tracing to a rotating file log (REQ §6; cap from config
+/// `[log] max_bytes`, default 5MB). Returns the guard that keeps the
+/// non-blocking writer alive for the process lifetime.
 fn init_logging(
     path: &Path,
+    max_bytes: u64,
 ) -> Result<Option<tracing_appender::non_blocking::WorkerGuard>, String> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).map_err(|e| format!("创建日志目录 {} 失败: {e}", dir.display()))?;
     }
-    let writer = RotatingFile::new(path).map_err(|e| e.to_string())?;
+    // 默认 5MB 走 `new`（LOG_ROTATE_BYTES 语义，notes/06 §7）；自定义
+    // `[log] max_bytes` 走 `with_cap`。
+    let writer = if max_bytes == config::DEFAULT_LOG_MAX_BYTES {
+        RotatingFile::new(path)
+    } else {
+        RotatingFile::with_cap(path, max_bytes)
+    }
+    .map_err(|e| e.to_string())?;
     let (non_blocking, guard) = tracing_appender::non_blocking(writer);
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -154,23 +217,29 @@ fn init_logging(
     Ok(Some(guard))
 }
 
-/// io::Write wrapper that rotates the file when it exceeds LOG_ROTATE_BYTES:
-/// the oversized file is renamed to `<name>.old` (previous `.old` replaced)
-/// and a fresh file is opened.
+/// io::Write wrapper that rotates the file when it exceeds `max_bytes`
+/// (default 5MB; `[log] max_bytes` overrides): the oversized file is renamed
+/// to `<name>.old` (previous `.old` replaced) and a fresh file is opened.
 struct RotatingFile {
     path: PathBuf,
     file: File,
     written: u64,
+    max_bytes: u64,
 }
 
 impl RotatingFile {
     fn new(path: &Path) -> io::Result<Self> {
+        Self::with_cap(path, LOG_ROTATE_BYTES)
+    }
+
+    fn with_cap(path: &Path, max_bytes: u64) -> io::Result<Self> {
         let file = OpenOptions::new().create(true).append(true).open(path)?;
         let written = file.metadata().map(|m| m.len()).unwrap_or(0);
         Ok(Self {
             path: path.to_path_buf(),
             file,
             written,
+            max_bytes: max_bytes.max(1),
         })
     }
 
@@ -192,7 +261,7 @@ impl RotatingFile {
 
 impl Write for RotatingFile {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        if self.written.saturating_add(buf.len() as u64) > LOG_ROTATE_BYTES {
+        if self.written.saturating_add(buf.len() as u64) > self.max_bytes {
             self.rotate()?;
         }
         let n = self.file.write(buf)?;
@@ -202,6 +271,62 @@ impl Write for RotatingFile {
 
     fn flush(&mut self) -> io::Result<()> {
         self.file.flush()
+    }
+}
+
+// ---------- REQ-008 Step 1：主 TUI perf 日志（AC-008-10） ----------
+
+/// 主循环 perf 采样/周期写日志（镜像 monitor.rs:614-693 口径）：
+/// 每帧 draw 后 sampler.tick，每 ~5s 写一行 PerfLogEntry
+/// （ts/rss_kb/frame_ms_p50/frame_ms_p99/search_ms/page_latency_ms/
+/// ws_reconnects）。路径解析：`DSHTUI_PERF_LOG` env 覆盖（既有 monitor
+/// 用法），否则 config `[perf] log`（默认开）+ `log_path`（默认
+/// /tmp/dshtui-perf.log，空 = 禁用）。
+struct PerfLogger {
+    sampler: dshtui::perf::FrameSampler,
+    path: String,
+    last_write: std::time::Instant,
+}
+
+impl PerfLogger {
+    fn from_config(eff: &Effective) -> Self {
+        let path = std::env::var("DSHTUI_PERF_LOG").unwrap_or_else(|_| {
+            if eff.perf.log && !eff.perf.log_path.is_empty() {
+                eff.perf.log_path.clone()
+            } else {
+                String::new()
+            }
+        });
+        Self {
+            sampler: dshtui::perf::FrameSampler::new(),
+            path,
+            last_write: std::time::Instant::now(),
+        }
+    }
+
+    /// 帧采样 + 周期写日志（每帧调用；内部每 ~5s 写一行）。
+    fn tick(&mut self, app: &AppState) {
+        self.sampler.tick();
+        if self.path.is_empty() {
+            return;
+        }
+        if self.sampler.count() > 0 && self.last_write.elapsed() >= Duration::from_secs(5) {
+            let ts_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            let entry = dshtui::perf::PerfLogEntry {
+                ts_ms,
+                rss_kb: (dshtui::perf::rss_mb() * 1024.0) as u64,
+                frame_ms_p50: self.sampler.p50(),
+                frame_ms_p99: self.sampler.p99(),
+                search_ms: app.last_search_ms,
+                page_latency_ms: app.last_page_latency_ms,
+                ws_reconnects: app.ws_reconnects,
+            };
+            dshtui::perf::log_perf_entry(&self.path, &entry);
+            self.last_write = std::time::Instant::now();
+        }
     }
 }
 
@@ -246,12 +371,15 @@ async fn run_startup_guidance(
         app.handle(AppEvent::StartupProbeFailed(hint));
     }
     sync_guidance(&mut app, false, token.is_some(), 0);
+    // REQ-008 Step 1：启动指引屏同样采样帧/写 perf 日志（AC-008-10）。
+    let mut perf = PerfLogger::from_config(&eff);
 
     loop {
         terminal
             .terminal
             .draw(|frame| dshtui::ui::render(frame, &app))
             .map_err(|e| e.to_string())?;
+        perf.tick(&app);
         if app.exited {
             return Ok(());
         }
@@ -393,6 +521,8 @@ async fn run_connected(eff: Effective, token: String, client: DshClient) -> Resu
     let (event_tx, mut event_rx) = mpsc::channel::<AppEvent>(256);
     let mut commands = VecDeque::from(app.handle(AppEvent::Startup));
     let mut backoff = Backoff::new(500, 10_000);
+    // REQ-008 Step 1：主 TUI perf 日志采样（AC-008-10；config `[perf]`）。
+    let mut perf = PerfLogger::from_config(&eff);
 
     loop {
         // Reconnect: draw first, then back off, then re-probe (Notes/03 §8).
@@ -402,6 +532,7 @@ async fn run_connected(eff: Effective, token: String, client: DshClient) -> Resu
                 .terminal
                 .draw(|frame| dshtui::ui::render(frame, &app))
                 .map_err(|e| e.to_string())?;
+            perf.tick(&app);
             let delay = backoff.next_delay_ms();
             tokio::time::sleep(Duration::from_millis(delay)).await;
             match DshClient::connect(&eff.url, &token).await {
@@ -427,7 +558,9 @@ async fn run_connected(eff: Effective, token: String, client: DshClient) -> Resu
         }
 
         // One command per iteration: list pagination renders between pages.
+        let mut cmd_had = false;
         if let Some(command) = commands.pop_front() {
+            cmd_had = true;
             // REQ-007 `:edit`（AC-007-25）：需要 TerminalSession 释放/恢复
             // raw mode，主循环内联处理（execute_one 无 terminal 访问）。
             if let Cmd::ExternalEdit { tmp_path, editor } = &command {
@@ -475,11 +608,11 @@ async fn run_connected(eff: Effective, token: String, client: DshClient) -> Resu
             break;
         }
 
-        terminal
-            .terminal
-            .draw(|frame| dshtui::ui::render(frame, &app))
-            .map_err(|e| e.to_string())?;
-
+        // REQ-008 Step 2（AC-008-04）：事件驱动 draw——先收集输入/后台事件
+        // （reducer 置 redraw_pending），再按需重绘；空闲（无输入、无事件、
+        // 无挂起重绘）跳过 draw 省 CPU（Notes/06 §5）。33ms tick 上限保留：
+        // event::poll 超时即回到循环顶部，输入延迟仍 ≤ tick。
+        let mut input_had = false;
         if event::poll(Duration::from_millis(eff.ui.tick_ms)).map_err(|e| e.to_string())? {
             let input = event::read().map_err(|e| e.to_string())?;
             let mode = match app.mode {
@@ -518,14 +651,31 @@ async fn run_connected(eff: Effective, token: String, client: DshClient) -> Resu
             };
             if let Some(command) = decoder.decode(mode, input) {
                 commands.extend(app.handle_command(command));
+                input_had = true;
             }
         }
+        let mut events_had = false;
         while let Ok(event) = event_rx.try_recv() {
             commands.extend(app.handle(event));
+            events_had = true;
         }
         // REQ-007：草稿变更后主循环串行 flush（AC-007-22/ADR-010）。
         if app.take_draft_dirty() {
             flush_drafts(&mut app);
+        }
+        // 空闲停渲染：仅当本 tick 有命令执行/输入/事件/挂起重绘才 draw。
+        if cmd_had || input_had || events_had || app.needs_redraw() {
+            terminal
+                .terminal
+                .draw(|frame| dshtui::ui::render(frame, &app))
+                .map_err(|e| e.to_string())?;
+            app.record_draw();
+            app.take_redraw();
+            // 帧采样只在真实 draw 后 tick（空闲跳过 draw → 不产生帧样本，
+            // frame_ms p50/p99 反映真实渲染帧率，Notes/06 §8）。
+            perf.tick(&app);
+        } else {
+            app.record_idle_cycle();
         }
     }
     // REQ-004 退出清理：未入缓存的临时文件（缓存目录由 ImageCache Drop 清理）。
@@ -633,7 +783,7 @@ async fn execute_one(
                 Ok(mux_ref) => session::open_follow(mux_ref, &address, max_messages).await,
                 Err(error) => Err(error),
             };
-            let session_id = SessionId(child_id.clone());
+            let session_id = SessionId::new(child_id.clone());
             match opened {
                 Ok(stream) => {
                     let generation = mux_generation.load(Ordering::Relaxed);
@@ -659,7 +809,7 @@ async fn execute_one(
             let Some(client) = client.as_ref() else {
                 return;
             };
-            let address = SessionAddress::session(&session_id.0);
+            let address = SessionAddress::session(&session_id.get());
             let opened = match open_mux_stream(client, mux, mux_generation, event_tx).await {
                 Ok(mux_ref) => session::open_follow(mux_ref, &address, max_messages).await,
                 Err(error) => Err(error),
@@ -695,15 +845,20 @@ async fn execute_one(
             let Some(client) = client.as_ref() else {
                 return;
             };
+            // REQ-008 Step 1：分页耗时采集（AC-008-10 page_latency_ms）。
+            let page_start = std::time::Instant::now();
             let result = session::page(
                 &client.http,
                 &client.base,
-                &SessionAddress::session(&session_id.0),
+                &SessionAddress::session(&session_id.get()),
                 through_seq,
                 before_seq,
                 max_messages.min(page_size.max(1)),
             )
             .await;
+            commands.extend(app.handle(AppEvent::PageLatencyMeasured {
+                elapsed_ms: page_start.elapsed().as_secs_f64() * 1000.0,
+            }));
             let event = match result {
                 Ok(page) => AppEvent::PageResult {
                     session_id,
@@ -726,7 +881,7 @@ async fn execute_one(
             let Some(client) = client.as_ref() else {
                 return;
             };
-            let event = match session::cancel(&client.http, &client.base, &session_id.0).await {
+            let event = match session::cancel(&client.http, &client.base, &session_id.get()).await {
                 Ok(accepted) => {
                     tracing::debug!(%session_id, ?accepted, "session/cancel accepted");
                     AppEvent::CancelAccepted {
@@ -749,8 +904,8 @@ async fn execute_one(
         } => {
             let Some(client) = client.as_ref() else {
                 let event = AppEvent::PromptFailed {
-                    session_id: SessionId(child_id.clone()),
-                    request_id: SessionRequestId(request_id.clone()),
+                    session_id: SessionId::new(child_id.clone()),
+                    request_id: SessionRequestId::new(request_id.clone()),
                     error: ClientError::Transport("未连接（dsh web 不可达）".into()),
                 };
                 commands.extend(app.handle(event));
@@ -768,13 +923,13 @@ async fn execute_one(
                     tracing::debug!(child = %child_id, message_id = ?receipt.message_id, "subagents/prompt accepted");
                     // 复用 PromptAccepted（child 窗口回显对账）。
                     commands.extend(app.handle(AppEvent::PromptAccepted {
-                        session_id: SessionId(child_id.clone()),
-                        request_id: SessionRequestId(request_id.clone()),
+                        session_id: SessionId::new(child_id.clone()),
+                        request_id: SessionRequestId::new(request_id.clone()),
                     }));
                 }
                 Err(error) => commands.extend(app.handle(AppEvent::PromptFailed {
-                    session_id: SessionId(child_id.clone()),
-                    request_id: SessionRequestId(request_id.clone()),
+                    session_id: SessionId::new(child_id.clone()),
+                    request_id: SessionRequestId::new(request_id.clone()),
                     error,
                 })),
             }
@@ -807,15 +962,20 @@ async fn execute_one(
             let Some(client) = client.as_ref() else {
                 return;
             };
-            let event =
-                match session::search(&client.http, &client.base, &query, SEARCH_TIMEOUT).await {
-                    Ok(result) => AppEvent::SearchResult {
-                        generation,
-                        items: result.items,
-                        has_more: result.has_more,
-                    },
-                    Err(error) => AppEvent::SearchError { generation, error },
-                };
+            // REQ-008 Step 1：检索耗时采集（AC-008-10 search_ms）。
+            let search_start = std::time::Instant::now();
+            let result = session::search(&client.http, &client.base, &query, SEARCH_TIMEOUT).await;
+            commands.extend(app.handle(AppEvent::SearchLatencyMeasured {
+                elapsed_ms: search_start.elapsed().as_secs_f64() * 1000.0,
+            }));
+            let event = match result {
+                Ok(result) => AppEvent::SearchResult {
+                    generation,
+                    items: result.items,
+                    has_more: result.has_more,
+                },
+                Err(error) => AppEvent::SearchError { generation, error },
+            };
             commands.extend(app.handle(event));
         }
         Cmd::DebounceSearch { query, generation } => {
@@ -833,9 +993,8 @@ async fn execute_one(
             let Some(client) = client.as_ref() else {
                 return;
             };
-            let address = SessionAddress::session(&session_id.0);
             let opened = match open_mux_stream(client, mux, mux_generation, event_tx).await {
-                Ok(mux_ref) => session::open_control(mux_ref, &address).await,
+                Ok(mux_ref) => session::open_control(mux_ref).await,
                 Err(error) => Err(error),
             };
             match opened {
@@ -954,11 +1113,16 @@ async fn execute_one(
                 commands.extend(app.handle(event));
                 return;
             };
-            let event =
-                match dshtui::api::commands::list(&client.http, &client.base, &agent_id.0).await {
-                    Ok(cmds) => AppEvent::RemoteCommandsLoaded { commands: cmds },
-                    Err(error) => AppEvent::RemoteCommandsFailed { error },
-                };
+            let event = match dshtui::api::commands::list(
+                &client.http,
+                &client.base,
+                &agent_id.get(),
+            )
+            .await
+            {
+                Ok(cmds) => AppEvent::RemoteCommandsLoaded { commands: cmds },
+                Err(error) => AppEvent::RemoteCommandsFailed { error },
+            };
             commands.extend(app.handle(event));
         }
         Cmd::ExecuteCommand { line } => {
@@ -979,7 +1143,7 @@ async fn execute_one(
             let event = match dshtui::api::commands::execute(
                 &client.http,
                 &client.base,
-                &agent_id.0,
+                &agent_id.get(),
                 &line,
                 &[],
             )
@@ -1038,7 +1202,7 @@ async fn execute_one(
                         .map_err(|e| ("rename session".to_string(), e))
                 }
                 WorkspaceOperation::ArchiveSession { session_id } => {
-                    workspace::archive_session(&client.http, &client.base, &session_id.0)
+                    workspace::archive_session(&client.http, &client.base, &session_id.get())
                         .await
                         .map(|_| OpOutcome::Ack)
                         .map_err(|e| ("archive session".to_string(), e))
@@ -1068,14 +1232,17 @@ async fn execute_one(
                 WorkspaceOperation::RenameWorkspace {
                     workspace_id,
                     title,
-                } => {
-                    workspace::rename_workspace(&client.http, &client.base, &workspace_id.0, &title)
-                        .await
-                        .map(|_| OpOutcome::Ack)
-                        .map_err(|e| ("rename workspace".to_string(), e))
-                }
+                } => workspace::rename_workspace(
+                    &client.http,
+                    &client.base,
+                    &workspace_id.get(),
+                    &title,
+                )
+                .await
+                .map(|_| OpOutcome::Ack)
+                .map_err(|e| ("rename workspace".to_string(), e)),
                 WorkspaceOperation::DeleteWorkspace { workspace_id } => {
-                    workspace::delete_workspace(&client.http, &client.base, &workspace_id.0)
+                    workspace::delete_workspace(&client.http, &client.base, &workspace_id.get())
                         .await
                         .map(|_| OpOutcome::Ack)
                         .map_err(|e| ("delete workspace".to_string(), e))
@@ -1086,8 +1253,8 @@ async fn execute_one(
                 } => workspace::insert_session_before(
                     &client.http,
                     &client.base,
-                    &target_workspace.0,
-                    &session_id.0,
+                    &target_workspace.get(),
+                    &session_id.get(),
                     None,
                 )
                 .await
@@ -1151,7 +1318,7 @@ async fn execute_one(
                 commands.extend(app.handle(event));
                 return;
             };
-            let sid = dshtui::api::types::SessionId(session_id.clone());
+            let sid = dshtui::api::types::SessionId::new(session_id.clone());
             match dshtui::api::session::fork(&client.http, &client.base, &sid, Some(at_seq)).await {
                 Ok(v) => commands.extend(app.handle(AppEvent::MessageBranchDone {
                     session_id: v.session_id,
@@ -1316,7 +1483,7 @@ async fn execute_one(
                 commands.extend(app.handle(event));
                 return;
             };
-            match dshtui::api::skills::list(&client.http, &client.base, &sid.0).await {
+            match dshtui::api::skills::list(&client.http, &client.base, &sid.get()).await {
                 Ok(value) => commands.extend(app.handle(AppEvent::SkillsListed { value })),
                 Err(error) => commands.extend(app.handle(AppEvent::SkillsListFailed { error })),
             }
@@ -1382,16 +1549,21 @@ async fn execute_one(
                             objective,
                             max_goal_rounds,
                         };
-                        dshtui::api::goals::create(&client.http, &client.base, &agent_id.0, &req)
-                            .await
-                            .map(|r| {
-                                Some(dshtui::api::types::GoalSnapshot {
-                                    id: r.id,
-                                    revision: r.revision,
-                                    ..Default::default()
-                                })
+                        dshtui::api::goals::create(
+                            &client.http,
+                            &client.base,
+                            &agent_id.get(),
+                            &req,
+                        )
+                        .await
+                        .map(|r| {
+                            Some(dshtui::api::types::GoalSnapshot {
+                                id: r.id,
+                                revision: r.revision,
+                                ..Default::default()
                             })
-                            .map_err(|e| ("create".into(), e))
+                        })
+                        .map_err(|e| ("create".into(), e))
                     }
                     GoalMutation::Edit { objective } => {
                         // goals/edit(agentId, ref, request)（typert 实读 0.1.2-rc.1：
@@ -1414,7 +1586,7 @@ async fn execute_one(
                         dshtui::api::goals::edit(
                             &client.http,
                             &client.base,
-                            &agent_id.0,
+                            &agent_id.get(),
                             &ref_,
                             &req,
                         )
@@ -1432,10 +1604,15 @@ async fn execute_one(
                                 .unwrap_or_default(),
                             revision: app.goals.sent_revision.unwrap_or(0),
                         };
-                        dshtui::api::goals::pause(&client.http, &client.base, &agent_id.0, &ref_)
-                            .await
-                            .map(Some)
-                            .map_err(|e| ("pause".into(), e))
+                        dshtui::api::goals::pause(
+                            &client.http,
+                            &client.base,
+                            &agent_id.get(),
+                            &ref_,
+                        )
+                        .await
+                        .map(Some)
+                        .map_err(|e| ("pause".into(), e))
                     }
                     GoalMutation::Resume => {
                         let ref_ = dshtui::api::types::GoalRef {
@@ -1447,10 +1624,15 @@ async fn execute_one(
                                 .unwrap_or_default(),
                             revision: app.goals.sent_revision.unwrap_or(0),
                         };
-                        dshtui::api::goals::resume(&client.http, &client.base, &agent_id.0, &ref_)
-                            .await
-                            .map(Some)
-                            .map_err(|e| ("resume".into(), e))
+                        dshtui::api::goals::resume(
+                            &client.http,
+                            &client.base,
+                            &agent_id.get(),
+                            &ref_,
+                        )
+                        .await
+                        .map(Some)
+                        .map_err(|e| ("resume".into(), e))
                     }
                     GoalMutation::Complete => {
                         let ref_ = dshtui::api::types::GoalRef {
@@ -1462,10 +1644,15 @@ async fn execute_one(
                                 .unwrap_or_default(),
                             revision: app.goals.sent_revision.unwrap_or(0),
                         };
-                        dshtui::api::goals::complete(&client.http, &client.base, &agent_id.0, &ref_)
-                            .await
-                            .map(Some)
-                            .map_err(|e| ("complete".into(), e))
+                        dshtui::api::goals::complete(
+                            &client.http,
+                            &client.base,
+                            &agent_id.get(),
+                            &ref_,
+                        )
+                        .await
+                        .map(Some)
+                        .map_err(|e| ("complete".into(), e))
                     }
                     GoalMutation::Clear => {
                         let ref_ = dshtui::api::types::GoalRef {
@@ -1477,10 +1664,15 @@ async fn execute_one(
                                 .unwrap_or_default(),
                             revision: app.goals.sent_revision.unwrap_or(0),
                         };
-                        dshtui::api::goals::clear(&client.http, &client.base, &agent_id.0, &ref_)
-                            .await
-                            .map(|_| None)
-                            .map_err(|e| ("clear".into(), e))
+                        dshtui::api::goals::clear(
+                            &client.http,
+                            &client.base,
+                            &agent_id.get(),
+                            &ref_,
+                        )
+                        .await
+                        .map(|_| None)
+                        .map_err(|e| ("clear".into(), e))
                     }
                 };
             let cleared = matches!(result, Ok(None));
@@ -1619,9 +1811,11 @@ async fn execute_one(
             let Some(session_id) = app.active_session.clone() else {
                 return;
             };
-            let (through_seq, before_seq) = match app.sessions.get(&session_id.0) {
+            let (through_seq, before_seq) = match app.sessions.get(&session_id.get()) {
                 Some(w) => (
-                    w.cursor().map(|c| SessionSeq(c.0)).unwrap_or(SessionSeq(0)),
+                    w.cursor()
+                        .map(|c| SessionSeq::new(c.get()))
+                        .unwrap_or(SessionSeq::new(0)),
                     w.head_seq(),
                 ),
                 None => {
@@ -1629,16 +1823,21 @@ async fn execute_one(
                     return;
                 }
             };
-            match session::page(
+            // REQ-008 Step 1：分页耗时采集（AC-008-10 page_latency_ms）。
+            let page_start = std::time::Instant::now();
+            let result = session::page(
                 &client.http,
                 &client.base,
-                &SessionAddress::session(&session_id.0),
+                &SessionAddress::session(&session_id.get()),
                 through_seq,
                 before_seq,
                 LOAD_THROUGH_PAGE_SIZE,
             )
-            .await
-            {
+            .await;
+            commands.extend(app.handle(AppEvent::PageLatencyMeasured {
+                elapsed_ms: page_start.elapsed().as_secs_f64() * 1000.0,
+            }));
+            match result {
                 Ok(page) => {
                     let has_more = page.has_more;
                     commands.extend(app.handle(AppEvent::LoadThroughPage {
@@ -2380,6 +2579,34 @@ mod tests {
         let fresh_len = fs::metadata(&path).unwrap().len();
         assert!(fresh_len < LOG_ROTATE_BYTES);
         // Cleanup: remove only the temp directory this test created.
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rotating_file_honors_custom_max_bytes_ac008_09() {
+        // REQ-008 AC-008-09: `[log] max_bytes` 自定义轮转上限。
+        let dir = std::env::temp_dir().join(format!("dshtui-rot-cap-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("dshtui.log");
+        {
+            let mut writer = RotatingFile::with_cap(&path, 4_096).unwrap();
+            let chunk = vec![b'x'; 1_000];
+            // 6×1KB > 4KB → 必然轮转。
+            for _ in 0..6 {
+                let n = writer.write(&chunk).unwrap();
+                assert_eq!(n, chunk.len(), "written amount handled");
+            }
+            writer.flush().unwrap();
+            assert!(
+                writer.written < 4_096,
+                "custom cap reset: {}",
+                writer.written
+            );
+        }
+        let old = path.with_extension("log.old");
+        assert!(old.exists(), "custom-cap rotation preserved .old");
+        let fresh_len = fs::metadata(&path).unwrap().len();
+        assert!(fresh_len < 4_096, "fresh log under custom cap: {fresh_len}");
         let _ = fs::remove_dir_all(&dir);
     }
 }

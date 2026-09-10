@@ -44,7 +44,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
             .unwrap_or_else(|| "-".into());
         let seq = item
             .seq
-            .map(|s| s.0.to_string())
+            .map(|s| s.get().to_string())
             .unwrap_or_else(|| "-".into());
         let prompt: String = item
             .prompt
@@ -104,7 +104,7 @@ mod tests {
     #[test]
     fn outline_lists_turn_outline_items_with_prompt() {
         let mut app = AppState::default();
-        app.active_session = Some(SessionId("s1".into()));
+        app.active_session = Some(SessionId::new("s1".into()));
         app.outline.open = true;
         app.sessions.touch("s1", 20).apply(Incoming::Snapshot {
             cursor: None,
@@ -135,7 +135,7 @@ mod tests {
     #[test]
     fn outline_empty_projection_shows_hint() {
         let mut app = AppState::default();
-        app.active_session = Some(SessionId("s1".into()));
+        app.active_session = Some(SessionId::new("s1".into()));
         app.outline.open = true;
         app.sessions.touch("s1", 20).apply(Incoming::Snapshot {
             cursor: None,
@@ -156,7 +156,7 @@ mod tests {
     fn outline_items_come_from_official_turn_outline_projection() {
         // turnOutline 投影 → TranscriptWindow::turn_outline()（缺失即空，不臆造）。
         let mut app = AppState::default();
-        app.active_session = Some(SessionId("s1".into()));
+        app.active_session = Some(SessionId::new("s1".into()));
         app.sessions.touch("s1", 20).apply(Incoming::Snapshot {
             cursor: None,
             records: vec![],
@@ -174,7 +174,7 @@ mod tests {
             .to_vec();
         assert_eq!(outline.len(), 1);
         assert_eq!(outline[0].turn, Some(2));
-        assert_eq!(outline[0].seq, Some(SessionSeq(9)));
+        assert_eq!(outline[0].seq, Some(SessionSeq::new(9)));
         assert_eq!(outline[0].prompt.as_deref(), Some("q"));
     }
 }

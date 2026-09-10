@@ -13,7 +13,7 @@ fn event(seq: u64, event_type: &str, content: Option<&str>) -> SessionHistoryRec
     SessionHistoryRecord::Event {
         event: SessionWireEvent {
             event_type: event_type.to_string(),
-            seq: Some(SessionSeq(seq)),
+            seq: Some(SessionSeq::new(seq)),
             time: None,
             request_id: None,
             ignorable: None,
@@ -42,10 +42,10 @@ fn rendered_text(terminal: &Terminal<TestBackend>) -> String {
 fn complete_frame_renders_session_sidebar_chat_status_and_details() {
     let mut app = AppState::new(20);
     app.conn = ConnState::Ready;
-    app.active_session = Some(SessionId("sess-1".into()));
+    app.active_session = Some(SessionId::new("sess-1".into()));
     app.focus = dshtui::app::Focus::Details;
     app.sessions.touch("sess-1", 20).apply(Incoming::Snapshot {
-        cursor: Some(dshtui::api::types::SessionLogOffset(9)),
+        cursor: Some(dshtui::api::types::SessionLogOffset::new(9)),
         records: vec![
             event(1, "user/message", Some("hello from user")),
             event(2, "assistant/message", None),
@@ -58,7 +58,7 @@ fn complete_frame_renders_session_sidebar_chat_status_and_details() {
     });
     app.workspaces
         .upsert_session(dshtui::api::types::SessionMeta {
-            id: SessionId("sess-1".into()),
+            id: SessionId::new("sess-1".into()),
             title: Some("Golden session".into()),
             cwd: Some("/tmp/project".into()),
             updated_at_ms: 1,
@@ -123,14 +123,14 @@ fn key_resize_event_updates_render_breakpoint_state() {
 fn composer_overlay_visible_in_insert_and_hidden_in_normal_ac002_01() {
     let mut app = AppState::new(20);
     app.conn = ConnState::Ready;
-    app.active_session = Some(SessionId("sess-1".into()));
+    app.active_session = Some(SessionId::new("sess-1".into()));
     app.mode = Mode::Insert;
     app.composer.visible = true;
-    app.composer.active_session = Some(SessionId("sess-1".into()));
+    app.composer.active_session = Some(SessionId::new("sess-1".into()));
     app.draft = Some(dshtui::model::DraftState {
         text: "你好 draft".into(),
         cursor: 8,
-        bound_session: SessionId("sess-1".into()),
+        bound_session: SessionId::new("sess-1".into()),
     });
     let backend = TestBackend::new(80, 20);
     let mut terminal = Terminal::new(backend).unwrap();
@@ -157,7 +157,7 @@ fn composer_overlay_visible_in_insert_and_hidden_in_normal_ac002_01() {
 fn stopping_state_and_insert_mode_render_in_status_ac002_05() {
     let mut app = AppState::new(20);
     app.conn = ConnState::Ready;
-    app.active_session = Some(SessionId("sess-1".into()));
+    app.active_session = Some(SessionId::new("sess-1".into()));
     // 官方投影 running=true（停止转场中）。
     app.sessions.touch("sess-1", 20).apply(Incoming::Snapshot {
         cursor: None,
@@ -166,7 +166,7 @@ fn stopping_state_and_insert_mode_render_in_status_ac002_05() {
         projections: Some(serde_json::json!({"running": true})),
     });
     app.stop = StopState {
-        requested_session: Some(SessionId("sess-1".into())),
+        requested_session: Some(SessionId::new("sess-1".into())),
     };
     app.mode = Mode::Insert;
     let backend = TestBackend::new(120, 20);
@@ -183,13 +183,13 @@ fn stopping_state_and_insert_mode_render_in_status_ac002_05() {
 fn markdown_block_renders_headings_and_code_ac003_01_02() {
     let mut app = AppState::new(40);
     app.conn = ConnState::Ready;
-    app.active_session = Some(SessionId("sess-1".into()));
+    app.active_session = Some(SessionId::new("sess-1".into()));
     app.sessions.touch("sess-1", 40).apply(Incoming::Snapshot {
         cursor: None,
         records: vec![SessionHistoryRecord::Event {
             event: SessionWireEvent {
                 event_type: "assistant/message".into(),
-                seq: Some(SessionSeq(1)),
+                seq: Some(SessionSeq::new(1)),
                 time: None,
                 request_id: None,
                 ignorable: None,
@@ -202,7 +202,7 @@ fn markdown_block_renders_headings_and_code_ac003_01_02() {
         projections: None,
     });
     app.handle(AppEvent::FollowChunks {
-        session_id: SessionId("sess-1".into()),
+        session_id: SessionId::new("sess-1".into()),
         row: ChunkRow::TextChunks(ChunkData {
             texts: vec!["# 标题一\n\n- 列表甲\n- 列表乙\n\n```rust\nfn main() {}\n```".into()],
             ..Default::default()
@@ -224,13 +224,13 @@ fn markdown_block_renders_headings_and_code_ac003_01_02() {
 fn search_overlay_and_status_matches_count_ac003_05() {
     let mut app = AppState::new(20);
     app.conn = ConnState::Ready;
-    app.active_session = Some(SessionId("sess-1".into()));
+    app.active_session = Some(SessionId::new("sess-1".into()));
     app.mode = Mode::Search;
     app.search.open = true;
     app.search.query = "deploy".into();
     app.search.cursor = 0;
     app.search_index.rebuild(&[Block::UserMessage {
-        seq: SessionSeq(1),
+        seq: SessionSeq::new(1),
         content: "deploy the operator".into(),
         time: None,
     }]);
@@ -251,7 +251,7 @@ fn search_overlay_and_status_matches_count_ac003_05() {
 fn approval_modal_renders_over_chat_ac003_07() {
     let mut app = AppState::new(20);
     app.conn = ConnState::Ready;
-    app.active_session = Some(SessionId("sess-1".into()));
+    app.active_session = Some(SessionId::new("sess-1".into()));
     app.mode = Mode::Approval;
     app.approval.visible = true;
     app.approval.event = Some(ApprovalEvent {
@@ -276,7 +276,7 @@ fn approval_modal_renders_over_chat_ac003_07() {
 fn waiting_approval_status_only_no_modal_ac003_18() {
     let mut app = AppState::new(20);
     app.conn = ConnState::Ready;
-    app.active_session = Some(SessionId("sess-1".into()));
+    app.active_session = Some(SessionId::new("sess-1".into()));
     app.approval.waiting_hint = true;
     let backend = TestBackend::new(100, 20);
     let mut terminal = Terminal::new(backend).unwrap();
@@ -291,7 +291,7 @@ fn approval_queue_list_renders_pending_and_failed_ac006_05_14() {
     use dshtui::model::ApprovalQueue;
     let mut app = AppState::new(20);
     app.conn = ConnState::Ready;
-    app.active_session = Some(SessionId("sess-1".into()));
+    app.active_session = Some(SessionId::new("sess-1".into()));
     app.mode = Mode::Approval;
     app.approval.visible = true;
     app.approval.list_open = true;
@@ -331,7 +331,7 @@ fn approval_queue_list_renders_pending_and_failed_ac006_05_14() {
 fn approval_danger_banner_requires_ack_ac006_16() {
     let mut app = AppState::new(20);
     app.conn = ConnState::Ready;
-    app.active_session = Some(SessionId("sess-1".into()));
+    app.active_session = Some(SessionId::new("sess-1".into()));
     app.mode = Mode::Approval;
     app.approval.visible = true;
     app.approval.event = Some(ApprovalEvent {
@@ -366,7 +366,7 @@ fn approval_danger_banner_requires_ack_ac006_16() {
 fn copied_toast_and_steer_label_render_in_status_ac003_06_08() {
     let mut app = AppState::new(20);
     app.conn = ConnState::Ready;
-    app.active_session = Some(SessionId("sess-1".into()));
+    app.active_session = Some(SessionId::new("sess-1".into()));
     app.mode = Mode::Insert;
     app.composer.visible = true;
     app.composer.steer = true;
@@ -385,7 +385,7 @@ fn nested_image_event(seq: u64) -> SessionHistoryRecord {
     SessionHistoryRecord::Event {
         event: SessionWireEvent {
             event_type: "assistant/message".into(),
-            seq: Some(SessionSeq(seq)),
+            seq: Some(SessionSeq::new(seq)),
             time: None,
             request_id: None,
             ignorable: None,
@@ -406,7 +406,7 @@ fn image_event(seq: u64, attachment_id: &str, name: &str, dims: &str) -> Session
     SessionHistoryRecord::Event {
         event: SessionWireEvent {
             event_type: "message/image".to_string(),
-            seq: Some(SessionSeq(seq)),
+            seq: Some(SessionSeq::new(seq)),
             time: None,
             request_id: None,
             ignorable: None,
@@ -444,7 +444,7 @@ fn image_placeholders_are_rendered_per_block_with_name_and_dims() {
     let mut app = AppState::default();
     app.conn = ConnState::Ready;
     app.kitty_capable = true;
-    app.active_session = Some(SessionId("sess-1".into()));
+    app.active_session = Some(SessionId::new("sess-1".into()));
     app.sessions.touch("sess-1", 20).apply(Incoming::Snapshot {
         cursor: None,
         records: vec![],
@@ -480,14 +480,14 @@ fn image_placeholder_backfills_meta_and_shows_error_without_crash() {
     let mut app = AppState::default();
     app.conn = ConnState::Ready;
     app.kitty_capable = true;
-    app.active_session = Some(SessionId("sess-1".into()));
+    app.active_session = Some(SessionId::new("sess-1".into()));
     *app.sessions.touch("sess-1", 20) = window.clone();
     let backend = TestBackend::new(100, 10);
     let mut terminal = Terminal::new(backend).unwrap();
 
     // 拉取成功回填：AttachmentRef 覆盖占位标注（位置不变）。
     app.image_meta.insert(
-        dshtui::api::types::AttachmentId("att-x".into()),
+        dshtui::api::types::AttachmentId::new("att-x".into()),
         dshtui::model::AttachmentRef::from(
             &dshtui::api::attachment::parse_response(&serde_json::json!({
                 "attachment": {
@@ -509,7 +509,7 @@ fn image_placeholder_backfills_meta_and_shows_error_without_crash() {
 
     // 失败：错误占位 + 可读提示，应用不崩溃。
     app.image_errors.insert(
-        dshtui::api::types::AttachmentId("att-x".into()),
+        dshtui::api::types::AttachmentId::new("att-x".into()),
         "拉取失败: 断网".into(),
     );
     terminal.draw(|frame| ui::render(frame, &app)).unwrap();
@@ -525,7 +525,7 @@ fn non_kitty_placeholder_shows_system_viewer_hint() {
     let mut app = AppState::default();
     app.conn = ConnState::Ready;
     app.kitty_capable = false;
-    app.active_session = Some(SessionId("sess-1".into()));
+    app.active_session = Some(SessionId::new("sess-1".into()));
     *app.sessions.touch("sess-1", 20) = window.clone();
     let backend = TestBackend::new(100, 10);
     let mut terminal = Terminal::new(backend).unwrap();
@@ -552,8 +552,8 @@ fn image_view_mode_shows_image_status_and_actions() {
     app.conn = ConnState::Ready;
     app.mode = dshtui::app::Mode::ImageView;
     app.image_view.open_view(
-        SessionSeq(1),
-        dshtui::api::types::AttachmentId("att-x".into()),
+        SessionSeq::new(1),
+        dshtui::api::types::AttachmentId::new("att-x".into()),
         Some("x.png".into()),
         Some("10x20".into()),
     );
@@ -576,8 +576,8 @@ fn image_view_pager_tag_renders_when_group_ac007_06() {
     app.conn = ConnState::Ready;
     app.mode = dshtui::app::Mode::ImageView;
     app.image_view.open_view(
-        SessionSeq(5),
-        dshtui::api::types::AttachmentId("att-y".into()),
+        SessionSeq::new(5),
+        dshtui::api::types::AttachmentId::new("att-y".into()),
         Some("y.png".into()),
         Some("10x20".into()),
     );
@@ -602,7 +602,7 @@ fn traj_ev(seq: u64, ty: &str, time_ms: i64, data: serde_json::Value) -> Session
     SessionHistoryRecord::Event {
         event: SessionWireEvent {
             event_type: ty.to_string(),
-            seq: Some(SessionSeq(seq)),
+            seq: Some(SessionSeq::new(seq)),
             time: Some(time_ms),
             request_id: None,
             ignorable: None,
@@ -617,8 +617,8 @@ fn traj_ev(seq: u64, ty: &str, time_ms: i64, data: serde_json::Value) -> Session
 fn trajectory_app() -> AppState {
     let mut app = AppState::new(200);
     app.conn = ConnState::Ready;
-    app.active_session = Some(SessionId("sess-t".into()));
-    let sid = SessionId("sess-t".into());
+    app.active_session = Some(SessionId::new("sess-t".into()));
+    let sid = SessionId::new("sess-t".into());
     const T: i64 = 1_700_000_000_000;
     let records = vec![
         traj_ev(
@@ -755,7 +755,7 @@ fn trajectory_detail_with_diff_renders_diff_text_ac005_10() {
     // AC-005-10：meta.diff 存在 → 展示 diff 文本（不降级）。
     let mut app = trajectory_app();
     // 用带 meta.diff 的 tool/result 重建。
-    let sid = SessionId("sess-t".into());
+    let sid = SessionId::new("sess-t".into());
     app.active_session = Some(sid.clone());
     app.traj_sessions = dshtui::model::TrajectoryStore::new(3);
     let mut w = dshtui::model::TrajectoryWindow::new(200);
@@ -846,7 +846,7 @@ fn model_catalog_overlay_renders_rows_and_status_ac006_01() {
     use dshtui::model::catalog::CatalogIndex;
     let mut app = AppState::new(20);
     app.conn = ConnState::Ready;
-    app.active_session = Some(SessionId("sess-1".into()));
+    app.active_session = Some(SessionId::new("sess-1".into()));
     app.mode = Mode::ModelCatalog;
     app.model_catalog.visible = true;
     let catalog: dshtui::api::types::ModelCatalog = serde_json::from_value(serde_json::json!({
@@ -890,11 +890,11 @@ fn sidebar_gv_grouped_vs_flat_renders_ac006_03() {
     use dshtui::api::types::{SessionMeta, WorkspaceId};
     let mut app = AppState::new(20);
     app.conn = ConnState::Ready;
-    let ws1 = WorkspaceId("ws1".into());
+    let ws1 = WorkspaceId::new("ws1".into());
     app.workspaces
         .upsert_workspace(ws1.clone(), Some("项目A".into()));
     let meta = |id: &str, ws: &WorkspaceId| SessionMeta {
-        id: SessionId(id.into()),
+        id: SessionId::new(id.into()),
         title: Some(format!("T-{id}")),
         cwd: None,
         updated_at_ms: 1,
@@ -907,7 +907,7 @@ fn sidebar_gv_grouped_vs_flat_renders_ac006_03() {
     };
     app.workspaces.upsert_session(meta("s1", &ws1));
     app.workspaces
-        .attach_session_to_workspace(&ws1, &SessionId("s1".into()));
+        .attach_session_to_workspace(&ws1, &SessionId::new("s1".into()));
 
     // 默认 workspace 分组：header + session（140 列 → 侧栏 32 列完整显示）。
     let backend = TestBackend::new(140, 10);

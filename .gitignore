@@ -1,2 +1,5 @@
 /target
 /proto
+# REQ-008 Step 7：cargo-dist 产物目录与日志轮转旧档不入库
+/dist
+*.log.old

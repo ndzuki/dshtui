@@ -283,7 +283,7 @@ impl TranscriptWindow {
 
     /// Whether a seq is already inside the window.
     pub fn contains_seq(&self, seq: SessionSeq) -> bool {
-        self.seen_seq.contains(&seq.0)
+        self.seen_seq.contains(&seq.get())
     }
 
     // ---------- optimistic echo seam (REQ-002 Step 3) ----------
@@ -334,7 +334,7 @@ impl TranscriptWindow {
             return;
         }
         self.pending
-            .retain(|e| !ids.contains(e.request_id.0.as_str()));
+            .retain(|e| !ids.contains(e.request_id.get().as_str()));
     }
 
     // ---------- write entry (single funnel) ----------
@@ -402,10 +402,10 @@ impl TranscriptWindow {
                 return ApplyEffect::Noop;
             }
         }
-        if self.seen_seq.contains(&seq.0) {
+        if self.seen_seq.contains(&seq.get()) {
             return ApplyEffect::Noop;
         }
-        self.seen_seq.insert(seq.0);
+        self.seen_seq.insert(seq.get());
         if let Some(rid) = ev.request_id.as_deref() {
             self.seen_request.insert(rid.to_string());
         }
@@ -477,7 +477,7 @@ impl TranscriptWindow {
         for rec in records {
             // Page overlap is deduplicated before insertion.
             if let Some(seq) = record_seq(&rec) {
-                if self.seen_seq.contains(&seq.0) {
+                if self.seen_seq.contains(&seq.get()) {
                     continue;
                 }
                 if let Some(rid) = record_request_id(&rec) {
@@ -515,7 +515,7 @@ impl TranscriptWindow {
                     tracing::warn!(event_type = %event.event_type, "event missing seq; skipped");
                     return 0;
                 };
-                if self.seen_seq.contains(&seq.0) {
+                if self.seen_seq.contains(&seq.get()) {
                     return 0;
                 }
                 if let Some(rid) = event.request_id.as_deref() {
@@ -524,7 +524,7 @@ impl TranscriptWindow {
                     }
                     self.seen_request.insert(rid.to_string());
                 }
-                self.seen_seq.insert(seq.0);
+                self.seen_seq.insert(seq.get());
                 let blocks = blocks_from_event(event, seq);
                 let inserted = blocks.len();
                 let idx = self.blocks.partition_point(|b| b.seq() < seq);
@@ -572,7 +572,10 @@ impl TranscriptWindow {
             .iter()
             .map(|item| TurnOutlineItem {
                 turn: item.get("turn").and_then(|v| v.as_u64()),
-                seq: item.get("seq").and_then(|v| v.as_u64()).map(SessionSeq),
+                seq: item
+                    .get("seq")
+                    .and_then(|v| v.as_u64())
+                    .map(SessionSeq::new),
                 prompt: item
                     .get("prompt")
                     .and_then(|v| v.as_str())
@@ -943,7 +946,7 @@ mod tests {
     fn ev(seq: u64, r#type: &str, rid: Option<&str>, data: Option<Value>) -> SessionWireEvent {
         SessionWireEvent {
             event_type: r#type.into(),
-            seq: Some(SessionSeq(seq)),
+            seq: Some(SessionSeq::new(seq)),
             time: Some(1000 + seq as i64),
             request_id: rid.map(String::from),
             ignorable: None,
@@ -963,7 +966,7 @@ mod tests {
     fn snapshot_rebuilds_and_sorts() {
         let mut w = TranscriptWindow::new(200);
         let eff = w.apply(Incoming::Snapshot {
-            cursor: Some(SessionLogOffset(5)),
+            cursor: Some(SessionLogOffset::new(5)),
             records: vec![
                 event_rec(10, "user/message", None),
                 event_rec(5, "user/message", None),
@@ -974,12 +977,12 @@ mod tests {
         });
         assert_eq!(eff, ApplyEffect::Rebuilt);
         assert_eq!(w.len(), 3);
-        let seqs: Vec<u64> = w.blocks().map(|b| b.seq().0).collect();
+        let seqs: Vec<u64> = w.blocks().map(|b| b.seq().get()).collect();
         assert_eq!(seqs, vec![5, 7, 10]);
-        assert_eq!(w.cursor(), Some(SessionLogOffset(5)));
+        assert_eq!(w.cursor(), Some(SessionLogOffset::new(5)));
         assert!(w.head_has_more());
-        assert_eq!(w.head_seq(), Some(SessionSeq(5)));
-        assert_eq!(w.tail_seq(), Some(SessionSeq(10)));
+        assert_eq!(w.head_seq(), Some(SessionSeq::new(5)));
+        assert_eq!(w.tail_seq(), Some(SessionSeq::new(10)));
     }
 
     #[test]
@@ -1067,14 +1070,14 @@ mod tests {
                 anchor_stable: true
             }
         );
-        assert_eq!(w.tail_seq(), Some(SessionSeq(4)));
+        assert_eq!(w.tail_seq(), Some(SessionSeq::new(4)));
     }
 
     #[test]
     fn page_prepend_overlap_dedup_and_order() {
         let mut w = TranscriptWindow::new(200);
         w.apply(Incoming::Snapshot {
-            cursor: Some(SessionLogOffset(6)),
+            cursor: Some(SessionLogOffset::new(6)),
             records: vec![
                 event_rec(6, "user/message", None),
                 event_rec(7, "user/message", None),
@@ -1099,7 +1102,7 @@ mod tests {
             }
         );
         assert!(!w.head_has_more(), "hasMore=false → 到顶");
-        let seqs: Vec<u64> = w.blocks().map(|b| b.seq().0).collect();
+        let seqs: Vec<u64> = w.blocks().map(|b| b.seq().get()).collect();
         assert_eq!(seqs, vec![4, 5, 6, 7]);
         // Everything overlaps → Noop.
         assert_eq!(
@@ -1139,7 +1142,7 @@ mod tests {
                 anchor_stable: true
             }
         );
-        let seqs: Vec<u64> = w.blocks().map(|b| b.seq().0).collect();
+        let seqs: Vec<u64> = w.blocks().map(|b| b.seq().get()).collect();
         assert_eq!(seqs, vec![10, 15, 20, 30]);
     }
 
@@ -1190,9 +1193,9 @@ mod tests {
             );
         }
         assert_eq!(w.len(), 10);
-        let seqs: Vec<u64> = w.blocks().map(|b| b.seq().0).collect();
+        let seqs: Vec<u64> = w.blocks().map(|b| b.seq().get()).collect();
         assert_eq!(seqs, (11..=20).collect::<Vec<_>>());
-        assert_eq!(w.head_seq(), Some(SessionSeq(11)));
+        assert_eq!(w.head_seq(), Some(SessionSeq::new(11)));
         // Page replay of an already-evicted seq → Noop (seq anchor semantics,
         // never loaded twice).
         assert_eq!(
@@ -1257,7 +1260,7 @@ mod tests {
                 event_type,
                 raw,
             } => {
-                assert_eq!(seq, SessionSeq(9));
+                assert_eq!(seq, SessionSeq::new(9));
                 assert_eq!(event_type, "future/mystery");
                 assert_eq!(raw["k"], "v");
             }
@@ -1290,7 +1293,7 @@ mod tests {
             has_more: true,
             projections: None,
         });
-        let seqs: Vec<u64> = w.blocks().map(|b| b.seq().0).collect();
+        let seqs: Vec<u64> = w.blocks().map(|b| b.seq().get()).collect();
         assert_eq!(seqs, vec![7]);
         // The old requestId/seq indexes are cleared: old seqs may re-enter.
         // An out-of-order event inserted before the window head → anchor shift
@@ -1307,7 +1310,7 @@ mod tests {
                 anchor_stable: false
             }
         );
-        assert_eq!(w.head_seq(), Some(SessionSeq(2)));
+        assert_eq!(w.head_seq(), Some(SessionSeq::new(2)));
     }
 
     #[test]
@@ -1325,7 +1328,7 @@ mod tests {
             })),
         });
         assert_eq!(w.turn_outline().len(), 2);
-        assert_eq!(w.turn_outline()[1].seq, Some(SessionSeq(6)));
+        assert_eq!(w.turn_outline()[1].seq, Some(SessionSeq::new(6)));
         assert_eq!(w.turn_outline()[1].response.as_deref(), Some("r2"));
     }
 
@@ -1380,7 +1383,7 @@ mod tests {
             has_more: true,
             projections: None,
         });
-        w.echo(SessionRequestId("req-1".into()), "hello");
+        w.echo(SessionRequestId::new("req-1".into()), "hello");
         assert_eq!(pending_texts(&w), vec!["hello"], "pending 立即可见");
         assert_eq!(w.len(), 0, "pending 不占 durable blocks/seq");
 
@@ -1428,7 +1431,7 @@ mod tests {
             has_more: true,
             projections: None,
         });
-        w.echo(SessionRequestId("req-9".into()), "text");
+        w.echo(SessionRequestId::new("req-9".into()), "text");
         assert_eq!(
             w.apply(Incoming::FollowEvent(ev(
                 3,
@@ -1449,10 +1452,10 @@ mod tests {
     #[test]
     fn snapshot_rebuild_reconciles_pending_without_duplicate() {
         let mut w = TranscriptWindow::new(200);
-        w.echo(SessionRequestId("req-7".into()), "snap");
+        w.echo(SessionRequestId::new("req-7".into()), "snap");
         // 重连快照含同 requestId：pending 对账移除，仅一个 durable 块。
         w.apply(Incoming::Snapshot {
-            cursor: Some(SessionLogOffset(7)),
+            cursor: Some(SessionLogOffset::new(7)),
             records: vec![event_rec(7, "user/message", Some("req-7"))],
             has_more: false,
             projections: None,
@@ -1461,7 +1464,7 @@ mod tests {
         assert_eq!(w.len(), 1);
         // 快照重放（同内容再来一次）→ 重建后仍只有一个块。
         w.apply(Incoming::Snapshot {
-            cursor: Some(SessionLogOffset(7)),
+            cursor: Some(SessionLogOffset::new(7)),
             records: vec![event_rec(7, "user/message", Some("req-7"))],
             has_more: false,
             projections: None,
@@ -1470,9 +1473,9 @@ mod tests {
 
         // 快照不含该 requestId：pending 保留，后到 durable 再 retire。
         let mut w2 = TranscriptWindow::new(200);
-        w2.echo(SessionRequestId("req-8".into()), "keep");
+        w2.echo(SessionRequestId::new("req-8".into()), "keep");
         w2.apply(Incoming::Snapshot {
-            cursor: Some(SessionLogOffset(1)),
+            cursor: Some(SessionLogOffset::new(1)),
             records: vec![event_rec(1, "user/message", None)],
             has_more: false,
             projections: None,
@@ -1491,9 +1494,9 @@ mod tests {
     #[test]
     fn fail_echo_marks_error_and_durable_later_retires_it() {
         let mut w = TranscriptWindow::new(200);
-        w.echo(SessionRequestId("req-f".into()), "boom");
+        w.echo(SessionRequestId::new("req-f".into()), "boom");
         w.fail_echo(
-            &SessionRequestId("req-f".into()),
+            &SessionRequestId::new("req-f".into()),
             "gateway/bad-request",
             "非法请求",
         );
@@ -1525,7 +1528,7 @@ mod tests {
         // 官方 durable user 消息的 requestId 位于 source（user-rpc.rpcId，
         // 2026-09-04 实读），顶层可能缺 requestId。
         let mut w = TranscriptWindow::new(200);
-        w.echo(SessionRequestId("req-nested".into()), "hi");
+        w.echo(SessionRequestId::new("req-nested".into()), "hi");
         let event = ev(
             5,
             "user/message",

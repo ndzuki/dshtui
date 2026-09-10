@@ -3325,7 +3325,7 @@ mod tests {
         // 非空（天空/草地已绘制）。
         assert!(b.iter().any(|v| *v != 0));
         // 状态条口径字段（ADR-008 不自算，仅透传）。
-        assert_eq!(scene.npcs[0].entry.session_id.0, "session-r");
+        assert_eq!(scene.npcs[0].entry.session_id.get(), "session-r");
     }
 
     fn entry(sid: &str, task_status: &str, status: &str) -> AgentRosterEntry {

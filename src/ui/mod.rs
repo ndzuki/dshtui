@@ -251,11 +251,11 @@ fn render_details(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         .map(|window| {
             let head = window
                 .head_seq()
-                .map(|seq| seq.0.to_string())
+                .map(|seq| seq.get().to_string())
                 .unwrap_or_else(|| "-".into());
             let tail = window
                 .tail_seq()
-                .map(|seq| seq.0.to_string())
+                .map(|seq| seq.get().to_string())
                 .unwrap_or_else(|| "-".into());
             format!(
                 "Session\n{}\n\nBlocks: {}\nSeq: {head}..{tail}\nMore history: {}",

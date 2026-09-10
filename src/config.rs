@@ -33,6 +33,14 @@ pub enum CliAction {
     Monitor {
         addr: Option<String>,
     },
+    /// `dshtui bench [--report …] [--report-md …] [--fixture …] [--scenario …]`
+    /// （REQ-008 FR-008-01 性能基准；V1，D-58/D-60）。
+    Bench {
+        report: Option<String>,
+        report_md: Option<String>,
+        fixture: Option<String>,
+        scenario: Option<String>,
+    },
 }
 
 /// Full structure of `~/.config/dshtui/config.toml` (Notes/02 §7 draft).
@@ -48,7 +56,29 @@ pub struct Config {
     pub drafts: DraftsConfig,
     /// Export default target path (ADR-010).
     pub export: ExportConfig,
+    /// REQ-008 AC-008-09：文件日志轮转上限（`[log] max_bytes`，可选；
+    /// 缺省 5MB 行为不变）。
+    pub log: LogConfig,
 }
+
+/// `[log]` — 文件日志配置（REQ-008 FR-008-02 / Notes/06 §7）。
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct LogConfig {
+    /// 轮转触发字节数（默认 5MB，对齐 main `LOG_ROTATE_BYTES`）。
+    pub max_bytes: u64,
+}
+
+impl Default for LogConfig {
+    fn default() -> Self {
+        Self {
+            max_bytes: DEFAULT_LOG_MAX_BYTES,
+        }
+    }
+}
+
+/// 文件日志轮转上限默认 5MB（Notes/06 §7）。
+pub const DEFAULT_LOG_MAX_BYTES: u64 = 5 * 1024 * 1024;
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
@@ -91,6 +121,13 @@ pub struct PerfConfig {
     pub page_size: usize,
     pub cache_bytes: u64,
     pub rss_target_mb: u64,
+    /// REQ-008 AC-008-10：perf 日志开关（默认开；`log_path` 为空 = 禁用）。
+    #[serde(default = "default_perf_log_on")]
+    pub log: bool,
+    /// REQ-008 AC-008-10：perf 日志路径（默认 `/tmp/dshtui-perf.log`；
+    /// 空 = 禁用）。环境变量 `DSHTUI_PERF_LOG` 覆盖既有 monitor 用法。
+    #[serde(default)]
+    pub log_path: String,
 }
 
 /// `[keymap]` — per-mode command→key-sequence override table (REQ-007
@@ -189,10 +226,16 @@ const DETAILS_WIDTH_CELLS_MAX: u16 = 60;
 /// 图片缓存预算默认 32MB（REQ-004 §3；pub 供 AppState 默认缓存构造）。
 pub const DEFAULT_CACHE_BYTES: u64 = 32 * 1024 * 1024;
 const DEFAULT_RSS_TARGET_MB: u64 = 80;
+/// REQ-008 AC-008-10：perf 日志默认路径（Notes/06 §8 `/tmp/dshtui-perf.log`）。
+pub const DEFAULT_PERF_LOG_PATH: &str = "/tmp/dshtui-perf.log";
 /// `/agents` 轮询间隔默认 2s（FR-009-02）。
 const DEFAULT_POLL_AGENTS_MS: u64 = 2_000;
 /// `/kb-stats` 轮询间隔默认 30s（FR-009-02）。
 const DEFAULT_POLL_KB_MS: u64 = 30_000;
+
+fn default_perf_log_on() -> bool {
+    true
+}
 
 impl Default for ServerConfig {
     fn default() -> Self {
@@ -227,6 +270,8 @@ impl Default for PerfConfig {
             page_size: DEFAULT_PAGE_SIZE,
             cache_bytes: DEFAULT_CACHE_BYTES,
             rss_target_mb: DEFAULT_RSS_TARGET_MB,
+            log: default_perf_log_on(),
+            log_path: DEFAULT_PERF_LOG_PATH.to_string(),
         }
     }
 }
@@ -602,6 +647,61 @@ pub fn parse_cli<I: IntoIterator<Item = String>>(args: I) -> Result<Cli, String>
         cli.action = CliAction::Monitor { addr };
         return Ok(cli);
     }
+    // `bench` 位置参数（REQ-008 FR-008-01 性能基准）。
+    if it.peek().is_some_and(|a| a == "bench") {
+        it.next();
+        let mut report: Option<String> = None;
+        let mut report_md: Option<String> = None;
+        let mut fixture: Option<String> = None;
+        let mut scenario: Option<String> = None;
+        while let Some(arg) = it.next() {
+            match arg.as_str() {
+                "--help" | "-h" => cli.action = CliAction::Help,
+                "--version" | "-V" => cli.action = CliAction::Version,
+                "--report" => {
+                    let v = it
+                        .next()
+                        .ok_or_else(|| "--report 需要一个路径参数".to_string())?;
+                    report = Some(v);
+                }
+                "--report-md" => {
+                    let v = it
+                        .next()
+                        .ok_or_else(|| "--report-md 需要一个路径参数".to_string())?;
+                    report_md = Some(v);
+                }
+                "--fixture" => {
+                    let v = it
+                        .next()
+                        .ok_or_else(|| "--fixture 需要一个参数（auto|live|seed）".to_string())?;
+                    fixture = Some(v);
+                }
+                "--scenario" => {
+                    let v = it
+                        .next()
+                        .ok_or_else(|| "--scenario 需要一个场景名".to_string())?;
+                    scenario = Some(v);
+                }
+                "--log" => {
+                    let v = it
+                        .next()
+                        .ok_or_else(|| "--log 需要一个文件路径参数".to_string())?;
+                    cli.log_file = Some(v);
+                }
+                other => return Err(format!("未知参数: {other}（--help 查看用法）")),
+            }
+        }
+        if matches!(cli.action, CliAction::Help | CliAction::Version) {
+            return Ok(cli);
+        }
+        cli.action = CliAction::Bench {
+            report,
+            report_md,
+            fixture,
+            scenario,
+        };
+        return Ok(cli);
+    }
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--help" | "-h" => cli.action = CliAction::Help,
@@ -687,6 +787,7 @@ dshtui {version} — 官方 dsh web Remote API 的 Rust TUI 客户端
 
 用法: dshtui [--url <url>] [--token <env-name>] [--log <file>] [--help] [--version]
       dshtui monitor [--addr <agent-server>] [--log <file>]
+      dshtui bench [--report <path>] [--report-md <path>] [--fixture auto|live|seed] [--scenario <name>]
 
 选项:
   --url <url>       dsh web 地址（默认 http://127.0.0.1:3080）
@@ -699,6 +800,21 @@ dshtui {version} — 官方 dsh web Remote API 的 Rust TUI 客户端
   monitor           Agent Town 监控面板（REQ-009 V0.3）：直连本机 OTR agent-server，
                     2s 轮询 /agents、30s 轮询 /kb-stats，kitty 终端渲染像素小镇。
     --addr <url>    agent-server 地址（默认 {monitor_addr}）
+  bench             性能基准（REQ-008 FR-008-01/AC-008-01~08，D-58/D-60）：进程内
+                    headless 测量 11 项指标（startup/first_screen/search/scroll p99 +
+                    fps/page_flip + 10k 列表搜索·首屏 + RSS 三档），产物双份原子写：
+                    JSON（机器 schema）+ markdown（人类可读表）；退出码 0=全 PASS /
+                    1=有 FAIL / 2=全 skip（under-scale）。
+    --report <path> JSON 报告路径（默认 {bench_report}；空 = 只打印摘要）
+    --report-md <p> markdown 报告路径（默认由 JSON 报告 .md 派生 {bench_report_md}；
+                    空 = 跳过 md；JSON/md 任一写失败都 exit 1 fail-closed）
+    --fixture <m>   auto|live|seed（默认 auto：本机 3080 可达 + DSH_TOKEN 已设 →
+                    live verified 读真实 session/list 侧栏；否则确定性 seed 兜底
+                    标 seed-fallback，不失败。CI 用 seed 强制复现）
+    --scenario <n>  只跑单个场景（默认全量；场景名 = startup_ms | first_screen_ms |
+                    search_ms | scroll_frame_p99_ms | scroll_fps | page_flip_ms |
+                    list_10k_search_ms | list_10k_first_screen_ms | idle_rss_mb |
+                    stream_rss_mb | image_rss_mb）
 
 kitty 快捷键（可选，写入 ~/.config/kitty/kitty.conf）:
   map ctrl+shift+a new_tab_with_cwd
@@ -708,7 +824,9 @@ token 来源优先级: --token <env> > 环境变量 {token_env} > 配置文件 >
 ",
         version = env!("CARGO_PKG_VERSION"),
         token_env = DEFAULT_TOKEN_ENV,
-        monitor_addr = DEFAULT_MONITOR_ADDR
+        monitor_addr = DEFAULT_MONITOR_ADDR,
+        bench_report = crate::bench::DEFAULT_REPORT_PATH,
+        bench_report_md = crate::bench::DEFAULT_REPORT_MD_PATH
     )
 }
 
@@ -995,6 +1113,49 @@ window_messages = 100
     #[test]
     fn cli_monitor_missing_addr_value_fails() {
         assert!(parse_cli(["dshtui".to_string(), "monitor".into(), "--addr".into()]).is_err());
+    }
+
+    // ---------- REQ-008 Step 1：perf 日志开关/路径 + [log] max_bytes ----------
+
+    #[test]
+    fn perf_log_defaults_on_with_tmp_path() {
+        let cfg = Config::load(Some(std::path::Path::new("/nonexistent/dshtui.toml"))).unwrap();
+        assert!(cfg.perf.log, "AC-008-10 perf 日志默认开");
+        assert_eq!(cfg.perf.log_path, DEFAULT_PERF_LOG_PATH);
+        let eff = cfg.resolve(&Cli::default()).unwrap();
+        assert!(eff.perf.log);
+        assert_eq!(eff.perf.log_path, DEFAULT_PERF_LOG_PATH);
+    }
+
+    #[test]
+    fn perf_log_can_be_disabled_and_path_overridden() {
+        // log=false 关闭；log_path 可配。
+        let (_dir, path) = tmp_config(
+            "[perf]\nlog = false\nlog_path = \"\"\nwindow_messages = 200\npage_size = 50\ncache_bytes = 1\nrss_target_mb = 80\n",
+        );
+        let cfg = Config::load(Some(&path)).unwrap();
+        assert!(!cfg.perf.log);
+        assert!(cfg.perf.log_path.is_empty(), "空路径 = 禁用");
+
+        let (_dir2, path2) = tmp_config("[perf]\nlog_path = \"/var/tmp/my-perf.log\"\n");
+        let cfg2 = Config::load(Some(&path2)).unwrap();
+        assert!(cfg2.perf.log, "未写 log 保持默认开");
+        assert_eq!(cfg2.perf.log_path, "/var/tmp/my-perf.log");
+    }
+
+    #[test]
+    fn log_section_defaults_to_5mb_and_overridable() {
+        let cfg = Config::load(Some(std::path::Path::new("/nonexistent/dshtui.toml"))).unwrap();
+        assert_eq!(
+            cfg.log.max_bytes, DEFAULT_LOG_MAX_BYTES,
+            "缺省 5MB 行为不变"
+        );
+        let (_dir, path) = tmp_config("[log]\nmax_bytes = 1048576\n");
+        let cfg2 = Config::load(Some(&path)).unwrap();
+        assert_eq!(cfg2.log.max_bytes, 1_048_576);
+        // 非法未知字段仍 deny（不静默接受）。
+        let (_dir3, path3) = tmp_config("[log]\nnope = 1\n");
+        assert!(Config::load(Some(&path3)).is_err());
     }
 
     #[test]

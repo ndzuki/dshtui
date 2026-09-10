@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "official_version": "0.1.2-rc.1",
+  "captured_at": "2026-09-09T00:00:00+08:00",
+  "source_session": "session-81c062d1-4576-4342-bf97-d38c16a42757",
+  "desensitized": true,
+  "lines": 204,
+  "sha256": "6a324f31b744baf28deebc6298f2da8376c05212c0e27736483c7eff75990729",
+  "notes": "官方同源 export 的确定性脱敏样本（D-65 golden）：内容 tokens （路径/消息文本/工具参数与描述/系统提示/标题/call·uuid·response id 等）替换为 [redacted-N]，时间戳整体平移到固定伪基点，保留 逐行 type/键结构/seq·time 序关系；仅作离线行格式/顺序回归基线，绝不入库真实内容。"
+}

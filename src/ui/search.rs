@@ -66,7 +66,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
             let snippet: String = hit.snippet.chars().take(50).collect();
             let mut spans = vec![Span::raw(format!(
                 "{}  {}",
-                hit.session_id.0,
+                hit.session_id.get(),
                 snippet.replace('\n', " ")
             ))];
             if idx == app.search.history_selection {
@@ -152,12 +152,12 @@ mod tests {
         app.search.window_matches = vec![0];
         app.search_index
             .rebuild(&[crate::model::Block::UserMessage {
-                seq: crate::api::types::SessionSeq(1),
+                seq: crate::api::types::SessionSeq::new(1),
                 content: "deploy the operator".into(),
                 time: None,
             }]);
         app.search.history_hits = vec![crate::api::types::SearchHit {
-            session_id: crate::api::types::SessionId("sess-9".into()),
+            session_id: crate::api::types::SessionId::new("sess-9".into()),
             snippet: "deploy 排查 …".into(),
         }];
         let backend = TestBackend::new(80, 20);

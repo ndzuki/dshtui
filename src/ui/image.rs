@@ -40,10 +40,10 @@ pub fn decode_image(
     bytes: &[u8],
     media_type: &MediaType,
 ) -> Result<DecodedImage, ImageDecodeError> {
-    if !is_supported_image(&media_type.0) {
+    if !is_supported_image(&media_type.get()) {
         return Err(ImageDecodeError {
             code: "decode/unsupported".into(),
-            message: format!("不支持的媒体类型 {}", media_type.0),
+            message: format!("不支持的媒体类型 {}", media_type.get()),
         });
     }
     let img = image::load_from_memory(bytes).map_err(|e| ImageDecodeError {
@@ -213,7 +213,7 @@ mod tests {
 
     #[test]
     fn decode_png_to_rgba_with_dimensions() {
-        let d = decode_image(&png_bytes(640, 480), &MediaType("image/png".into())).unwrap();
+        let d = decode_image(&png_bytes(640, 480), &MediaType::new("image/png".into())).unwrap();
         assert_eq!((d.width, d.height), (640, 480));
         assert_eq!(d.rgba.get_pixel(0, 0).0, [0, 0, 128, 255]);
     }
@@ -221,21 +221,22 @@ mod tests {
     #[test]
     fn decode_gif_returns_first_frame_only_without_stalling() {
         let t0 = std::time::Instant::now();
-        let d = decode_image(&gif_two_frames(), &MediaType("image/gif".into())).unwrap();
+        let d = decode_image(&gif_two_frames(), &MediaType::new("image/gif".into())).unwrap();
         assert!(t0.elapsed().as_millis() < 500, "首帧解码不得卡顿");
         assert_eq!(d.rgba.get_pixel(8, 8).0, [255, 0, 0, 255], "仅首帧（红）");
     }
 
     #[test]
     fn decode_unsupported_media_type_is_typed_error() {
-        let err = decode_image(&[0u8; 4], &MediaType("image/svg+xml".into())).unwrap_err();
+        let err = decode_image(&[0u8; 4], &MediaType::new("image/svg+xml".into())).unwrap_err();
         assert_eq!(err.code, "decode/unsupported");
         assert!(!err.message.is_empty());
     }
 
     #[test]
     fn decode_corrupt_bytes_is_typed_error() {
-        let err = decode_image(b"\x89PNG not really", &MediaType("image/png".into())).unwrap_err();
+        let err =
+            decode_image(b"\x89PNG not really", &MediaType::new("image/png".into())).unwrap_err();
         assert_eq!(err.code, "decode/corrupt");
     }
 

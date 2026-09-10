@@ -6,7 +6,7 @@ use dshtui::model::{ApplyEffect, Incoming, TranscriptWindow};
 fn event(seq: u64, event_type: &str, request_id: Option<&str>) -> SessionWireEvent {
     SessionWireEvent {
         event_type: event_type.to_string(),
-        seq: Some(SessionSeq(seq)),
+        seq: Some(SessionSeq::new(seq)),
         time: None,
         request_id: request_id.map(str::to_string),
         ignorable: None,
@@ -23,7 +23,7 @@ fn record(seq: u64, event_type: &str, request_id: Option<&str>) -> SessionHistor
 }
 
 fn seqs(window: &TranscriptWindow) -> Vec<u64> {
-    window.blocks().map(|block| block.seq().0).collect()
+    window.blocks().map(|block| block.seq().get()).collect()
 }
 
 #[test]
@@ -31,7 +31,7 @@ fn seq_order_request_id_dedup_and_page_merge_share_one_seam() {
     let mut window = TranscriptWindow::new(20);
     assert_eq!(
         window.apply(Incoming::Snapshot {
-            cursor: Some(SessionLogOffset(30)),
+            cursor: Some(SessionLogOffset::new(30)),
             records: vec![
                 record(20, "user/message", None),
                 record(10, "user/message", None)
@@ -93,7 +93,7 @@ fn seq_order_request_id_dedup_and_page_merge_share_one_seam() {
     );
     assert_eq!(seqs(&window), vec![5, 10, 15, 20, 30]);
     assert!(!window.head_has_more());
-    assert_eq!(window.head_seq(), Some(SessionSeq(5)));
+    assert_eq!(window.head_seq(), Some(SessionSeq::new(5)));
 
     assert_eq!(
         window.apply(Incoming::Page {
@@ -126,7 +126,7 @@ fn snapshot_rebuild_replaces_sequence_and_request_indexes() {
     );
     assert_eq!(seqs(&window), vec![2]);
     assert_eq!(window.turn_outline().len(), 1);
-    assert_eq!(window.turn_outline()[0].seq, Some(SessionSeq(2)));
+    assert_eq!(window.turn_outline()[0].seq, Some(SessionSeq::new(2)));
 
     // Rebuild clears both indexes, so the old seq/request id can be accepted again.
     assert_eq!(
@@ -147,7 +147,7 @@ fn snapshot_rebuild_replaces_sequence_and_request_indexes() {
 fn optimistic_echo_reconciles_against_durable_event_and_snapshot_ac002_06() {
     // 集成 seam：echo 后 durable 事件与重连快照都能对账，不重复显示。
     let mut window = TranscriptWindow::new(20);
-    window.echo(SessionRequestId("req-x".into()), "echoed");
+    window.echo(SessionRequestId::new("req-x".into()), "echoed");
     assert_eq!(window.pending().count(), 1);
     assert_eq!(window.len(), 0, "pending 不占 blocks");
 
@@ -166,9 +166,9 @@ fn optimistic_echo_reconciles_against_durable_event_and_snapshot_ac002_06() {
     assert_eq!(seqs(&window), vec![5]);
 
     // 重连快照重放同 requestId：重建后仍只有一条。
-    window.echo(SessionRequestId("req-y".into()), "again");
+    window.echo(SessionRequestId::new("req-y".into()), "again");
     window.apply(Incoming::Snapshot {
-        cursor: Some(SessionLogOffset(6)),
+        cursor: Some(SessionLogOffset::new(6)),
         records: vec![record(6, "user/message", Some("req-y"))],
         has_more: false,
         projections: None,
@@ -177,7 +177,7 @@ fn optimistic_echo_reconciles_against_durable_event_and_snapshot_ac002_06() {
     assert_eq!(seqs(&window), vec![6]);
     assert_eq!(
         window.apply(Incoming::Snapshot {
-            cursor: Some(SessionLogOffset(6)),
+            cursor: Some(SessionLogOffset::new(6)),
             records: vec![record(6, "user/message", Some("req-y"))],
             has_more: false,
             projections: None,
@@ -194,7 +194,7 @@ fn nested_image_reference_is_found_through_children() {
     let mut window = TranscriptWindow::new(20);
     window.apply(Incoming::FollowEvent(SessionWireEvent {
         event_type: "assistant/message".into(),
-        seq: Some(SessionSeq(1)),
+        seq: Some(SessionSeq::new(1)),
         time: None,
         request_id: None,
         ignorable: None,
@@ -238,7 +238,7 @@ fn same_event_multiple_images_expand_to_blocks_in_wire_order() {
     let mut window = TranscriptWindow::new(20);
     let eff = window.apply(Incoming::FollowEvent(SessionWireEvent {
         event_type: "user/message".into(),
-        seq: Some(SessionSeq(7)),
+        seq: Some(SessionSeq::new(7)),
         time: None,
         request_id: None,
         ignorable: None,
@@ -328,8 +328,8 @@ fn attachment_ref_maps_api_payload_to_internal_snake_case() {
     }))
     .unwrap();
     let r: AttachmentRef = AttachmentRef::from(&data);
-    assert_eq!(r.attachment_id.0, "att-1");
-    assert_eq!(r.media_type.0, "image/png");
+    assert_eq!(r.attachment_id.get(), "att-1");
+    assert_eq!(r.media_type.get(), "image/png");
     assert_eq!(r.bytes, 1024);
     assert_eq!((r.width, r.height), (640, 480));
     assert_eq!(r.name.as_deref(), Some("design.png"));
@@ -360,16 +360,16 @@ fn image_view_state_transitions_loading_rendered_failed_closed() {
 
     // 打开 → Loading，锚点记录来源 Block.seq（防串图）。
     state.open_view(
-        SessionSeq(42),
-        AttachmentId("att-1".into()),
+        SessionSeq::new(42),
+        AttachmentId::new("att-1".into()),
         Some("a.png".into()),
         Some("10x20".into()),
     );
     assert!(state.open);
     assert_eq!(state.phase, ImageViewPhase::Loading);
-    assert_eq!(state.block_seq, Some(SessionSeq(42)));
+    assert_eq!(state.block_seq, Some(SessionSeq::new(42)));
     assert_eq!(
-        state.attachment_id.as_ref().map(|a| a.0.as_str()),
+        state.attachment_id.as_ref().map(|a| a.get()).as_deref(),
         Some("att-1")
     );
     assert_eq!(state.name.as_deref(), Some("a.png"));
@@ -380,7 +380,12 @@ fn image_view_state_transitions_loading_rendered_failed_closed() {
     assert_eq!(state.phase, ImageViewPhase::Rendered);
 
     // 重新打开（幂等锚点路径）先回 Loading 再失败：失败带 code/message。
-    state.open_view(SessionSeq(43), AttachmentId("att-2".into()), None, None);
+    state.open_view(
+        SessionSeq::new(43),
+        AttachmentId::new("att-2".into()),
+        None,
+        None,
+    );
     state.mark_failed("decode/unsupported".into(), "格式不支持".into());
     assert_eq!(state.phase, ImageViewPhase::Failed);
     let err = state.error.as_ref().unwrap();
@@ -402,22 +407,22 @@ fn image_block_identity_is_extracted_from_block_image_only() {
     use dshtui::model::image::image_block_of;
     use dshtui::model::Block;
     let image = Block::Image {
-        seq: SessionSeq(7),
+        seq: SessionSeq::new(7),
         attachment_id: Some("att-7".into()),
         name: Some("x.png".into()),
         dims: Some("12x34".into()),
     };
     let r = image_block_of(&image).expect("image block identity");
-    assert_eq!(r.seq, SessionSeq(7));
+    assert_eq!(r.seq, SessionSeq::new(7));
     assert_eq!(
-        r.attachment_id.as_ref().map(|a| a.0.as_str()),
+        r.attachment_id.as_ref().map(|a| a.get()).as_deref(),
         Some("att-7")
     );
     assert_eq!(r.name.as_deref(), Some("x.png"));
     assert_eq!(r.dims.as_deref(), Some("12x34"));
 
     assert!(image_block_of(&Block::UserMessage {
-        seq: SessionSeq(8),
+        seq: SessionSeq::new(8),
         content: "hi".into(),
         time: None,
     })
@@ -441,7 +446,7 @@ use dshtui::model::trajectory::{
 fn traj_event(seq: u64, event_type: &str, data: serde_json::Value) -> SessionWireEvent {
     SessionWireEvent {
         event_type: event_type.to_string(),
-        seq: Some(SessionSeq(seq)),
+        seq: Some(SessionSeq::new(seq)),
         time: Some(1_700_000_000_000 + seq as i64),
         request_id: None,
         ignorable: None,
@@ -648,7 +653,7 @@ fn trajectory_27turn_1144step_ordered_window_and_tool_locatable_ac005_02() {
         projections: None,
     });
     assert_eq!(w.len(), 200, "窗口上限 200（逐出最旧留 seq 锚）");
-    let seqs: Vec<u64> = w.raw_rows().map(|r| r.seq().0).collect();
+    let seqs: Vec<u64> = w.raw_rows().map(|r| r.seq().get()).collect();
     let sorted = {
         let mut s = seqs.clone();
         s.sort_unstable();
@@ -673,7 +678,7 @@ fn trajectory_page_prepend_no_dup_no_gap_and_has_more_false_ac005_07() {
     // 不丢（复用 REQ-001 AC-001-03/11 口径）。
     let mut w = TrajectoryWindow::new(200);
     w.apply(TrajIncoming::Snapshot {
-        cursor: Some(SessionLogOffset(5)),
+        cursor: Some(SessionLogOffset::new(5)),
         records: vec![
             traj_record(4, "step/start", serde_json::json!({"turn": 1, "step": 1})),
             traj_record(5, "user/message", serde_json::json!({"content": "a"})),
@@ -702,7 +707,7 @@ fn trajectory_page_prepend_no_dup_no_gap_and_has_more_false_ac005_07() {
         }
     );
     assert!(!w.head_has_more(), "hasMore=false → 到顶");
-    let seqs: Vec<u64> = w.raw_rows().map(|r| r.seq().0).collect();
+    let seqs: Vec<u64> = w.raw_rows().map(|r| r.seq().get()).collect();
     assert_eq!(seqs, vec![1, 2, 4, 5], "无重复无空洞、边界行不丢");
     // 全重叠 → Noop。
     assert_eq!(
@@ -736,7 +741,7 @@ fn trajectory_reconnect_snapshot_reconciles_seq_gap_ac005_08() {
     )));
     // 重连快照：只带回 seq 10（缺口 11 由 follow 尾页补齐）。
     w.apply(TrajIncoming::Snapshot {
-        cursor: Some(SessionLogOffset(10)),
+        cursor: Some(SessionLogOffset::new(10)),
         records: vec![traj_record(
             10,
             "user/message",
@@ -754,7 +759,7 @@ fn trajectory_reconnect_snapshot_reconciles_seq_gap_ac005_08() {
         ))),
         TrajEffect::TailAppended { appended: 1 }
     );
-    let seqs: Vec<u64> = w.raw_rows().map(|r| r.seq().0).collect();
+    let seqs: Vec<u64> = w.raw_rows().map(|r| r.seq().get()).collect();
     assert_eq!(seqs, vec![10, 11], "对账补齐后事件链完整");
 }
 
@@ -779,7 +784,7 @@ fn trajectory_seq_request_id_dedup_and_eviction_anchor_ac005_07_08() {
         TrajEffect::TailAppended { appended: 1 }
     );
     let mut replay = e.clone();
-    replay.seq = Some(SessionSeq(3));
+    replay.seq = Some(SessionSeq::new(3));
     assert_eq!(w.apply(TrajIncoming::FollowEvent(replay)), TrajEffect::Noop);
     // seq 去重。
     assert_eq!(w.apply(TrajIncoming::FollowEvent(e)), TrajEffect::Noop);
@@ -899,14 +904,14 @@ fn trajectory_fold_concurrent_append_keeps_all_rows_ac005_12() {
         .unwrap()
         .id();
     assert!(w.toggle_group(&mut fold, asst2_id));
-    let before: Vec<u64> = w.view(&fold).into_iter().map(|r| r.seq().0).collect();
+    let before: Vec<u64> = w.view(&fold).into_iter().map(|r| r.seq().get()).collect();
     assert_eq!(
         before.iter().filter(|s| **s == 12 || **s == 13).count(),
         0,
         "折叠中 append 的成员行隐藏"
     );
     assert!(!w.toggle_group(&mut fold, asst2_id), "za 展开");
-    let after: Vec<u64> = w.view(&fold).into_iter().map(|r| r.seq().0).collect();
+    let after: Vec<u64> = w.view(&fold).into_iter().map(|r| r.seq().get()).collect();
     assert_eq!(
         after.iter().filter(|s| **s == 12 || **s == 13).count(),
         2,
@@ -919,7 +924,7 @@ fn trajectory_fold_concurrent_append_keeps_all_rows_ac005_12() {
         .unwrap()
         .id();
     assert!(w.toggle_group(&mut fold, turn_id));
-    let view: Vec<u64> = w.view(&fold).into_iter().map(|r| r.seq().0).collect();
+    let view: Vec<u64> = w.view(&fold).into_iter().map(|r| r.seq().get()).collect();
     let turn1: Vec<u64> = view
         .iter()
         .copied()
@@ -997,7 +1002,7 @@ fn trajectory_row_id_stable_across_prepend_and_toggle() {
     });
     assert_eq!(
         w.row(id).map(|r| r.seq()),
-        Some(SessionSeq(5)),
+        Some(SessionSeq::new(5)),
         "前插后 RowId 仍指向同一行"
     );
     let mut fold = FoldState::default();
@@ -1092,7 +1097,7 @@ fn detail_for_tool_call_aggregates_args_result_usage_timing_ac005_03() {
         .unwrap();
     let detail = detail_for(&call, &w).expect("tool/call 行可开详情");
     assert_eq!(detail.source_kind, TrajKind::ToolCall);
-    assert_eq!(detail.source_seq, SessionSeq(4));
+    assert_eq!(detail.source_seq, SessionSeq::new(4));
     // arguments 原始 JSON 字符串 → 格式化 JSON（含换行缩进）。
     let args = detail.args_text.expect("args 存在");
     assert!(args.contains("\"command\""), "args 格式化: {args}");
@@ -1333,7 +1338,7 @@ fn trajectory_search_match_jumps_to_row_and_expands_fold_ac005_13() {
     let item = &index.items()[hits[0].item_index];
     // 命中行在窗口内可定位（RowId 稳定跳转）。
     let row = w.row(item.row_id).expect("命中行可定位");
-    assert_eq!(row.seq(), SessionSeq(11));
+    assert_eq!(row.seq(), SessionSeq::new(11));
     // 折叠 turn 2 的 assistant 组后，命中行被隐藏；展开组后可见（跳转前置）。
     let mut fold = FoldState::default();
     let asst2 = w
@@ -1356,7 +1361,7 @@ fn trajectory_search_item_displays_kind_digest() {
     let item = TrajectorySearchItem {
         row_id: RowId(1),
         kind: TrajKind::ToolCall,
-        seq: SessionSeq(5),
+        seq: SessionSeq::new(5),
         text: "bash {\"command\":\"ls\"}".to_string(),
         display: "tool: bash".to_string(),
     };
@@ -1449,7 +1454,7 @@ fn assistant_message_retains_wire_message_id_ac007_27() {
     // assistant/message 事件 data 含官方 message id（messageFeedback 定位锚）。
     window.apply(Incoming::FollowEvent(SessionWireEvent {
         event_type: "assistant/message".into(),
-        seq: Some(SessionSeq(1)),
+        seq: Some(SessionSeq::new(1)),
         time: None,
         request_id: None,
         ignorable: None,
